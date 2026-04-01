@@ -43,3 +43,40 @@ class TestCLIBasics:
     def test_history_help(self):
         result = runner.invoke(app, ["history", "--help"])
         assert result.exit_code == 0
+
+
+class TestCLIModuleImports:
+    """Verify all new modules import correctly through the CLI entry point."""
+
+    def test_status_module_imports(self):
+        from forge.agent.status import Phase, StatusTracker
+
+        assert Phase.THINKING.value == "thinking"
+        assert StatusTracker is not None
+
+    def test_deps_has_new_fields(self):
+        from forge.agent.deps import AgentDeps
+        from pathlib import Path
+        from rich.console import Console
+        import io
+
+        deps = AgentDeps(cwd=Path("/tmp"), console=Console(file=io.StringIO()))
+        assert deps.status_tracker is None
+        assert deps.thinking_enabled is False
+
+    def test_render_has_split_thinking(self):
+        from forge.agent.render import _split_thinking
+
+        t, v = _split_thinking("<think>x</think>y")
+        assert t == "x"
+        assert v == "y"
+
+    def test_loop_has_plan_overlay(self):
+        from forge.agent.loop import PLAN_OVERLAY
+
+        assert "PLANNING" in PLAN_OVERLAY
+
+    def test_loop_has_maybe_prepend_think(self):
+        from forge.agent.loop import _maybe_prepend_think
+
+        assert callable(_maybe_prepend_think)

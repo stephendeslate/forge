@@ -1,6 +1,11 @@
 """Tests for render helper functions."""
 
-from forge.agent.render import _tool_style, _format_tool_args, _truncate
+from forge.agent.render import (
+    _tool_style,
+    _format_tool_args,
+    _truncate,
+    _split_thinking,
+)
 
 
 class TestToolStyle:
@@ -65,3 +70,60 @@ class TestTruncate:
     def test_one_over_limit(self):
         text = "x" * 2001
         assert "truncated" in _truncate(text)
+
+
+class TestSplitThinking:
+    def test_no_thinking_tags(self):
+        thinking, visible = _split_thinking("hello world")
+        assert thinking == ""
+        assert visible == "hello world"
+
+    def test_complete_thinking_block(self):
+        thinking, visible = _split_thinking("<think>plan this</think>actual response")
+        assert thinking == "plan this"
+        assert visible == "actual response"
+
+    def test_thinking_only(self):
+        thinking, visible = _split_thinking("<think>just thinking</think>")
+        assert thinking == "just thinking"
+        assert visible == ""
+
+    def test_partial_thinking_unclosed(self):
+        """Streaming scenario: <think> opened but not yet closed."""
+        thinking, visible = _split_thinking("<think>still thinking...")
+        assert thinking == "still thinking..."
+        assert visible == ""
+
+    def test_text_before_thinking(self):
+        thinking, visible = _split_thinking("prefix <think>thought</think> suffix")
+        assert thinking == "thought"
+        assert visible == "prefix  suffix"
+
+    def test_multiple_thinking_blocks(self):
+        raw = "<think>first</think>middle<think>second</think>end"
+        thinking, visible = _split_thinking(raw)
+        assert "first" in thinking
+        assert "second" in thinking
+        assert "middle" in visible
+        assert "end" in visible
+
+    def test_case_insensitive(self):
+        thinking, visible = _split_thinking("<THINK>thought</THINK>visible")
+        assert thinking == "thought"
+        assert visible == "visible"
+
+    def test_empty_string(self):
+        thinking, visible = _split_thinking("")
+        assert thinking == ""
+        assert visible == ""
+
+    def test_empty_thinking_block(self):
+        thinking, visible = _split_thinking("<think></think>content")
+        assert thinking == ""
+        assert visible == "content"
+
+    def test_multiline_thinking(self):
+        raw = "<think>line 1\nline 2\nline 3</think>response"
+        thinking, visible = _split_thinking(raw)
+        assert "line 1\nline 2\nline 3" == thinking
+        assert visible == "response"

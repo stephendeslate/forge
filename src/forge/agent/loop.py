@@ -19,6 +19,7 @@ from forge.agent.context import compact_history, count_messages_tokens
 from forge.agent.deps import AgentDeps
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
+from forge.agent.status import StatusTracker
 from forge.agent.tools import ALL_TOOLS
 from forge.config import settings
 
@@ -36,6 +37,19 @@ Guidelines:
 - When making changes, verify them by reading the modified file or running tests.
 - All file paths are relative to the working directory unless absolute.
 """
+
+PLAN_OVERLAY = """\
+You are in PLANNING mode. Your task is to analyze the request and produce a structured plan.
+
+Do NOT execute any actions or use any tools. Instead, output a clear plan with:
+1. **Goal**: What needs to be accomplished
+2. **Steps**: Numbered steps to achieve the goal
+3. **Files**: Which files will be read/modified/created
+4. **Risks**: Any potential issues or edge cases
+
+Be specific and actionable. The plan will be reviewed before execution.
+"""
+
 
 def _ensure_ollama_env() -> None:
     """Set OLLAMA_BASE_URL env var for pydantic-ai's Ollama provider."""
@@ -63,6 +77,102 @@ def create_agent(system: str = AGENT_SYSTEM, cwd: Path | None = None) -> Agent[A
         deps_type=AgentDeps,
         model_settings=ModelSettings(timeout=300),
     )
+
+
+async def _run_with_status(
+    agent: Agent[AgentDeps, str],
+    prompt: str,
+    deps: AgentDeps,
+    message_history: list[ModelMessage] | None,
+) -> list[ModelMessage]:
+    """Run agent with status tracker lifecycle management.
+
+    Returns the updated message history.
+    """
+    tracker = StatusTracker(console=deps.console)
+    deps.status_tracker = tracker
+    tracker.start()
+
+    try:
+        result = await agent.run(
+            prompt,
+            deps=deps,
+            message_history=message_history,
+            event_stream_handler=render_events,
+        )
+        return result.all_messages()
+    finally:
+        tracker.stop()
+        # Print summary after clearing status line
+        deps.console.print(tracker.summary())
+        deps.status_tracker = None
+
+
+async def _plan_and_execute(
+    agent: Agent[AgentDeps, str],
+    prompt: str,
+    deps: AgentDeps,
+    message_history: list[ModelMessage] | None,
+) -> list[ModelMessage] | None:
+    """Two-phase plan-then-execute workflow.
+
+    Phase 1: Generate a plan (no tools).
+    Phase 2: On approval, execute with full tools.
+    Returns updated message_history, or the original if cancelled.
+    """
+    console = deps.console
+
+    # Phase 1: Planning — create a no-tools agent with plan overlay
+    _ensure_ollama_env()
+    plan_agent: Agent[AgentDeps, str] = Agent(
+        model=f"ollama:{settings.ollama.heavy_model}",
+        instructions=PLAN_OVERLAY,
+        tools=[],  # No tools in planning mode
+        deps_type=AgentDeps,
+        model_settings=ModelSettings(timeout=300),
+    )
+
+    console.print("[dim]Planning...[/dim]")
+    try:
+        plan_result = await plan_agent.run(
+            prompt,
+            deps=deps,
+            message_history=None,  # Fresh context for planning
+        )
+        plan_text = plan_result.output
+    except Exception as e:
+        _handle_agent_error(console, e)
+        return message_history
+
+    # Display the plan
+    console.print(
+        Panel(
+            plan_text,
+            title="[bold]Plan[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    # Phase 2: Ask for approval
+    try:
+        from prompt_toolkit import prompt as pt_prompt
+
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: pt_prompt("Execute this plan? [Y/n] ")
+        )
+        answer = answer.strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]Plan cancelled.[/dim]")
+        return message_history
+
+    if answer in ("n", "no"):
+        console.print("[dim]Plan cancelled.[/dim]")
+        return message_history
+
+    # Phase 3: Execute with full agent
+    execution_prompt = f"Execute this plan:\n\n{plan_text}\n\nOriginal request: {prompt}"
+    return await _run_with_status(agent, execution_prompt, deps, message_history)
 
 
 async def _save_agent_session(
@@ -146,13 +256,8 @@ async def agent_repl(
     if initial_prompt:
         console.print(f"\n[bold]> {initial_prompt}[/bold]")
         try:
-            result = await agent.run(
-                initial_prompt,
-                deps=deps,
-                message_history=message_history,
-                event_stream_handler=render_events,
-            )
-            message_history = result.all_messages()
+            prompt = _maybe_prepend_think(initial_prompt, deps)
+            message_history = await _run_with_status(agent, prompt, deps, message_history)
             if db:
                 # Auto-title from first prompt
                 title = initial_prompt[:60].strip()
@@ -219,6 +324,29 @@ async def agent_repl(
                     else:
                         console.print("[dim]No history yet.[/dim]")
                     continue
+                elif cmd == "/think":
+                    deps.thinking_enabled = not deps.thinking_enabled
+                    state = "on" if deps.thinking_enabled else "off"
+                    console.print(f"[dim]Extended thinking: {state}[/dim]")
+                    continue
+                elif cmd == "/plan":
+                    # Extract prompt after /plan
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[dim]Usage: /plan <prompt>[/dim]")
+                        continue
+                    plan_prompt = parts[1]
+                    try:
+                        result = await _plan_and_execute(
+                            agent, plan_prompt, deps, message_history
+                        )
+                        if result is not None:
+                            message_history = result
+                    except KeyboardInterrupt:
+                        console.print("\n[dim]Interrupted.[/dim]")
+                    except Exception as e:
+                        _handle_agent_error(console, e)
+                    continue
                 elif cmd == "/help":
                     console.print(
                         Panel(
@@ -226,6 +354,8 @@ async def agent_repl(
                             "/compact  — compact history to fit token budget\n"
                             "/tokens   — show estimated token count\n"
                             "/messages — list message history\n"
+                            "/think    — toggle extended thinking on/off\n"
+                            "/plan     — plan before executing (e.g. /plan refactor X)\n"
                             "/cwd      — show working directory\n"
                             "/cd <dir> — change working directory\n"
                             "/quit     — exit",
@@ -271,15 +401,12 @@ async def agent_repl(
                     pass
                 title_set = True
 
-            # Run agent
+            # Run agent with status tracking
             try:
-                result = await agent.run(
-                    user_input,
-                    deps=deps,
-                    message_history=message_history,
-                    event_stream_handler=render_events,
+                prompt = _maybe_prepend_think(user_input, deps)
+                message_history = await _run_with_status(
+                    agent, prompt, deps, message_history
                 )
-                message_history = result.all_messages()
             except KeyboardInterrupt:
                 console.print("\n[dim]Interrupted.[/dim]")
             except Exception as e:
@@ -290,6 +417,13 @@ async def agent_repl(
             await _save_agent_session(db, session_id, message_history)
         if db:
             await db.close()
+
+
+def _maybe_prepend_think(prompt: str, deps: AgentDeps) -> str:
+    """Prepend /think or /no_think tag based on thinking_enabled setting."""
+    if deps.thinking_enabled:
+        return f"/think\n{prompt}"
+    return prompt
 
 
 async def _connect_db():
