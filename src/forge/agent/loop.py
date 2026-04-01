@@ -95,7 +95,11 @@ async def _run_with_status(
     """
     tracker = StatusTracker(console=deps.console, visible=deps.status_visible)
     deps.status_tracker = tracker
-    tracker.start()
+
+    def _on_toggle(visible: bool) -> None:
+        deps.status_visible = visible
+
+    tracker.start(on_toggle=_on_toggle)
 
     try:
         result = await agent.run(

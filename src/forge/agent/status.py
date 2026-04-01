@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import os
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -31,6 +35,27 @@ _PHASE_DISPLAY: dict[Phase, tuple[str, str]] = {
 }
 
 
+def _set_nonblocking(fd: int) -> int:
+    """Set fd to non-blocking mode, return old flags."""
+    old = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, old | os.O_NONBLOCK)
+    return old
+
+
+def _restore_flags(fd: int, flags: int) -> None:
+    """Restore original fd flags."""
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+
+def _try_read_byte(fd: int) -> int | None:
+    """Try to read one byte from fd (non-blocking). Returns byte value or None."""
+    try:
+        data = os.read(fd, 1)
+        return data[0] if data else None
+    except (BlockingIOError, OSError):
+        return None
+
+
 @dataclass
 class StatusTracker:
     """Ephemeral ANSI status line showing phase + elapsed time + tool count.
@@ -46,17 +71,24 @@ class StatusTracker:
     _detail: str = field(default="", init=False)
     _tool_calls: int = field(default=0, init=False)
     _ticker: asyncio.Task[None] | None = field(default=None, init=False)
+    _key_monitor: asyncio.Task[None] | None = field(default=None, init=False)
     _paused: bool = field(default=False, init=False)
     _active: bool = field(default=False, init=False)
+    _on_toggle: object | None = field(default=None, init=False)  # callback
 
     @property
     def tool_calls(self) -> int:
         return self._tool_calls
 
-    def start(self) -> None:
-        """Start the status ticker."""
+    def start(self, on_toggle: object | None = None) -> None:
+        """Start the status ticker and optional keypress monitor.
+
+        Args:
+            on_toggle: Callable invoked with (visible: bool) when Ctrl-O is pressed.
+        """
         self._start_time = time.monotonic()
         self._active = True
+        self._on_toggle = on_toggle
         if not self.console.is_terminal:
             return
         self._phase = Phase.THINKING
@@ -64,16 +96,19 @@ class StatusTracker:
         try:
             loop = asyncio.get_running_loop()
             self._ticker = loop.create_task(self._tick_loop())
+            self._key_monitor = loop.create_task(self._key_loop())
         except RuntimeError:
             # No running event loop — skip ticker (non-async context)
             pass
 
     def stop(self) -> None:
-        """Stop the ticker and clear the status line."""
+        """Stop the ticker, key monitor, and clear the status line."""
         self._active = False
-        if self._ticker and not self._ticker.done():
-            self._ticker.cancel()
+        for task in (self._ticker, self._key_monitor):
+            if task and not task.done():
+                task.cancel()
         self._ticker = None
+        self._key_monitor = None
         self._clear_line()
 
     def set_phase(self, phase: Phase, detail: str = "") -> None:
@@ -144,3 +179,31 @@ class StatusTracker:
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             pass
+
+    async def _key_loop(self) -> None:
+        """Monitor stdin for Ctrl-O (0x0f) to toggle visibility."""
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            # Set cbreak mode — passes keys immediately, no echo
+            tty.setcbreak(fd)
+            # Make stdin non-blocking so we can poll without freezing
+            old_flags = _set_nonblocking(fd)
+            try:
+                while self._active:
+                    ch = _try_read_byte(fd)
+                    if ch == 0x0F:  # Ctrl-O
+                        self.visible = not self.visible
+                        if not self.visible:
+                            self._clear_line()
+                        if self._on_toggle:
+                            self._on_toggle(self.visible)  # type: ignore[operator]
+                    await asyncio.sleep(0.05)
+            finally:
+                _restore_flags(fd, old_flags)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
