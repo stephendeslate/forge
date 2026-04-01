@@ -1,0 +1,64 @@
+[project]
+name = "forge"
+version = "0.1.0"
+description = "Local AI orchestration — smart routing, RAG, and self-correction pipelines"
+readme = "README.md"
+authors = [
+    { name = "stephendeslate", email = "sjdeslate@protonmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-ai>=1.75",
+    "typer>=0.15",
+    "rich>=13",
+    "prompt-toolkit>=3.0",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+forge = "forge.cli:app"
+
+[project.optional-dependencies]
+rag = [
+    "asyncpg>=0.30",
+    "pgvector>=0.3",
+    "tree-sitter>=0.24",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-rust>=0.23",
+    "tree-sitter-go>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-c>=0.23",
+    "tree-sitter-cpp>=0.23",
+    "tree-sitter-bash>=0.23",
+    "tree-sitter-json>=0.24",
+    "tree-sitter-yaml>=0.7",
+    "tree-sitter-toml>=0.7",
+    "tree-sitter-html>=0.23",
+    "tree-sitter-css>=0.23",
+    "tree-sitter-markdown>=0.4",
+]
+cache = [
+    "redis>=5",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.10,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
