@@ -396,16 +396,43 @@ async def web_fetch(
 
 
 def _strip_html(html: str) -> str:
-    """Minimal HTML-to-text: strip tags, decode common entities, collapse whitespace."""
+    """Extract main content from HTML, stripping boilerplate navigation/menus.
+
+    Uses trafilatura for intelligent content extraction, with a regex fallback.
+    """
+    try:
+        import trafilatura
+
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            favor_recall=True,
+        )
+        if text and len(text) > 50:
+            return text
+    except Exception:
+        pass
+
+    # Fallback: aggressive regex stripping
+    return _strip_html_fallback(html)
+
+
+def _strip_html_fallback(html: str) -> str:
+    """Regex-based HTML-to-text fallback."""
     import re
 
-    # Remove script/style blocks entirely
-    text = re.sub(r"<(script|style)[^>]*>[\s\S]*?</\1>", "", html, flags=re.IGNORECASE)
+    # Remove script, style, nav, header, footer, aside blocks entirely
+    for tag in ("script", "style", "nav", "header", "footer", "aside", "noscript"):
+        html = re.sub(rf"<{tag}[^>]*>[\s\S]*?</{tag}>", "", html, flags=re.IGNORECASE)
+    # Remove hidden elements
+    html = re.sub(r'<[^>]+(?:hidden|display:\s*none)[^>]*>[\s\S]*?</[^>]+>', "", html)
     # Remove all HTML tags
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", html)
     # Decode common entities
     for entity, char in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
-                         ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")]:
+                         ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " "),
+                         ("&deg;", "°")]:
         text = text.replace(entity, char)
     # Collapse whitespace
     text = re.sub(r"[ \t]+", " ", text)
