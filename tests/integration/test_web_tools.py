@@ -116,6 +116,30 @@ class TestWebFetch:
         assert "Fetched:" in result
 
 
+class TestToolDocstringSynthesis:
+    """Verify tool docstrings instruct the model to synthesize results, not relay raw output."""
+
+    def test_web_search_docstring_says_not_relay(self):
+        doc = web_search.__doc__
+        assert doc is not None
+        assert "do not relay" in doc.lower()
+
+    def test_web_search_docstring_says_answer(self):
+        doc = web_search.__doc__
+        assert doc is not None
+        assert "answer" in doc.lower()
+
+    def test_web_fetch_docstring_says_extract(self):
+        doc = web_fetch.__doc__
+        assert doc is not None
+        assert "extract" in doc.lower()
+
+    def test_web_fetch_docstring_says_not_dump(self):
+        doc = web_fetch.__doc__
+        assert doc is not None
+        assert "do not dump" in doc.lower()
+
+
 class TestWebSearchNoBackend:
     """Tests that work even without SearXNG running."""
 

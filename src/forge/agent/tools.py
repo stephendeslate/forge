@@ -282,8 +282,11 @@ async def web_search(
     query: str,
     max_results: int = 5,
 ) -> str:
-    """Search the web and return results. Use for documentation lookups, API references,
+    """Search the web for information. Use for weather, news, documentation lookups, API references,
     error messages, or any question requiring up-to-date information.
+
+    The results are raw search data — use them to formulate a direct answer to the user's question.
+    Do NOT relay the raw results to the user; instead, read the results and answer their question.
 
     Args:
         query: The search query.
@@ -333,7 +336,8 @@ async def web_search(
         return (
             "Error: No search backend available. "
             "Start a local SearXNG instance (docker run -p 8888:8080 searxng/searxng) "
-            "or configure a search endpoint."
+            "or configure a search endpoint. "
+            "Do NOT retry — inform the user that web search is unavailable."
         )
 
 
@@ -344,6 +348,9 @@ async def web_fetch(
 ) -> str:
     """Fetch a web page and return its text content. Use to read documentation pages,
     API references, or specific URLs from search results.
+
+    The fetched content is raw data for you to process. Extract the relevant information
+    and present a clear answer to the user — do not dump raw page content.
 
     Args:
         url: The URL to fetch.
@@ -360,14 +367,17 @@ async def web_fetch(
         try:
             resp = await client.get(url, headers=headers)
         except httpx.TimeoutException:
-            return f"Error: Request timed out fetching {url}"
+            return f"Error: Request timed out fetching {url}. Do NOT retry — inform the user."
         except httpx.ConnectError as e:
-            return f"Error: Could not connect to {url}: {e}"
+            return f"Error: Could not connect to {url}: {e}. Do NOT retry — inform the user."
         except Exception as e:
-            return f"Error fetching {url}: {e}"
+            return f"Error fetching {url}: {e}. Do NOT retry — inform the user."
 
         if resp.status_code >= 400:
-            return f"Error: HTTP {resp.status_code} fetching {url}"
+            return (
+                f"Error: HTTP {resp.status_code} fetching {url}. "
+                "Do NOT retry this URL — report the error to the user and move on."
+            )
 
         content_type = resp.headers.get("content-type", "")
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.usage import UsageLimits
 from rich.console import Console
 from rich.panel import Panel
 
@@ -26,7 +28,7 @@ from forge.config import settings
 AGENT_SYSTEM = """\
 You are Forge, a versatile local AI assistant. You help users with coding, writing, analysis, research, and general questions — as well as reading, understanding, editing, and creating code.
 
-You have access to tools for reading files, writing files, editing files, running shell commands, searching code, and listing files. Use them to accomplish the user's request.
+You have access to tools for reading files, writing files, editing files, running shell commands, searching code, listing files, web search, and web fetch. Use them to accomplish the user's request.
 
 Guidelines:
 - Read files before editing them to understand existing code.
@@ -36,6 +38,8 @@ Guidelines:
 - Be concise in explanations. Show what you did, not what you plan to do.
 - When making changes, verify them by reading the modified file or running tests.
 - All file paths are relative to the working directory unless absolute.
+- IMPORTANT: When you use tools like web_search or web_fetch, the results are raw data for YOU to process. Always synthesize tool results into a direct, natural answer to the user's question. Never dump raw search results or tool output as your response — interpret, summarize, and answer the question.
+- If the user asks a question (e.g. "what's the weather?"), use the appropriate tool to gather information, then respond with a clear answer based on what you found.
 """
 
 PLAN_OVERLAY = """\
@@ -89,7 +93,7 @@ async def _run_with_status(
 
     Returns the updated message history.
     """
-    tracker = StatusTracker(console=deps.console)
+    tracker = StatusTracker(console=deps.console, visible=deps.status_visible)
     deps.status_tracker = tracker
     tracker.start()
 
@@ -99,6 +103,7 @@ async def _run_with_status(
             deps=deps,
             message_history=message_history,
             event_stream_handler=render_events,
+            usage_limits=UsageLimits(request_limit=25),
         )
         return result.all_messages()
     finally:
@@ -205,6 +210,7 @@ async def agent_repl(
     """Run the agentic REPL with tool use."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
 
     console = Console()
     cwd = Path.cwd()
@@ -215,7 +221,25 @@ async def agent_repl(
         permission=permission or PermissionPolicy.AUTO,
     )
     message_history: list[ModelMessage] | None = None
-    session: PromptSession[str] = PromptSession(history=InMemoryHistory())
+
+    # Custom key bindings
+    kb = KeyBindings()
+
+    @kb.add("c-o")
+    def _toggle_status(event):
+        deps.status_visible = not deps.status_visible
+        state = "visible" if deps.status_visible else "hidden"
+        # Update any active status tracker
+        if deps.status_tracker:
+            deps.status_tracker.visible = deps.status_visible
+            if not deps.status_visible:
+                deps.status_tracker._clear_line()
+        sys.stderr.write(f"\r\033[2K\033[2mStatus line: {state} (Ctrl-O to toggle)\033[0m\n")
+        sys.stderr.flush()
+
+    session: PromptSession[str] = PromptSession(
+        history=InMemoryHistory(), key_bindings=kb
+    )
 
     # DB persistence
     db = await _connect_db()
@@ -246,7 +270,7 @@ async def agent_repl(
             f"{project_info}{instr_info}\n"
             f"Working directory: [dim]{deps.cwd}[/dim]"
             f"{persist_info}\n"
-            "Type [bold]/help[/bold] for commands, [bold]/quit[/bold] or Ctrl-D to exit",
+            "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] toggle status, [bold]Ctrl-D[/bold] to exit",
             title="forge agent" if system is AGENT_SYSTEM else "forge",
             border_style="magenta",
         )
@@ -324,6 +348,15 @@ async def agent_repl(
                     else:
                         console.print("[dim]No history yet.[/dim]")
                     continue
+                elif cmd == "/status":
+                    deps.status_visible = not deps.status_visible
+                    if deps.status_tracker:
+                        deps.status_tracker.visible = deps.status_visible
+                        if not deps.status_visible:
+                            deps.status_tracker._clear_line()
+                    state = "visible" if deps.status_visible else "hidden"
+                    console.print(f"[dim]Status line: {state}[/dim]")
+                    continue
                 elif cmd == "/think":
                     deps.thinking_enabled = not deps.thinking_enabled
                     state = "on" if deps.thinking_enabled else "off"
@@ -354,6 +387,7 @@ async def agent_repl(
                             "/compact  — compact history to fit token budget\n"
                             "/tokens   — show estimated token count\n"
                             "/messages — list message history\n"
+                            "/status   — toggle status line (or Ctrl-O)\n"
                             "/think    — toggle extended thinking on/off\n"
                             "/plan     — plan before executing (e.g. /plan refactor X)\n"
                             "/cwd      — show working directory\n"
@@ -442,6 +476,16 @@ async def _connect_db():
 
 def _handle_agent_error(console: Console, e: Exception) -> None:
     """Print a user-friendly agent error message."""
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    if isinstance(e, UsageLimitExceeded):
+        console.print(
+            "[yellow]Agent hit the request limit (25 iterations).[/yellow] "
+            "This usually means the model was stuck in a loop. "
+            "The partial result has been preserved in history."
+        )
+        return
+
     err_str = str(e).lower()
     if "connection" in err_str or "connect" in err_str:
         console.print(

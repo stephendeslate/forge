@@ -3,7 +3,7 @@
 import os
 from unittest.mock import patch
 
-from forge.agent.loop import _ensure_ollama_env, _maybe_prepend_think
+from forge.agent.loop import _ensure_ollama_env, _maybe_prepend_think, AGENT_SYSTEM
 from forge.agent.deps import AgentDeps
 from forge.core.project import detect_project_type, load_project_instructions
 
@@ -70,6 +70,25 @@ class TestLoadProjectInstructions:
         (d / "instructions.md").write_text("Custom forge instructions")
         result = load_project_instructions(tmp_path)
         assert "Custom forge instructions" in result
+
+
+class TestAgentSystemPrompt:
+    """Verify the system prompt instructs the model to synthesize tool results."""
+
+    def test_system_prompt_mentions_web_tools(self):
+        assert "web search" in AGENT_SYSTEM.lower()
+        assert "web fetch" in AGENT_SYSTEM.lower()
+
+    def test_system_prompt_has_synthesis_instruction(self):
+        """Model must be told to synthesize answers from tool results, not dump raw output."""
+        assert "synthesize" in AGENT_SYSTEM.lower() or "raw data" in AGENT_SYSTEM.lower()
+        assert "never dump raw" in AGENT_SYSTEM.lower()
+
+    def test_system_prompt_has_answer_guidance(self):
+        """Model must be told to answer the user's question based on tool results."""
+        assert "answer" in AGENT_SYSTEM.lower()
+        # Should mention using tools to gather info, then responding
+        assert "clear answer" in AGENT_SYSTEM.lower() or "natural answer" in AGENT_SYSTEM.lower()
 
 
 class TestEnsureOllamaEnv:

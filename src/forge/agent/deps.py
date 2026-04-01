@@ -23,3 +23,4 @@ class AgentDeps:
     permission: PermissionPolicy = PermissionPolicy.AUTO
     status_tracker: StatusTracker | None = None
     thinking_enabled: bool = False
+    status_visible: bool = True

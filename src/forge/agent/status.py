@@ -40,6 +40,7 @@ class StatusTracker:
     """
 
     console: Console
+    visible: bool = True
     _start_time: float = field(default=0.0, init=False)
     _phase: Phase = field(default=Phase.THINKING, init=False)
     _detail: str = field(default="", init=False)
@@ -92,7 +93,8 @@ class StatusTracker:
         """Resume status line output after Rich Live stops."""
         if self._active:
             self._paused = False
-            self._print_status()
+            if self.visible:
+                self._print_status()
 
     def increment_tool_calls(self) -> None:
         """Increment the tool call counter."""
@@ -112,7 +114,7 @@ class StatusTracker:
 
     def _print_status(self) -> None:
         """Print the ephemeral status line."""
-        if not self.console.is_terminal or self._paused or not self._active:
+        if not self.console.is_terminal or self._paused or not self._active or not self.visible:
             return
         emoji, _ = _PHASE_DISPLAY.get(self._phase, ("", "dim"))
         parts = [emoji, self._elapsed(), "│", self._phase.value]
