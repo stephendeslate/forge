@@ -211,5 +211,5 @@ class TestRetrieve:
                 await retrieve("query", "proj", mock_db)
 
         call_kwargs = mock_db.search.call_args
-        assert call_kwargs.kwargs["limit"] == 8
+        assert call_kwargs.kwargs["limit"] == 20
         assert call_kwargs.kwargs["min_score"] == 0.3

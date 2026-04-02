@@ -134,14 +134,17 @@ async def edit_file(
 async def run_command(
     ctx: RunContext[AgentDeps],
     command: str,
-    timeout: float = 30.0,
+    timeout: float = 0,
 ) -> str:
     """Execute a shell command in the working directory and return stdout + stderr.
 
     Args:
         command: The shell command to run.
-        timeout: Maximum seconds to wait (default 30).
+        timeout: Maximum seconds to wait (0 = use default from config).
     """
+    from forge.config import settings as _settings
+    if timeout <= 0:
+        timeout = _settings.agent.run_command_timeout
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -170,14 +173,15 @@ async def run_command(
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
     if stdout_text:
-        # Truncate very long output
-        if len(stdout_text) > 10_000:
-            stdout_text = stdout_text[:10_000] + "\n... (truncated)"
+        stdout_limit = _settings.agent.run_command_stdout_limit
+        if len(stdout_text) > stdout_limit:
+            stdout_text = stdout_text[:stdout_limit] + "\n... (truncated)"
         parts.append(f"stdout:\n{stdout_text}")
 
     if stderr_text:
-        if len(stderr_text) > 5_000:
-            stderr_text = stderr_text[:5_000] + "\n... (truncated)"
+        stderr_limit = _settings.agent.run_command_stderr_limit
+        if len(stderr_text) > stderr_limit:
+            stderr_text = stderr_text[:stderr_limit] + "\n... (truncated)"
         parts.append(f"stderr:\n{stderr_text}")
 
     if not stdout_text and not stderr_text:
@@ -191,6 +195,8 @@ async def search_code(
     pattern: str,
     path: str = ".",
     glob_filter: str = "",
+    file_type: str = "",
+    context_lines: int = 0,
 ) -> str:
     """Search file contents using ripgrep. Returns matching lines with file paths and line numbers.
 
@@ -198,14 +204,23 @@ async def search_code(
         pattern: Regex pattern to search for.
         path: Directory to search in (relative to cwd or absolute).
         glob_filter: Optional glob to filter files (e.g. "*.py", "*.ts").
+        file_type: Optional file type filter (e.g. "py", "ts", "rust").
+        context_lines: Lines of context around each match (0-10).
     """
+    from forge.config import settings as _settings
+
     search_path = _resolve_path(ctx, path)
     if not search_path.exists():
         return f"Error: Path not found: {search_path}"
 
-    cmd_parts = ["rg", "--line-number", "--no-heading", "--color=never", "--max-count=50"]
+    max_matches = _settings.agent.search_max_matches
+    cmd_parts = ["rg", "--line-number", "--no-heading", "--color=never", f"--max-count={max_matches}"]
     if glob_filter:
         cmd_parts.extend(["--glob", glob_filter])
+    if file_type:
+        cmd_parts.extend(["--type", file_type])
+    if context_lines > 0:
+        cmd_parts.extend(["-C", str(min(context_lines, 10))])
     cmd_parts.extend(["--", pattern, str(search_path)])
 
     try:
@@ -231,9 +246,9 @@ async def search_code(
         return f"Error: {err}" if err else "No matches found."
 
     lines = output.splitlines()
-    if len(lines) > 50:
-        lines = lines[:50]
-        lines.append(f"... ({len(output.splitlines())} total matches, showing first 50)")
+    if len(lines) > max_matches:
+        lines = lines[:max_matches]
+        lines.append(f"... ({len(output.splitlines())} total matches, showing first {max_matches})")
 
     return "\n".join(lines)
 
@@ -268,10 +283,13 @@ async def list_files(
     if not files:
         return f"No files matching '{pattern}' in {search_path}"
 
+    from forge.config import settings as _settings
+    limit = _settings.agent.list_files_limit
+
     total = len(files)
-    if total > 200:
-        files = files[:200]
-        files.append(f"... ({total} total files, showing first 200)")
+    if total > limit:
+        files = files[:limit]
+        files.append(f"... ({total} total files, showing first {limit})")
 
     return "\n".join(files)
 
@@ -845,7 +863,7 @@ async def delegate(
     task: str,
     model: str | None = None,
 ) -> str:
-    """Delegate a contained task to a sub-agent running a fast local model.
+    """Delegate a contained task to a sub-agent.
 
     The sub-agent runs in an isolated git worktree with its own tools.
     Use this for self-contained implementation tasks with a clear spec
@@ -855,7 +873,7 @@ async def delegate(
     Args:
         ctx: The run context.
         task: Clear description of what the sub-agent should do.
-        model: Optional model override (defaults to fast model).
+        model: Optional model override (defaults to heavy model via config).
 
     Returns:
         Sub-agent's output summary, including branch name if changes were made.

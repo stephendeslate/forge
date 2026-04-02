@@ -11,15 +11,19 @@ async def retrieve(
     project: str,
     db: Database,
     *,
-    limit: int = 8,
+    limit: int = 20,
     min_score: float = 0.3,
-    max_tokens: int = 3000,
+    max_tokens: int = 0,
 ) -> list[ChunkRow]:
     """Retrieve relevant code chunks for a query.
 
     Embeds the query, searches pgvector, and returns chunks ranked by similarity,
     respecting a total token budget.
     """
+    if max_tokens <= 0:
+        from forge.config import settings
+        max_tokens = settings.agent.rag_max_tokens
+
     query_embedding = await embed_single(query)
     embedding_str = format_embedding_for_pg(query_embedding)
 

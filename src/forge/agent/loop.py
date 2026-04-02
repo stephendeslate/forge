@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.messages import ModelMessage
-from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 from rich.console import Console
 from rich.markdown import Markdown
@@ -18,7 +17,6 @@ from rich.panel import Panel
 
 from forge import __version__
 from forge.agent.context import (
-    DEFAULT_TOKEN_BUDGET,
     count_messages_tokens,
     smart_compact_history,
 )
@@ -41,7 +39,7 @@ from forge.agent.tools import ALL_TOOLS, DELEGATE_TOOLS, MEMORY_TOOLS, TASK_TOOL
 from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
 from forge.log import get_logger
-from forge.models.ollama import _ensure_ollama_env
+from forge.models.ollama import _ensure_ollama_env, _model_settings
 
 if TYPE_CHECKING:
     from forge.storage.database import Database
@@ -128,7 +126,7 @@ def create_agent(
         tools=tools if tools is not None else ALL_TOOLS,
         toolsets=toolsets or [],
         deps_type=AgentDeps,
-        model_settings=ModelSettings(timeout=300),
+        model_settings=_model_settings(),
         retries=3,
     )
 
@@ -178,7 +176,7 @@ async def _run_with_status(
             deps=deps,
             message_history=message_history,
             event_stream_handler=render_events,
-            usage_limits=UsageLimits(request_limit=15),
+            usage_limits=UsageLimits(request_limit=settings.agent.request_limit),
         )
         if deps.model_override:
             run_kwargs["model"] = f"ollama:{deps.model_override}"
@@ -234,7 +232,7 @@ async def _plan_and_execute(
         instructions=PLAN_OVERLAY,
         tools=[],  # No tools in planning mode
         deps_type=AgentDeps,
-        model_settings=ModelSettings(timeout=300),
+        model_settings=_model_settings(),
     )
 
     console.print("[dim]Planning...[/dim]")
@@ -661,12 +659,13 @@ async def agent_repl(
                     continue
                 elif cmd == "/compact":
                     if message_history:
+                        budget = settings.agent.token_budget
                         before = len(message_history)
                         _, before_tokens = count_messages_tokens(message_history)
                         console.print(
-                            f"[dim]Compacting {before} messages (~{before_tokens:,} tokens)...[/dim]"
+                            f"[dim]Compacting {before} messages (~{before_tokens:,} tokens, budget {budget:,})...[/dim]"
                         )
-                        message_history = await smart_compact_history(message_history)
+                        message_history = await smart_compact_history(message_history, budget)
                         after = len(message_history)
                         _, after_tokens = count_messages_tokens(message_history)
                         console.print(
@@ -678,8 +677,9 @@ async def agent_repl(
                     continue
                 elif cmd == "/tokens":
                     if message_history:
+                        budget = settings.agent.token_budget
                         count, tokens = count_messages_tokens(message_history)
-                        console.print(f"[dim]{count} messages, ~{tokens:,} tokens[/dim]")
+                        console.print(f"[dim]{count} messages, ~{tokens:,} / {budget:,} tokens[/dim]")
                     else:
                         console.print("[dim]No history yet.[/dim]")
                     continue
@@ -1022,11 +1022,12 @@ async def agent_repl(
                     continue
 
             # Auto-compact if history is getting large
+            budget = settings.agent.token_budget
             if message_history and len(message_history) > 40:
                 _, tokens = count_messages_tokens(message_history)
-                if tokens > DEFAULT_TOKEN_BUDGET * 0.8:
+                if tokens > budget * settings.agent.compaction_threshold:
                     before = len(message_history)
-                    message_history = await smart_compact_history(message_history)
+                    message_history = await smart_compact_history(message_history, budget)
                     after = len(message_history)
                     console.print(
                         f"[dim]Auto-compacted: {before} → {after} messages[/dim]"

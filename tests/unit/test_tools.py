@@ -150,8 +150,8 @@ class TestRunCommand:
         assert "found" in result
 
     async def test_run_truncates_long_output(self, ctx):
-        result = await run_command(ctx, "python3 -c \"print('x' * 15000)\"")
-        assert "truncated" in result.lower() or len(result) <= 12000
+        result = await run_command(ctx, "python3 -c \"print('x' * 60000)\"")
+        assert "truncated" in result.lower() or len(result) <= 55000
 
 
 @pytest.mark.skipif(not has_rg, reason="ripgrep (rg) not installed")

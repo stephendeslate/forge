@@ -285,7 +285,6 @@ async def _summarize_with_prompt(
     Returns None on any failure.
     """
     from pydantic_ai import Agent
-    from pydantic_ai.settings import ModelSettings
 
     from forge.config import settings
 
@@ -299,8 +298,9 @@ async def _summarize_with_prompt(
         return None
 
     conversation_text = "\n---\n".join(text_parts)
-    if len(conversation_text) > 8000:
-        conversation_text = conversation_text[:8000] + "\n... (truncated)"
+    input_limit = settings.agent.compaction_input_limit
+    if len(conversation_text) > input_limit:
+        conversation_text = conversation_text[:input_limit] + "\n... (truncated)"
 
     if prompt_template:
         prompt = prompt_template.format(
@@ -325,11 +325,12 @@ async def _summarize_with_prompt(
         os.environ["OLLAMA_BASE_URL"] = base
 
     try:
+        from forge.models.ollama import _model_settings
         summarizer: Agent[None, str] = Agent(
-            model=f"ollama:{settings.ollama.fast_model}",
+            model=f"ollama:{settings.ollama.heavy_model}",
             instructions="You are a concise conversation summarizer for an AI coding assistant.",
             tools=[],
-            model_settings=ModelSettings(timeout=60),
+            model_settings=_model_settings(timeout=60),
         )
         result = await summarizer.run(prompt)
         summary = result.output

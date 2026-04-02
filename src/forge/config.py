@@ -60,6 +60,23 @@ class HookSettings(BaseSettings):
     user_prompt_submit: list[str] = Field(default_factory=list, description="Shell commands on prompt submit")
 
 
+class AgentSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FORGE_AGENT_")
+
+    num_ctx: int = Field(default=131072, description="Ollama num_ctx — context window size in tokens")
+    token_budget: int = Field(default=120000, description="Max tokens before auto-compaction triggers")
+    compaction_threshold: float = Field(default=0.85, description="Fraction of token_budget that triggers auto-compaction")
+    compaction_input_limit: int = Field(default=32000, description="Max chars of conversation text fed to the summarizer")
+    request_limit: int = Field(default=25, description="Max LLM requests per agent turn")
+    run_command_timeout: float = Field(default=120.0, description="Default timeout for run_command tool (seconds)")
+    run_command_stdout_limit: int = Field(default=50000, description="Max stdout chars captured from run_command")
+    run_command_stderr_limit: int = Field(default=20000, description="Max stderr chars captured from run_command")
+    search_max_matches: int = Field(default=200, description="Max ripgrep matches in search_code")
+    list_files_limit: int = Field(default=500, description="Max files returned by list_files")
+    rag_max_tokens: int = Field(default=12000, description="Max tokens of RAG context injected into prompts")
+    delegate_model: str = Field(default="", description="Model for sub-agent delegation (empty = use heavy model)")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="FORGE_",
@@ -69,7 +86,7 @@ class Settings(BaseSettings):
 
     default_route: Literal["heavy", "fast", "auto"] = "auto"
     streaming: bool = True
-    max_history: int = Field(default=50, description="Max conversation turns kept in memory")
+    max_history: int = Field(default=50, description="Max conversation turns kept in memory (code mode)")
     persist_history: bool = Field(default=True, description="Persist conversations to PostgreSQL")
 
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
@@ -77,6 +94,7 @@ class Settings(BaseSettings):
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     hooks: HookSettings = Field(default_factory=HookSettings)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
 
     @classmethod
     def ensure_config_dir(cls) -> Path:

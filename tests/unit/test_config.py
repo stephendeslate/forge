@@ -42,6 +42,8 @@ class TestSettings:
         assert s.persist_history is True
         assert isinstance(s.ollama, OllamaSettings)
         assert isinstance(s.npu, NPUSettings)
+        assert s.agent.num_ctx == 131072
+        assert s.agent.token_budget == 120000
 
     def test_env_override_streaming(self):
         with patch.dict(os.environ, {"FORGE_STREAMING": "false"}):

@@ -10,8 +10,15 @@ from pydantic_ai.settings import ModelSettings
 
 from forge.config import settings
 
-# Ollama can take a while to load models, especially the 84GB heavy model
-_OLLAMA_TIMEOUT = ModelSettings(timeout=300)
+
+def _model_settings(timeout: int = 300, num_ctx: int | None = None) -> ModelSettings:
+    """Build ModelSettings with num_ctx passed through to Ollama via extra_body."""
+    ctx = num_ctx or settings.agent.num_ctx
+    return ModelSettings(timeout=timeout, extra_body={"options": {"num_ctx": ctx}})
+
+
+# Legacy alias — callers that just need the default timeout + num_ctx
+_OLLAMA_TIMEOUT = _model_settings()
 
 
 def _ensure_ollama_env() -> None:

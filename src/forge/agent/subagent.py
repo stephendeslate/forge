@@ -8,7 +8,6 @@ from pathlib import Path
 
 from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import ModelMessage
-from pydantic_ai.settings import ModelSettings
 
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import HookRegistry
@@ -98,7 +97,7 @@ async def run_subagent(
             base = f"{base}/v1"
         os.environ["OLLAMA_BASE_URL"] = base
 
-    model_name = model or settings.ollama.fast_model
+    model_name = model or settings.agent.delegate_model or settings.ollama.heavy_model
     worktree_info: WorktreeInfo | None = None
     work_dir = cwd
 
@@ -118,12 +117,13 @@ async def run_subagent(
         full_system += f"\n\n{project_ctx}"
 
     # Create sub-agent with limited tools and permissive policy
+    from forge.models.ollama import _model_settings
     agent: Agent[AgentDeps, str] = Agent(
         model=f"ollama:{model_name}",
         instructions=full_system,
         tools=SUBAGENT_TOOLS,
         deps_type=AgentDeps,
-        model_settings=ModelSettings(timeout=timeout),
+        model_settings=_model_settings(timeout=int(timeout), num_ctx=min(settings.agent.num_ctx, 32768)),
         retries=2,
     )
 
