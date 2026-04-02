@@ -36,7 +36,7 @@ from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
 from forge.agent.status import StatusTracker
 from forge.agent.task_store import TaskStore
-from forge.agent.tools import ALL_TOOLS, MEMORY_TOOLS, TASK_TOOLS
+from forge.agent.tools import ALL_TOOLS, DELEGATE_TOOLS, MEMORY_TOOLS, TASK_TOOLS
 from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
 from forge.log import get_logger
@@ -81,6 +81,13 @@ Do not create tasks for single simple operations.
 When the user asks you to remember something, use save_memory with an appropriate category.
 When you need to recall past context, use recall_memories.
 Categories: feedback (user corrections), project (decisions/context), user (role/preferences), reference (external pointers).
+
+## Delegation
+Use the delegate tool for contained, single-file implementation tasks with a clear spec.
+The sub-agent runs a fast local model in an isolated git worktree.
+Good for: "write tests for X", "add docstrings to Y", "implement function Z per this spec".
+Bad for: multi-file refactors, architectural decisions, tasks requiring your conversation context.
+After delegation, verify the sub-agent's work before reporting success.
 """
 
 PLAN_OVERLAY = """\
@@ -483,6 +490,7 @@ async def agent_repl(
 
     # Build agent with conditional tools
     extra_tools: list[Tool] = list(TASK_TOOLS)  # Always add task tools
+    extra_tools.extend(DELEGATE_TOOLS)  # Sub-agent delegation
     if deps.memory_db:
         extra_tools.extend(MEMORY_TOOLS)
     if rag_available:

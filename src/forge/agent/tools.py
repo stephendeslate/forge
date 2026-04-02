@@ -838,3 +838,40 @@ TASK_TOOLS: list[Tool] = [
     Tool(with_hooks(task_list)),
     Tool(with_hooks(task_get)),
 ]
+
+
+async def delegate(
+    ctx: RunContext[AgentDeps],
+    task: str,
+    model: str | None = None,
+) -> str:
+    """Delegate a contained task to a sub-agent running a fast local model.
+
+    The sub-agent runs in an isolated git worktree with its own tools.
+    Use this for self-contained implementation tasks with a clear spec
+    (e.g. "add a docstring to all functions in X", "write tests for Y").
+    Do NOT delegate tasks requiring cross-file architectural decisions.
+
+    Args:
+        ctx: The run context.
+        task: Clear description of what the sub-agent should do.
+        model: Optional model override (defaults to fast model).
+
+    Returns:
+        Sub-agent's output summary, including branch name if changes were made.
+    """
+    from forge.agent.subagent import run_subagent_and_merge
+
+    result = await run_subagent_and_merge(
+        task=task,
+        cwd=ctx.deps.cwd,
+        model=model,
+    )
+    if not result.success:
+        raise ModelRetry(f"Sub-agent failed: {result.output}")
+    return result.output
+
+
+DELEGATE_TOOLS: list[Tool] = [
+    Tool(with_hooks(delegate), sequential=True),
+]

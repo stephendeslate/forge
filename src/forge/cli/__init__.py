@@ -153,3 +153,13 @@ def run(
     from ._run import run_command
 
     asyncio.run(run_command(prompt, retries, timeout, project))
+
+
+@app.command()
+def serve(
+    cwd: str = typer.Option(None, "--cwd", help="Working directory for MCP tools"),
+) -> None:
+    """Start Forge as an MCP server (stdio transport)."""
+    from forge.mcp_server import run as mcp_run
+
+    mcp_run(cwd=cwd)

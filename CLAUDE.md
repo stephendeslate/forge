@@ -10,11 +10,13 @@
 ## Commands
 
 ```bash
-forge                           # Interactive REPL
+forge                           # Interactive REPL (defaults to agent mode)
 forge agent                     # Agentic coding mode (tool-using REPL)
 forge agent "read X and fix Y"  # Agentic mode with initial prompt
 forge agent --yolo              # Skip permission prompts for writes/commands
 forge agent --ask               # Prompt for every tool call
+forge agent --worktree          # Run in isolated git worktree (auto-named)
+forge agent --worktree --worktree-name feat  # Named worktree
 forge ask "question"            # One-shot query (auto-routes)
 forge ask --gpu "complex"       # Force heavy model
 forge ask --fast "quick"        # Force fast model
@@ -32,7 +34,36 @@ forge history                   # List recent conversation sessions
 forge history --limit 50        # List more sessions
 forge resume                    # Resume most recent session
 forge resume <session_id>       # Resume a specific session (prefix match)
+forge serve                     # Start as MCP server (stdio transport)
+forge serve --cwd /path         # MCP server rooted at specific directory
 ```
+
+### Agent REPL Commands
+
+```
+/help         — show all commands and keyboard shortcuts
+/compact      — force context compaction (shows before/after token counts)
+/tokens       — show current token estimate
+/plan <task>  — plan before executing (two-phase: plan → review → execute)
+/plan-status  — show active plan
+/think        — toggle extended thinking (qwen3 /think tag)
+/tasks        — show task list with status and dependencies
+/memory       — show memory stats or search memories
+/forget <id>  — delete a memory by numeric ID
+/mcp          — list connected MCP servers
+/worktree [n] — create isolated git worktree (optional name)
+/cd <dir>     — change working directory (reloads agent context)
+/cwd          — show current working directory
+/model <name> — switch model mid-session
+/exit         — exit the REPL
+```
+
+### Keyboard Shortcuts
+
+- **Ctrl-O** — toggle status line visibility
+- **Ctrl-R** — toggle tool result visibility
+- **Ctrl-C** — interrupt current generation
+- **Ctrl-D** — exit REPL
 
 ## Architecture
 
@@ -44,13 +75,24 @@ CLI (typer) → Router (heuristic) → OllamaBackend (pydantic-ai)
 
 forge index → walk → tree-sitter chunk → embed (nomic-v2-moe) → pgvector store
 forge code  → embed query → pgvector search → inject context → generate
-forge agent → pydantic-ai Agent(tools=[...]) → agentic loop (read/write/edit/run/search)
+forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
+               ├── tools: read/write/edit/run/search/web_search/web_fetch
+               ├── task tools: task_create/task_update/task_list/task_get
+               ├── memory tools: save_memory/recall_memories
+               ├── MCP: external tool servers via .forge/mcp.json
+               └── hooks: pre/post tool use events, permission enforcement
 ```
 
 - **Router** uses keyword heuristics (no LLM call) to classify prompts; auto-routes short simple prompts to NPU when enabled
 - **Pydantic AI** wraps Ollama via OpenAI-compatible API (`OLLAMA_BASE_URL` env var with `/v1` suffix)
 - **Streaming** via `Agent.run_stream()` → `stream_text(delta=True)` → Rich Live display
 - **Agent mode** uses `Agent.run()` with `event_stream_handler` for tool-calling loop + streaming display
+- **Hooks** event-driven system (`PreToolUse`, `PostToolUse`, `SessionStart/End`, etc.) with priority ordering and block/allow semantics
+- **Tasks** in-memory store with `PENDING → IN_PROGRESS → COMPLETED` lifecycle, dependency tracking, system prompt injection
+- **Memory** cross-session persistence via pgvector embeddings — categories: `feedback`, `project`, `user`, `reference`; semantic recall + auto-pruning
+- **MCP** discovers `.forge/mcp.json` (project-local) and `~/.config/forge/mcp.json` (global), expands `${VAR}` env refs, project overrides global
+- **Context compaction** 3-tier: truncate tool results → summarize task sequences → full LLM summarization with domain-aware prompt; auto-triggers at 80% token budget
+- **Worktrees** git worktree isolation via `--worktree` flag or `/worktree` command; atexit crash safety, cleanup prompt on exit
 - **RAG** tree-sitter AST chunking → nomic-embed-text-v2-moe (768d) → pgvector cosine search
 - **Database** PostgreSQL on Unix socket (port 5433), pgvector 0.6.0 with `vector` type (not halfvec)
 
@@ -65,10 +107,15 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop (read/write/edit
 - tree-sitter 0.25+ requires individual language packages (`tree-sitter-python`, etc.), not `tree-sitter-languages`
 - Conversation persistence: `sessions` table (metadata) + `conversations` table (messages), async fire-and-forget writes
 - Disable persistence with `FORGE_PERSIST_HISTORY=false`
+- MCP config format: `{"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}` — same schema as Claude Desktop
+- Memory stored in `memories` table with 768d embeddings; recalled via cosine similarity; auto-prunes at 50 entries
+- Task store is in-memory per session, serialized to DB for resume; injected into system prompt via `to_prompt()`
+- Hook registry: `HookRegistry.on(EventType, handler)` with priority ordering; `@with_hooks` decorator wraps tools
 
 ## Testing
 
 ```bash
+uv run pytest tests/unit/ -x -q              # Run all unit tests
 uv run forge --version
 uv run forge status
 uv run forge ask --fast "test"
@@ -78,6 +125,7 @@ uv run forge code "explain the router" --fast  # RAG-augmented query
 uv run forge agent "read pyproject.toml and tell me the project name"
 uv run forge agent                             # Interactive agentic REPL
 uv run forge agent --yolo "find all files importing typer"  # No permission prompts
+uv run forge agent --worktree                  # Agent in isolated worktree
 ```
 
 ## Phases
@@ -89,3 +137,6 @@ uv run forge agent --yolo "find all files importing typer"  # No permission prom
 - [x] Phase 4: Conversation persistence (PostgreSQL sessions + messages, history/resume commands)
 - [x] Phase 5: NPU integration (FastFlowLM) — httpx backend, auto-routing, `/npu` + `--npu` CLI
 - [x] Phase 6: Agentic coding mode — tool-using agent loop (read, write, edit, search, run commands)
+- [x] Phase 7A: Hooks, task tracking, cross-session memory — event system, in-memory tasks with dependencies, pgvector semantic memory
+- [x] Phase 7B: Worktrees + improved compaction — git worktree isolation, 3-tier context compaction with domain-aware summarization
+- [x] Phase 7C: MCP integration — discover and connect external MCP tool servers via pydantic-ai
