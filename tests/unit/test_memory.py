@@ -114,13 +114,16 @@ class TestMemoryModule:
         mock_db = AsyncMock()
         mock_db.save_memory = AsyncMock(return_value=51)
         mock_db.count_memories = AsyncMock(return_value=55)
-        mock_db.prune_memories = AsyncMock(return_value=5)
+        mock_db.find_similar_pairs = AsyncMock(return_value=[])
+        mock_db.get_all_memories_with_embeddings = AsyncMock(return_value=[])
+        mock_db.prune_by_ids = AsyncMock(return_value=0)
 
         with patch("forge.agent.memory.embed_single", new_callable=AsyncMock, return_value=[0.1] * 768):
             with patch("forge.agent.memory.format_embedding_for_pg", return_value="[0.1,...]"):
                 await save_memory_to_db(mock_db, "proj", "feedback", "subj", "content")
 
-        mock_db.prune_memories.assert_called_once_with("proj", keep=50)
+        # Smart prune is now called instead of simple prune_memories
+        mock_db.find_similar_pairs.assert_called_once()
 
     async def test_recall_from_db(self):
         from forge.agent.memory import recall_from_db

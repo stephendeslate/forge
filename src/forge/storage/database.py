@@ -60,6 +60,26 @@ class Database:
                     max_size=self._pool_max,
                     timeout=self._connect_timeout,
                 )
+                # Auto-run pending migrations
+                try:
+                    from forge.storage.migrations import run_migrations
+
+                    applied = await run_migrations(self._pool)
+                    if applied:
+                        from forge.log import get_logger
+
+                        get_logger(__name__).info(
+                            "Applied %d migration(s): %s",
+                            len(applied),
+                            ", ".join(applied),
+                        )
+                except Exception:
+                    from forge.log import get_logger
+
+                    get_logger(__name__).warning(
+                        "Migration check failed — continuing without migrations",
+                        exc_info=True,
+                    )
                 return
             except (OSError, asyncpg.PostgresError) as exc:
                 if attempt == self._retry_attempts - 1:
@@ -323,11 +343,13 @@ class Database:
                 embedding, project, limit, min_score,
             )
 
-        # Touch accessed_at for returned memories
+        # Touch accessed_at and increment access_count for returned memories
         if rows:
             ids = [r["id"] for r in rows]
             await self.pool.execute(
-                "UPDATE memories SET accessed_at = NOW() WHERE id = ANY($1::bigint[])",
+                "UPDATE memories SET accessed_at = NOW(), "
+                "access_count = COALESCE(access_count, 0) + 1 "
+                "WHERE id = ANY($1::bigint[])",
                 ids,
             )
 
@@ -402,6 +424,95 @@ class Database:
             )
             """,
             project, keep,
+        )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    async def find_similar_pairs(
+        self, project: str, threshold: float = 0.92,
+    ) -> list[tuple[int, int, float]]:
+        """Find memory pairs with cosine similarity >= threshold."""
+        rows = await self.pool.fetch(
+            """
+            SELECT a.id AS id_a, b.id AS id_b,
+                   1 - (a.embedding <=> b.embedding) AS similarity
+            FROM memories a, memories b
+            WHERE a.project = $1 AND b.project = $1
+              AND a.id < b.id
+              AND 1 - (a.embedding <=> b.embedding) >= $2
+            ORDER BY similarity DESC
+            """,
+            project, threshold,
+        )
+        return [(r["id_a"], r["id_b"], r["similarity"]) for r in rows]
+
+    async def get_memories_by_ids(self, ids: list[int]) -> list[MemoryRow]:
+        """Fetch specific memories by ID."""
+        rows = await self.pool.fetch(
+            "SELECT id, project, category, subject, content, created_at, accessed_at, "
+            "COALESCE(access_count, 0) AS access_count "
+            "FROM memories WHERE id = ANY($1::bigint[]) ORDER BY id",
+            ids,
+        )
+        result = []
+        for r in rows:
+            mr = MemoryRow(
+                id=r["id"], project=r["project"], category=r["category"],
+                subject=r["subject"], content=r["content"],
+                created_at=r["created_at"], accessed_at=r["accessed_at"],
+            )
+            mr.access_count = r["access_count"]  # type: ignore[attr-defined]
+            result.append(mr)
+        return result
+
+    async def get_all_memories_with_embeddings(self, project: str) -> list[MemoryRow]:
+        """Fetch all memories for a project with access_count."""
+        rows = await self.pool.fetch(
+            "SELECT id, project, category, subject, content, created_at, accessed_at, "
+            "COALESCE(access_count, 0) AS access_count "
+            "FROM memories WHERE project = $1 ORDER BY id",
+            project,
+        )
+        result = []
+        for r in rows:
+            mr = MemoryRow(
+                id=r["id"], project=r["project"], category=r["category"],
+                subject=r["subject"], content=r["content"],
+                created_at=r["created_at"], accessed_at=r["accessed_at"],
+            )
+            mr.access_count = r["access_count"]  # type: ignore[attr-defined]
+            result.append(mr)
+        return result
+
+    async def merge_memory(
+        self, keep_id: int, discard_id: int, new_content: str, new_embedding: str,
+    ) -> None:
+        """Merge two memories: update keeper content/embedding, delete discarded."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # Sum access counts
+                await conn.execute(
+                    """
+                    UPDATE memories SET
+                        content = $2,
+                        embedding = $3::vector,
+                        access_count = COALESCE(access_count, 0) + (
+                            SELECT COALESCE(access_count, 0) FROM memories WHERE id = $4
+                        )
+                    WHERE id = $1
+                    """,
+                    keep_id, new_content, new_embedding, discard_id,
+                )
+                await conn.execute("DELETE FROM memories WHERE id = $1", discard_id)
+
+    async def prune_by_ids(self, ids: list[int]) -> int:
+        """Delete memories by ID list. Returns count deleted."""
+        if not ids:
+            return 0
+        result = await self.pool.execute(
+            "DELETE FROM memories WHERE id = ANY($1::bigint[])", ids,
         )
         try:
             return int(result.split()[-1])

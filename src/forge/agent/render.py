@@ -134,14 +134,22 @@ async def render_events(
                 tracker.resume()
 
     def _finalize_live() -> None:
-        """Stop transient Live and clean up state.
+        """Stop non-transient Live and record streamed text in the turn buffer.
 
-        Does not print — the transient Live handles streaming display,
-        and loop.py prints the authoritative result.output after run().
+        The Live persists on screen (transient=False). We add the final
+        rendered content to the turn buffer as already_printed so that
+        loop.py won't duplicate it and Ctrl-R rerender still works.
         """
         nonlocal live, has_thinking
         if live is None:
             return
+        raw = "".join(text_chunks)
+        if raw.strip():
+            visible = _render_text_with_thinking(raw, console, has_thinking)
+            live.update(visible)
+            turn_buffer = ctx.deps.turn_buffer
+            if turn_buffer:
+                turn_buffer.add(visible, is_tool=False, already_printed=True)
         live.stop()
         live = None
         text_chunks.clear()
@@ -171,7 +179,7 @@ async def render_events(
                             console=console,
                             refresh_per_second=12,
                             vertical_overflow="visible",
-                            transient=True,
+                            transient=False,
                         )
                         live.start()
 

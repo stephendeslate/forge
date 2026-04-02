@@ -51,6 +51,8 @@ class TurnEnd:
     turn_number: int
     tool_call_count: int
     elapsed: float
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,13 @@ EVENT_TYPES = (
 # ---------------------------------------------------------------------------
 # Hook action / result
 # ---------------------------------------------------------------------------
+
+class HookEscalation(Exception):
+    """Raised by hook handlers to escalate beyond the hook system.
+
+    Not caught by HookRegistry.check() — propagates to the agent loop.
+    """
+
 
 class HookAction(Enum):
     ALLOW = "allow"
@@ -142,10 +151,16 @@ class HookRegistry:
                 result = handler(event)
                 if asyncio.iscoroutine(result):
                     await result
+            except HookEscalation:
+                raise
             except Exception:
                 logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
 
         await asyncio.gather(*[_run(h) for _, h in handlers])
+
+    def get_handlers(self, event_type: type) -> list[tuple[int, HookHandler]]:
+        """Return a copy of handlers for the given event type."""
+        return list(self._handlers.get(event_type, []))
 
     async def check(self, event: object) -> HookResult:
         """Fire a blocking event. Handlers run sequentially; first non-ALLOW wins."""
@@ -157,6 +172,8 @@ class HookRegistry:
                     result = await result
                 if isinstance(result, HookResult) and result.action != HookAction.ALLOW:
                     return result
+            except HookEscalation:
+                raise
             except Exception:
                 logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
         return HookResult()

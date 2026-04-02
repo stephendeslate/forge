@@ -95,13 +95,16 @@ async def edit_file(
     old_text: str,
     new_text: str,
 ) -> str:
-    """Replace an exact string in a file. The old_text must appear exactly once.
+    """Replace text in a file. Tries exact match first, then whitespace-normalized
+    and fuzzy matching as fallbacks.
 
     Args:
         file_path: Path to the file (relative to cwd or absolute).
-        old_text: The exact text to find and replace (must be unique in the file).
+        old_text: The text to find and replace (must be unique in the file).
         new_text: The replacement text.
     """
+    from forge.agent.edit_utils import EditMatchError, find_and_replace
+
     path = _resolve_path(ctx, file_path)
     if not path.exists():
         raise ModelRetry(f"File not found: {path} — check the path and try again")
@@ -111,24 +114,22 @@ async def edit_file(
     except Exception as e:
         return f"Error reading {path}: {e}"
 
-    count = text.count(old_text)
-    if count == 0:
-        raise ModelRetry(
-            f"old_text not found in {path} — read the file first to get the exact text"
-        )
-    if count > 1:
-        raise ModelRetry(
-            f"old_text appears {count} times in {path} — provide more surrounding "
-            "context to make the match unique"
-        )
+    try:
+        new_content, method, warning = find_and_replace(text, old_text, new_text)
+    except EditMatchError as e:
+        raise ModelRetry(str(e))
 
-    new_content = text.replace(old_text, new_text, 1)
     try:
         path.write_text(new_content, encoding="utf-8")
     except Exception as e:
         return f"Error writing {path}: {e}"
 
-    return f"Edited {path} — replaced 1 occurrence"
+    msg = f"Edited {path}"
+    if method != "exact":
+        msg += f" (matched via {method})"
+    if warning:
+        msg += f"\nNote: {warning}"
+    return msg
 
 
 async def run_command(
@@ -884,6 +885,7 @@ async def delegate(
         task=task,
         cwd=ctx.deps.cwd,
         model=model,
+        parent_hooks=ctx.deps.hook_registry,
     )
     if not result.success:
         raise ModelRetry(f"Sub-agent failed: {result.output}")

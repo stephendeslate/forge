@@ -112,7 +112,7 @@ class TestStatusTrackerSummary:
         tracker.increment_tool_calls()
         summary = tracker.summary()
         tracker.stop()
-        assert "1 tool call in" in summary
+        assert "1 tool call" in summary
         # Singular "call" not "calls"
         assert "calls" not in summary
 
@@ -123,7 +123,7 @@ class TestStatusTrackerSummary:
             tracker.increment_tool_calls()
         summary = tracker.summary()
         tracker.stop()
-        assert "3 tool calls in" in summary
+        assert "3 tool calls" in summary
 
 
 class TestStatusTrackerTerminalOutput:

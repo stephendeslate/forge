@@ -75,6 +75,28 @@ class AgentSettings(BaseSettings):
     list_files_limit: int = Field(default=500, description="Max files returned by list_files")
     rag_max_tokens: int = Field(default=12000, description="Max tokens of RAG context injected into prompts")
     delegate_model: str = Field(default="", description="Model for sub-agent delegation (empty = use heavy model)")
+    compaction_model: str = Field(default="", description="Model for compaction summarization (empty = use fast model)")
+    preload_model: bool = Field(default=True, description="Preload the heavy model on agent startup")
+
+    # Circuit breaker
+    cb_enabled: bool = Field(default=True, description="Enable tool-call loop detection")
+    cb_identical: int = Field(default=3, description="Identical call threshold before warning")
+    cb_failures: int = Field(default=3, description="Consecutive failure threshold")
+    cb_oscillation_window: int = Field(default=3, description="A-B oscillation cycle count")
+    cb_post_warning_grace: int = Field(default=2, description="Extra calls allowed after warning before trip")
+    cb_history_size: int = Field(default=20, description="Tool call history buffer size")
+
+    # Model escalation
+    auto_escalation: bool = Field(default=True, description="Auto-escalate from fast to heavy on trouble")
+    escalation_threshold: float = Field(default=5.0, description="Cumulative signal weight to trigger escalation")
+
+
+class MemorySettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FORGE_MEMORY_")
+
+    max_memories: int = Field(default=50, description="Max memories per project before pruning")
+    similarity_threshold: float = Field(default=0.92, description="Cosine similarity threshold for dedup")
+    max_merges: int = Field(default=5, description="Max merge operations per prune cycle")
 
 
 class Settings(BaseSettings):
@@ -95,6 +117,7 @@ class Settings(BaseSettings):
     search: SearchSettings = Field(default_factory=SearchSettings)
     hooks: HookSettings = Field(default_factory=HookSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
 
     @classmethod
     def ensure_config_dir(cls) -> Path:

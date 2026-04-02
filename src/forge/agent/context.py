@@ -127,6 +127,22 @@ def count_messages_tokens(messages: list[ModelMessage]) -> tuple[int, int]:
     return len(messages), total_tokens
 
 
+def get_token_count(
+    messages: list[ModelMessage],
+    deps: object | None = None,
+) -> int:
+    """Return real token count if available from deps, else estimate.
+
+    Args:
+        messages: Conversation messages (used for estimation fallback).
+        deps: AgentDeps instance with tokens_in field (optional).
+    """
+    if deps and getattr(deps, "tokens_in", 0) > 0:
+        return deps.tokens_in  # Last request's input tokens ≈ conversation size
+    _, estimated = count_messages_tokens(messages)
+    return estimated
+
+
 def _message_text(msg: ModelMessage) -> str:
     """Extract all text content from a message for token estimation."""
     parts_text: list[str] = []
@@ -326,11 +342,12 @@ async def _summarize_with_prompt(
 
     try:
         from forge.models.ollama import _model_settings
+        model_name = settings.agent.compaction_model or settings.ollama.fast_model
         summarizer: Agent[None, str] = Agent(
-            model=f"ollama:{settings.ollama.heavy_model}",
+            model=f"ollama:{model_name}",
             instructions="You are a concise conversation summarizer for an AI coding assistant.",
             tools=[],
-            model_settings=_model_settings(timeout=60),
+            model_settings=_model_settings(timeout=60, num_ctx=8192),
         )
         result = await summarizer.run(prompt)
         summary = result.output

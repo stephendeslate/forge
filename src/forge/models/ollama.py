@@ -69,6 +69,66 @@ class OllamaBackend:
                 yield chunk
 
 
+class OllamaMonitor:
+    """Tracks Ollama model state via /api/ps and manages lifecycle."""
+
+    def __init__(self, base_url: str | None = None):
+        self._base_url = (base_url or settings.ollama.base_url).rstrip("/")
+        self._session: "httpx.AsyncClient | None" = None
+
+    async def _client(self) -> "httpx.AsyncClient":
+        import httpx
+
+        if self._session is None:
+            self._session = httpx.AsyncClient(base_url=self._base_url, timeout=10)
+        return self._session
+
+    async def list_loaded(self) -> list[dict]:
+        """Call GET /api/ps, return list of loaded model dicts."""
+        client = await self._client()
+        resp = await client.get("/api/ps")
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("models", [])
+
+    async def is_loaded(self, model: str) -> bool:
+        """Check if a specific model is currently loaded."""
+        models = await self.list_loaded()
+        return any(m.get("name", "").startswith(model) for m in models)
+
+    async def preload(self, model: str, num_ctx: int | None = None) -> bool:
+        """POST /api/generate with empty prompt to preload a model.
+
+        Returns True if model loaded successfully.
+        """
+        import httpx
+
+        client = await self._client()
+        body: dict = {"model": model, "prompt": "", "stream": False}
+        if num_ctx:
+            body["options"] = {"num_ctx": num_ctx}
+        try:
+            resp = await client.post("/api/generate", json=body, timeout=120)
+            return resp.status_code == 200
+        except httpx.TimeoutException:
+            return False
+
+    async def health_check(self) -> bool:
+        """GET /api/ps — returns True if Ollama is responsive."""
+        try:
+            client = await self._client()
+            resp = await client.get("/api/ps")
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        """Close the httpx session."""
+        if self._session:
+            await self._session.aclose()
+            self._session = None
+
+
 _heavy_backend: OllamaBackend | None = None
 _fast_backend: OllamaBackend | None = None
 

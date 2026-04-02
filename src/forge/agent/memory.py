@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from forge.config import settings
 from forge.log import get_logger
 from forge.models.embeddings import embed_single, format_embedding_for_pg
 
@@ -11,8 +12,6 @@ if TYPE_CHECKING:
     from forge.storage.database import Database, MemoryRow
 
 logger = get_logger(__name__)
-
-MAX_MEMORIES = 50  # Auto-prune threshold
 
 
 async def save_memory_to_db(
@@ -26,14 +25,31 @@ async def save_memory_to_db(
     embedding = await embed_single(f"{subject}: {content}")
     embedding_str = format_embedding_for_pg(embedding)
 
+    max_memories = settings.memory.max_memories
     memory_id = await db.save_memory(project, category, subject, content, embedding_str)
 
-    # Auto-prune
+    # Auto-prune using smart scoring
     count = await db.count_memories(project)
-    if count > MAX_MEMORIES:
-        pruned = await db.prune_memories(project, keep=MAX_MEMORIES)
-        if pruned > 0:
-            logger.debug("Pruned %d old memories for project %s", pruned, project)
+    if count > max_memories:
+        try:
+            from forge.agent.memory_pruning import smart_prune
+
+            merged, pruned = await smart_prune(
+                db, project,
+                keep=max_memories,
+                similarity_threshold=settings.memory.similarity_threshold,
+                max_merges=settings.memory.max_merges,
+            )
+            if merged or pruned:
+                logger.debug(
+                    "Smart prune for %s: merged=%d, pruned=%d", project, merged, pruned,
+                )
+        except Exception:
+            # Fall back to simple LRU
+            logger.debug("Smart prune failed, falling back to LRU", exc_info=True)
+            pruned = await db.prune_memories(project, keep=max_memories)
+            if pruned > 0:
+                logger.debug("LRU pruned %d memories for project %s", pruned, project)
 
     return memory_id
 

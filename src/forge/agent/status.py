@@ -148,14 +148,22 @@ class StatusTracker:
         """Increment the tool call counter."""
         self._tool_calls += 1
 
+    # Token tracking — set externally after each turn
+    tokens_in: int = field(default=0, init=False)
+    tokens_out: int = field(default=0, init=False)
+
     def summary(self) -> str:
         """Return a final summary string."""
         elapsed = time.monotonic() - self._start_time
         tc = self._tool_calls
-        if tc == 0:
-            return f"[dim]{elapsed:.1f}s[/dim]"
-        calls = "call" if tc == 1 else "calls"
-        return f"[dim]{tc} tool {calls} in {elapsed:.1f}s[/dim]"
+        parts: list[str] = []
+        if tc > 0:
+            calls = "call" if tc == 1 else "calls"
+            parts.append(f"{tc} tool {calls}")
+        if self.tokens_in > 0 or self.tokens_out > 0:
+            parts.append(f"{self.tokens_in:,}↑ {self.tokens_out:,}↓ tok")
+        parts.append(f"{elapsed:.1f}s")
+        return f"[dim]{' · '.join(parts)}[/dim]"
 
     def _elapsed(self) -> str:
         return f"{time.monotonic() - self._start_time:.1f}s"

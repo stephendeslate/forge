@@ -11,11 +11,14 @@ from rich.console import Console
 from forge.agent.permissions import PermissionPolicy
 
 if TYPE_CHECKING:
+    from forge.agent.circuit_breaker import ToolCallTracker
+    from forge.agent.escalation import ModelEscalator
     from forge.agent.hooks import HookRegistry
     from forge.agent.status import StatusTracker
     from forge.agent.task_store import TaskStore
     from forge.agent.turn_buffer import TurnBuffer
     from forge.agent.worktree import WorktreeInfo
+    from forge.models.ollama import OllamaMonitor
     from forge.storage.database import Database
 
 
@@ -48,3 +51,12 @@ class AgentDeps:
     memory_project: str | None = None
     # Task tracking
     task_store: TaskStore | None = None
+    # Ollama model lifecycle
+    ollama_monitor: OllamaMonitor | None = None
+    # Token tracking (real counts from Ollama API)
+    tokens_in: int = 0
+    tokens_out: int = 0
+    # Circuit breaker
+    circuit_breaker: ToolCallTracker | None = None
+    # Model escalation
+    escalator: ModelEscalator | None = None

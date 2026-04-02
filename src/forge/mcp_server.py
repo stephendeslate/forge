@@ -78,27 +78,33 @@ def write_file(file_path: str, content: str) -> str:
 
 @mcp.tool()
 def edit_file(file_path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in a file. old_text must appear exactly once.
+    """Replace text in a file. Tries exact match first, then whitespace-normalized
+    and fuzzy matching as fallbacks.
 
     Args:
         file_path: Path to the file.
-        old_text: The exact text to find and replace.
+        old_text: The text to find and replace.
         new_text: The replacement text.
     """
+    from forge.agent.edit_utils import EditMatchError, find_and_replace
+
     resolved = _resolve(file_path)
     if not resolved.exists():
         return f"Error: File not found: {file_path}"
 
     content = resolved.read_text()
-    count = content.count(old_text)
-    if count == 0:
-        return "Error: old_text not found in file."
-    if count > 1:
-        return f"Error: old_text appears {count} times — must be unique."
+    try:
+        new_content, method, warning = find_and_replace(content, old_text, new_text)
+    except EditMatchError as e:
+        return f"Error: {e}"
 
-    new_content = content.replace(old_text, new_text, 1)
     resolved.write_text(new_content)
-    return f"Edited {file_path}"
+    msg = f"Edited {file_path}"
+    if method != "exact":
+        msg += f" (matched via {method})"
+    if warning:
+        msg += f"\nNote: {warning}"
+    return msg
 
 
 @mcp.tool()

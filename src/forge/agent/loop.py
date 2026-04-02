@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import UsageLimits
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
 
-from forge import __version__
 from forge.agent.context import (
     count_messages_tokens,
     smart_compact_history,
@@ -23,10 +20,6 @@ from forge.agent.context import (
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import (
     HookRegistry,
-    PostToolUse,
-    PreToolUse,
-    SessionEnd,
-    SessionStart,
     TurnEnd,
     TurnStart,
     make_permission_handler,
@@ -35,7 +28,7 @@ from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
 from forge.agent.status import StatusTracker
 from forge.agent.task_store import TaskStore
-from forge.agent.tools import ALL_TOOLS, DELEGATE_TOOLS, MEMORY_TOOLS, TASK_TOOLS
+from forge.agent.tools import ALL_TOOLS
 from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
 from forge.log import get_logger
@@ -182,12 +175,22 @@ async def _run_with_status(
             run_kwargs["model"] = f"ollama:{deps.model_override}"
 
         result = await agent.run(prompt, **run_kwargs)
+        # Capture real token counts from Ollama API response
+        try:
+            usage = result.usage()
+            deps.tokens_in += usage.input_tokens or 0
+            deps.tokens_out += usage.output_tokens or 0
+        except Exception:
+            pass  # usage() may not be available for all backends
         # Pause tracker before printing to prevent status line garbling output
         tracker.pause()
 
-        # Add final answer + summary to turn buffer, then print via buffer
-        if isinstance(result.output, str) and result.output.strip():
+        # Add final answer to turn buffer unless already streamed by render_events
+        streamed = any(not it.is_tool and it.was_printed for it in turn_buffer._items)
+        if not streamed and isinstance(result.output, str) and result.output.strip():
             turn_buffer.add(Markdown(result.output), is_tool=False)
+        tracker.tokens_in = deps.tokens_in
+        tracker.tokens_out = deps.tokens_out
         tracker.stop()
         turn_buffer.add(tracker.summary(), is_tool=False)
         turn_buffer.print_final(deps.tools_visible)
@@ -199,6 +202,8 @@ async def _run_with_status(
                 turn_number=turn_number,
                 tool_call_count=tracker.tool_calls,
                 elapsed=elapsed,
+                tokens_in=deps.tokens_in,
+                tokens_out=deps.tokens_out,
             ))
 
         deps.status_tracker = None
@@ -345,27 +350,29 @@ async def agent_repl(
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.key_binding import KeyBindings
 
+    from forge.agent.commands import CommandContext, dispatch, _UNCHANGED
+    from forge.agent.session import (
+        setup_worktree,
+        setup_persistence,
+        setup_memory,
+        setup_model_monitor,
+        setup_rag,
+        setup_mcp,
+        build_agent_with_tools,
+        wire_dynamic_prompts,
+        wire_rag_hooks,
+        print_welcome,
+        cleanup,
+    )
+
     console = Console()
     cwd = Path.cwd()
 
-    # Create worktree if requested via CLI flag
-    worktree_info = None
-    if worktree_name is not None:
-        from forge.agent.worktree import create_worktree, is_git_repo
-
-        if not is_git_repo(cwd):
-            console.print("[red]Not a git repository — cannot create worktree.[/red]")
-            return
-        try:
-            worktree_info = create_worktree(cwd, worktree_name or None)
-            cwd = worktree_info.path
-            console.print(
-                f"[green]Worktree created:[/green] {worktree_info.path}\n"
-                f"[green]Branch:[/green] {worktree_info.branch}"
-            )
-        except RuntimeError as e:
-            console.print(f"[red]Worktree error:[/red] {e}")
-            return
+    # --- Setup phase ---
+    try:
+        cwd, worktree_info = setup_worktree(cwd, worktree_name, console)
+    except SystemExit:
+        return
 
     deps = AgentDeps(
         cwd=cwd,
@@ -374,25 +381,58 @@ async def agent_repl(
         worktree=worktree_info,
     )
 
-    # Hook registry — permission enforcement
     hook_registry = HookRegistry()
+    from forge.agent.hooks import PreToolUse
     hook_registry.on(PreToolUse, make_permission_handler(deps))
     deps.hook_registry = hook_registry
-
-    # Task tracking — always available
     deps.task_store = TaskStore()
 
-    agent = create_agent(system=system, cwd=cwd)
-    message_history: list[ModelMessage] | None = None
+    # Circuit breaker
+    if settings.agent.cb_enabled:
+        from forge.agent.circuit_breaker import ToolCallTracker, wire_circuit_breaker
 
-    # Custom key bindings
+        tracker = ToolCallTracker(
+            identical_threshold=settings.agent.cb_identical,
+            failure_threshold=settings.agent.cb_failures,
+            oscillation_window=settings.agent.cb_oscillation_window,
+            post_warning_grace=settings.agent.cb_post_warning_grace,
+            history_size=settings.agent.cb_history_size,
+        )
+        deps.circuit_breaker = tracker
+        wire_circuit_breaker(tracker, deps)
+
+    await setup_model_monitor(deps, console)
+
+    db, session_id, message_history = await setup_persistence(
+        resume_session_id, deps, console, system,
+    )
+    memory_count = await setup_memory(db, deps, cwd)
+    rag_available, rag_project_name = await setup_rag(db, deps, cwd, console, worktree_info)
+    mcp_servers, mcp_stack = await setup_mcp(cwd)
+
+    agent, extra_tools, system = build_agent_with_tools(
+        system, cwd, deps, rag_available, mcp_servers,
+    )
+    wire_dynamic_prompts(agent, deps)
+
+    if rag_available and db:
+        wire_rag_hooks(hook_registry, deps, db, rag_project_name)
+
+    # Emit SessionStart
+    from forge.agent.hooks import SessionStart
+    await hook_registry.emit(SessionStart(
+        session_id=session_id, cwd=str(cwd), permission=deps.permission.value,
+    ))
+
+    print_welcome(console, deps, session_id, db, system, rag_available, memory_count, mcp_servers)
+
+    # --- Key bindings ---
     kb = KeyBindings()
 
     @kb.add("c-o")
     def _toggle_status(event):
         deps.status_visible = not deps.status_visible
         state = "visible" if deps.status_visible else "hidden"
-        # Update any active status tracker
         if deps.status_tracker:
             deps.status_tracker.visible = deps.status_visible
             if not deps.status_visible:
@@ -404,10 +444,8 @@ async def agent_repl(
     def _toggle_tools(event):
         deps.tools_visible = not deps.tools_visible
         if deps.turn_buffer and deps.turn_buffer._items:
-            # Erase prompt_toolkit's prompt display before rerendering
             event.app.renderer.erase()
             deps.turn_buffer.rerender(deps.tools_visible)
-            # Force prompt_toolkit to redraw the prompt
             event.app.renderer.reset()
             event.app.invalidate()
         else:
@@ -415,212 +453,35 @@ async def agent_repl(
             sys.stderr.write(f"\r\033[2K\033[2mTool results: {state} (Ctrl-R to toggle)\033[0m\n")
             sys.stderr.flush()
 
-    session: PromptSession[str] = PromptSession(
-        history=InMemoryHistory(), key_bindings=kb
+    pt_session: PromptSession[str] = PromptSession(
+        history=InMemoryHistory(), key_bindings=kb,
     )
 
-    # DB persistence
-    db = await _connect_db()
-    session_id = resume_session_id or str(uuid.uuid4())
+    # Model escalation
+    turn_counter_ref = [0]
+    if settings.agent.auto_escalation:
+        from forge.agent.escalation import ModelEscalator, wire_escalation
 
-    if db and resume_session_id:
-        # Resume: load existing message history
-        loaded = await _load_agent_history(db, session_id)
-        if loaded:
-            message_history = loaded
-            console.print(f"[dim]Resumed session with {len(loaded)} messages.[/dim]")
-        # Resume task store
-        try:
-            task_json = await db.load_task_store(session_id)
-            if task_json:
-                deps.task_store = TaskStore.from_json(task_json)
-                open_tasks = deps.task_store.list_open()
-                if open_tasks:
-                    console.print(f"[dim]Restored {len(open_tasks)} open task(s).[/dim]")
-        except Exception:
-            logger.debug("Task store load failed", exc_info=True)
-    elif db:
-        try:
-            await db.create_session(session_id, mode="agent" if system is AGENT_SYSTEM else "chat")
-        except Exception:
-            logger.warning("Session creation failed, disabling persistence", exc_info=True)
-            db = None
-
-    # Memory integration — wire DB for cross-session memory
-    memory_count = 0
-    if db:
-        deps.memory_db = db
-        deps.memory_project = cwd.name
-        try:
-            memory_count = await db.count_memories(cwd.name)
-        except Exception:
-            logger.debug("Memory count failed", exc_info=True)
-
-    # RAG integration — check if cwd is indexed
-    # When in a worktree, use the base repo name for project lookup
-    rag_project_name = worktree_info.base_dir.name if worktree_info else cwd.name
-    rag_available = False
-    if db:
-        try:
-            stats = await db.get_project_stats(rag_project_name)
-            if stats.get("chunk_count", 0) > 0:
-                deps.rag_db = db
-                deps.rag_project = rag_project_name
-                rag_available = True
-        except Exception:
-            logger.debug("RAG stats check failed", exc_info=True)
-
-    # Auto-reindex stale files in background
-    if rag_available and db:
-        try:
-            from forge.rag.indexer import find_stale_files, reindex_files
-            stale = await find_stale_files(cwd, db, rag_project_name)
-            if stale:
-                console.print(f"[dim]Auto-reindexing {len(stale)} changed file(s)...[/dim]")
-                asyncio.create_task(reindex_files(stale, cwd, db, rag_project_name))
-        except Exception:
-            logger.debug("Auto-reindex check failed", exc_info=True)
-
-    # MCP server integration
-    from contextlib import AsyncExitStack
-
-    from forge.agent.mcp_config import load_all_mcp_servers
-
-    mcp_servers = load_all_mcp_servers(cwd)
-    mcp_stack = AsyncExitStack()
-    mcp_started: list = []
-    for server in mcp_servers:
-        try:
-            await mcp_stack.enter_async_context(server)
-            mcp_started.append(server)
-        except Exception:
-            sid = getattr(server, "id", server)
-            logger.warning("Failed to start MCP server: %s", sid, exc_info=True)
-    mcp_servers = mcp_started  # Only pass successfully started servers
-
-    # Build agent with conditional tools
-    extra_tools: list[Tool] = list(TASK_TOOLS)  # Always add task tools
-    extra_tools.extend(DELEGATE_TOOLS)  # Sub-agent delegation
-    if deps.memory_db:
-        extra_tools.extend(MEMORY_TOOLS)
-    if rag_available:
-        from forge.agent.tools import rag_search
-        extra_tools.append(rag_search)
-        system = (
-            system + "\n\nUse rag_search for semantic code search (conceptual queries). "
-            "Use search_code for exact text/regex matches."
+        escalator = ModelEscalator(
+            deps, console, threshold=settings.agent.escalation_threshold,
         )
-    if mcp_servers:
-        system += (
-            "\n\n## MCP tools\n"
-            "Some tools come from external MCP servers. They are prefixed with the server name "
-            "(e.g. \"filesystem_read_file\"). Use them like any other tool. "
-            "If an MCP tool fails, report the error to the user."
-        )
-    agent = create_agent(
-        system=system, cwd=cwd, tools=ALL_TOOLS + extra_tools, toolsets=mcp_servers or None,
-    )
+        deps.escalator = escalator
+        wire_escalation(escalator, deps, turn_counter_ref)
 
-    # Inject dynamic task/memory context into system prompt
-    @agent.system_prompt
-    async def _inject_tasks(ctx: RunContext[AgentDeps]) -> str:
-        if ctx.deps.task_store:
-            return ctx.deps.task_store.to_prompt()
-        return ""
-
-    @agent.system_prompt
-    async def _inject_memories(ctx: RunContext[AgentDeps]) -> str:
-        if ctx.deps.memory_db and ctx.deps.memory_project:
-            try:
-                from forge.agent.memory import get_startup_memories
-                rows = await get_startup_memories(ctx.deps.memory_db, ctx.deps.memory_project, limit=10)
-                if rows:
-                    lines = ["## Remembered context\n"]
-                    for r in rows:
-                        lines.append(f"- [{r.category}] **{r.subject}**: {r.content}")
-                    return "\n".join(lines)
-            except Exception:
-                logger.debug("Memory injection failed", exc_info=True)
-        return ""
-
-    # Post-write reindex hooks — collect written files, batch reindex at turn end
-    _pending_reindex: set[Path] = set()
-
-    if rag_available and db:
-        async def _reindex_on_write(event: PostToolUse) -> None:
-            if event.tool_name in ("write_file", "edit_file"):
-                file_path = event.args.get("file_path")
-                if file_path:
-                    p = Path(file_path)
-                    if not p.is_absolute():
-                        p = (deps.cwd / p).resolve()
-                    else:
-                        p = p.resolve()
-                    _pending_reindex.add(p)
-
-        async def _flush_reindex(event: TurnEnd) -> None:
-            if _pending_reindex and db:
-                from forge.rag.indexer import reindex_files
-                files = list(_pending_reindex)
-                _pending_reindex.clear()
-                asyncio.create_task(reindex_files(files, deps.cwd, db, rag_project_name))
-
-        hook_registry.on(PostToolUse, _reindex_on_write)
-        hook_registry.on(TurnEnd, _flush_reindex)
-
-    # Emit SessionStart
-    await hook_registry.emit(SessionStart(
-        session_id=session_id,
-        cwd=str(cwd),
-        permission=deps.permission.value,
-    ))
-
-    # Show project context info
-    from forge.core.project import INSTRUCTION_FILES, detect_project_type
-
-    project_type = detect_project_type(cwd)
-    project_info = f"Project: [cyan]{project_type}[/cyan] | " if project_type else ""
-    instructions_loaded = any((cwd / f).is_file() for f in INSTRUCTION_FILES)
-    instr_info = "[green]instructions loaded[/green]" if instructions_loaded else ""
-    rag_info = " | [green]RAG indexed[/green]" if rag_available else ""
-    memory_info = f" | [green]{memory_count} memories[/green]" if memory_count else ""
-    mcp_info = f" | [green]{len(mcp_servers)} MCP server(s)[/green]" if mcp_servers else ""
-
-    persist_info = f"\nSession: [dim]{session_id[:8]}…[/dim]" if db else ""
-    worktree_banner = ""
-    if deps.worktree:
-        worktree_banner = f"\nWorktree: [cyan]{deps.worktree.branch}[/cyan] at [dim]{deps.worktree.path}[/dim]"
-
-    active_model = deps.model_override or settings.ollama.heavy_model
-    console.print(
-        Panel(
-            f"[bold]Forge v{__version__}[/bold] — {'agentic coding mode' if system is AGENT_SYSTEM else 'chat + tools'}\n"
-            f"Model: [green]{active_model}[/green]\n"
-            f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
-            f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
-            f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}\n"
-            f"Working directory: [dim]{deps.cwd}[/dim]"
-            f"{worktree_banner}"
-            f"{persist_info}\n"
-            "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] status, [bold]Ctrl-R[/bold] tools, [bold]Ctrl-D[/bold] exit",
-            title="forge agent" if system is AGENT_SYSTEM else "forge",
-            border_style="magenta",
-        )
-    )
-
-    # Handle initial prompt if provided
+    # --- Initial prompt ---
     turn_counter = 0
     if initial_prompt:
         turn_counter += 1
+        turn_counter_ref[0] = turn_counter
         console.print(f"\n[bold]> {initial_prompt}[/bold]")
         try:
             prompt = _maybe_prepend_think(initial_prompt, deps)
-            message_history = await _run_with_status(agent, prompt, deps, message_history, turn_number=turn_counter)
-            # Incremental save
+            message_history = await _run_with_status(
+                agent, prompt, deps, message_history, turn_number=turn_counter,
+            )
             if db and message_history:
                 asyncio.create_task(_save_agent_session(db, session_id, message_history))
             if db:
-                # Auto-title from first prompt
                 title = initial_prompt[:60].strip()
                 if len(initial_prompt) > 60:
                     title = title.rsplit(" ", 1)[0] + "…"
@@ -631,13 +492,13 @@ async def agent_repl(
         except Exception as e:
             _handle_agent_error(console, e)
 
-    # REPL loop
+    # --- REPL loop ---
     title_set = initial_prompt is not None
     try:
         while True:
             try:
                 user_input = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: session.prompt("\n❯ ")
+                    None, lambda: pt_session.prompt("\n❯ ")
                 )
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Goodbye.[/dim]")
@@ -647,379 +508,35 @@ async def agent_repl(
             if not user_input:
                 continue
 
-            # REPL commands
+            # Dispatch slash commands via registry
             if user_input.startswith("/"):
-                cmd = user_input.lower().split()[0]
-                if cmd in ("/quit", "/exit", "/q"):
-                    console.print("[dim]Goodbye.[/dim]")
-                    break
-                elif cmd == "/clear":
-                    message_history = None
-                    console.print("[dim]Conversation cleared.[/dim]")
-                    continue
-                elif cmd == "/compact":
-                    if message_history:
-                        budget = settings.agent.token_budget
-                        before = len(message_history)
-                        _, before_tokens = count_messages_tokens(message_history)
-                        console.print(
-                            f"[dim]Compacting {before} messages (~{before_tokens:,} tokens, budget {budget:,})...[/dim]"
-                        )
-                        message_history = await smart_compact_history(message_history, budget)
-                        after = len(message_history)
-                        _, after_tokens = count_messages_tokens(message_history)
-                        console.print(
-                            f"[dim]Compacted: {before} → {after} messages "
-                            f"(~{before_tokens:,} → ~{after_tokens:,} tokens)[/dim]"
-                        )
-                    else:
-                        console.print("[dim]No history to compact.[/dim]")
-                    continue
-                elif cmd == "/tokens":
-                    if message_history:
-                        budget = settings.agent.token_budget
-                        count, tokens = count_messages_tokens(message_history)
-                        console.print(f"[dim]{count} messages, ~{tokens:,} / {budget:,} tokens[/dim]")
-                    else:
-                        console.print("[dim]No history yet.[/dim]")
-                    continue
-                elif cmd == "/messages":
-                    if message_history:
-                        for i, msg in enumerate(message_history):
-                            kind = type(msg).__name__
-                            text_len = len(str(msg))
-                            console.print(f"[dim]  {i}: {kind} ({text_len} chars)[/dim]")
-                    else:
-                        console.print("[dim]No history yet.[/dim]")
-                    continue
-                elif cmd == "/status":
-                    deps.status_visible = not deps.status_visible
-                    if deps.status_tracker:
-                        deps.status_tracker.visible = deps.status_visible
-                        if not deps.status_visible:
-                            deps.status_tracker._clear_line()
-                    state = "visible" if deps.status_visible else "hidden"
-                    console.print(f"[dim]Status line: {state}[/dim]")
-                    continue
-                elif cmd == "/think":
-                    deps.thinking_enabled = not deps.thinking_enabled
-                    state = "on" if deps.thinking_enabled else "off"
-                    console.print(f"[dim]Extended thinking: {state}[/dim]")
-                    continue
-                elif cmd == "/plan":
-                    # Extract prompt after /plan
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) < 2:
-                        console.print("[dim]Usage: /plan <prompt>[/dim]")
-                        continue
-                    plan_prompt = parts[1]
-                    try:
-                        result = await _plan_and_execute(
-                            agent, plan_prompt, deps, message_history
-                        )
-                        if result is not None:
-                            message_history = result
-                    except KeyboardInterrupt:
-                        console.print("\n[dim]Interrupted.[/dim]")
-                    except Exception as e:
-                        _handle_agent_error(console, e)
-                    continue
-                elif cmd == "/tools":
-                    deps.tools_visible = not deps.tools_visible
-                    if deps.turn_buffer and deps.turn_buffer._items:
-                        deps.turn_buffer.rerender(deps.tools_visible)
-                    else:
-                        state = "visible" if deps.tools_visible else "hidden"
-                        console.print(f"[dim]Tool results: {state}[/dim]")
-                    continue
-                elif cmd == "/model":
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) < 2:
-                        current = deps.model_override or settings.ollama.heavy_model
-                        console.print(
-                            f"[dim]Current model: {current}\n"
-                            f"Usage: /model fast | /model heavy | /model <name>[/dim]"
-                        )
-                        continue
-                    arg = parts[1].strip()
-                    if arg == "heavy":
-                        deps.model_override = None
-                        console.print(f"[dim]Model: {settings.ollama.heavy_model} (heavy)[/dim]")
-                    elif arg == "fast":
-                        deps.model_override = settings.ollama.fast_model
-                        console.print(f"[dim]Model: {settings.ollama.fast_model} (fast)[/dim]")
-                    else:
-                        deps.model_override = arg
-                        console.print(f"[dim]Model: {arg}[/dim]")
-                    continue
-                elif cmd == "/plan-status":
-                    if deps.active_plan:
-                        console.print(
-                            Panel(deps.active_plan, title="Active Plan", border_style="cyan")
-                        )
-                    else:
-                        console.print("[dim]No active plan.[/dim]")
-                    continue
-                elif cmd == "/tasks":
-                    if deps.task_store:
-                        tasks = deps.task_store.list_all()
-                        if tasks:
-                            from rich.table import Table
-                            table = Table(title="Tasks", border_style="dim")
-                            table.add_column("ID", style="cyan")
-                            table.add_column("Status")
-                            table.add_column("Subject")
-                            table.add_column("Blocked By", style="dim")
-                            for t in tasks:
-                                status_style = {
-                                    "pending": "dim",
-                                    "in_progress": "yellow",
-                                    "completed": "green",
-                                }.get(t.status.value, "dim")
-                                blocked = ", ".join(t.blocked_by) if t.blocked_by else ""
-                                table.add_row(t.id, f"[{status_style}]{t.status.value}[/{status_style}]", t.subject, blocked)
-                            console.print(table)
-                        else:
-                            console.print("[dim]No tasks.[/dim]")
-                    else:
-                        console.print("[dim]Task tracking unavailable.[/dim]")
-                    continue
-                elif cmd == "/memory":
-                    parts = user_input.split(maxsplit=2)
-                    if len(parts) >= 3 and parts[1].lower() == "search":
-                        query = parts[2]
-                        if deps.memory_db and deps.memory_project:
-                            try:
-                                from forge.agent.memory import recall_from_db
-                                rows = await recall_from_db(deps.memory_db, deps.memory_project, query)
-                                if rows:
-                                    for r in rows:
-                                        score = f"{r.score:.2f}" if r.score else ""
-                                        console.print(f"  [cyan]#{r.id}[/cyan] [{r.category}] [bold]{r.subject}[/bold]: {r.content} [dim]{score}[/dim]")
-                                else:
-                                    console.print("[dim]No matching memories.[/dim]")
-                            except Exception as e:
-                                console.print(f"[red]Memory search error:[/red] {e}")
-                        else:
-                            console.print("[dim]Memory unavailable (no database).[/dim]")
-                    else:
-                        # Show memory stats
-                        if deps.memory_db and deps.memory_project:
-                            try:
-                                count = await deps.memory_db.count_memories(deps.memory_project)
-                                console.print(f"[dim]{count} memories for project '{deps.memory_project}'[/dim]")
-                                console.print("[dim]Usage: /memory search <query>[/dim]")
-                            except Exception:
-                                console.print("[dim]Memory stats unavailable.[/dim]")
-                        else:
-                            console.print("[dim]Memory unavailable (no database).[/dim]")
-                    continue
-                elif cmd == "/forget":
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) < 2:
-                        console.print("[dim]Usage: /forget <memory_id>[/dim]")
-                        continue
-                    try:
-                        mid = int(parts[1].strip())
-                        if deps.memory_db:
-                            deleted = await deps.memory_db.delete_memory(mid)
-                            if deleted:
-                                console.print(f"[dim]Deleted memory #{mid}.[/dim]")
-                            else:
-                                console.print(f"[dim]Memory #{mid} not found.[/dim]")
-                        else:
-                            console.print("[dim]Memory unavailable (no database).[/dim]")
-                    except ValueError:
-                        console.print("[dim]Usage: /forget <memory_id> (numeric ID)[/dim]")
-                    continue
-                elif cmd == "/mcp":
-                    if mcp_servers:
-                        for server in mcp_servers:
-                            sid = getattr(server, "id", None) or "unknown"
-                            stype = type(server).__name__
-                            is_up = getattr(server, "is_running", False)
-                            state = "running" if is_up else "stopped"
-                            console.print(
-                                f"  [cyan]{sid}[/cyan] — {stype} [{state}]"
-                            )
-                    else:
-                        console.print("[dim]No MCP servers configured.[/dim]")
-                    continue
-                elif cmd == "/help":
-                    console.print(
-                        Panel(
-                            "/clear         — clear conversation history\n"
-                            "/compact       — compact history to fit token budget\n"
-                            "/tokens        — show estimated token count\n"
-                            "/messages      — list message history\n"
-                            "/model         — switch model (fast/heavy/<name>)\n"
-                            "/status        — toggle status line (or Ctrl-O)\n"
-                            "/tools         — toggle tool result display (or Ctrl-R)\n"
-                            "/think         — toggle extended thinking on/off\n"
-                            "/plan          — plan before executing (e.g. /plan refactor X)\n"
-                            "/plan-status   — show active plan\n"
-                            "/tasks         — show task list\n"
-                            "/mcp           — list connected MCP servers\n"
-                            "/memory        — show memory stats / search memories\n"
-                            "/forget <id>   — delete a memory by ID\n"
-                            "/checkpoint    — save conversation checkpoint [name]\n"
-                            "/restore <n>   — restore to named checkpoint\n"
-                            "/checkpoints   — list saved checkpoints\n"
-                            "/index         — index/reindex project for RAG\n"
-                            "/cwd           — show working directory\n"
-                            "/cd <dir>      — change working directory\n"
-                            "/worktree      — create isolated git worktree\n"
-                            "/quit          — exit",
-                            title="commands",
-                            border_style="dim",
-                        )
-                    )
-                    continue
-                elif cmd == "/cwd":
-                    console.print(f"[dim]{deps.cwd}[/dim]")
-                    continue
-                elif cmd == "/cd":
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) < 2:
-                        console.print("[dim]Usage: /cd <directory>[/dim]")
-                        continue
-                    new_dir = Path(parts[1]).expanduser()
-                    if not new_dir.is_absolute():
-                        new_dir = deps.cwd / new_dir
-                    new_dir = new_dir.resolve()
-                    if new_dir.is_dir():
-                        deps.cwd = new_dir
-                        agent = _rebuild_agent(
-                            deps, system, extra_tools,
-                            toolsets=mcp_servers or None,
-                        )
-                        console.print(f"[dim]Working directory: {deps.cwd} (agent reloaded)[/dim]")
-                    else:
-                        console.print(f"[red]Not a directory: {new_dir}[/red]")
-                    continue
-                elif cmd == "/worktree":
-                    if deps.worktree:
-                        console.print("[yellow]Already in a worktree.[/yellow]")
-                        continue
-                    from forge.agent.worktree import create_worktree, is_git_repo
-
-                    if not is_git_repo(deps.cwd):
-                        console.print("[red]Not a git repository — cannot create worktree.[/red]")
-                        continue
-                    wt_parts = user_input.split(maxsplit=1)
-                    wt_name = wt_parts[1].strip() if len(wt_parts) > 1 else None
-                    try:
-                        wt_info = create_worktree(deps.cwd, wt_name)
-                        deps.worktree = wt_info
-                        deps.cwd = wt_info.path
-                        agent = _rebuild_agent(
-                            deps, system, extra_tools,
-                            toolsets=mcp_servers or None,
-                        )
-                        console.print(
-                            f"[green]Worktree created:[/green] {wt_info.path}\n"
-                            f"[green]Branch:[/green] {wt_info.branch}"
-                        )
-                    except RuntimeError as e:
-                        console.print(f"[red]Worktree error:[/red] {e}")
-                    continue
-                elif cmd == "/checkpoint":
-                    if not db:
-                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
-                        continue
-                    parts = user_input.split(maxsplit=1)
-                    cp_name = parts[1].strip() if len(parts) > 1 else f"cp-{turn_counter}"
-                    if not message_history:
-                        console.print("[dim]No history to checkpoint.[/dim]")
-                        continue
-                    try:
-                        history_json = _message_list_adapter.dump_json(message_history).decode()
-                        task_json = deps.task_store.to_json() if deps.task_store else None
-                        await db.save_checkpoint(
-                            session_id, cp_name, history_json, task_json, len(message_history),
-                        )
-                        console.print(
-                            f"[green]Checkpoint '{cp_name}' saved ({len(message_history)} messages).[/green]"
-                        )
-                    except Exception as e:
-                        console.print(f"[red]Checkpoint save failed:[/red] {e}")
-                    continue
-                elif cmd == "/restore":
-                    if not db:
-                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
-                        continue
-                    parts = user_input.split(maxsplit=1)
-                    if len(parts) < 2:
-                        console.print("[dim]Usage: /restore <name>[/dim]")
-                        continue
-                    cp_name = parts[1].strip()
-                    try:
-                        cp = await db.load_checkpoint(session_id, cp_name)
-                        if not cp:
-                            console.print(f"[yellow]Checkpoint '{cp_name}' not found.[/yellow]")
-                            continue
-                        message_history = _message_list_adapter.validate_json(cp["agent_history"])
-                        if cp.get("task_store"):
-                            deps.task_store = TaskStore.from_json(cp["task_store"])
-                        console.print(
-                            f"[green]Restored to checkpoint '{cp_name}' ({cp['message_count']} messages).[/green]"
-                        )
-                    except Exception as e:
-                        console.print(f"[red]Restore failed:[/red] {e}")
-                    continue
-                elif cmd == "/checkpoints":
-                    if not db:
-                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
-                        continue
-                    try:
-                        cps = await db.list_checkpoints(session_id)
-                        if cps:
-                            from rich.table import Table
-                            table = Table(title="Checkpoints", border_style="dim")
-                            table.add_column("Name", style="cyan")
-                            table.add_column("Messages", justify="right")
-                            table.add_column("Created", style="dim")
-                            for cp in cps:
-                                table.add_row(
-                                    cp["name"],
-                                    str(cp["message_count"]),
-                                    str(cp["created_at"].strftime("%Y-%m-%d %H:%M")),
-                                )
-                            console.print(table)
-                        else:
-                            console.print("[dim]No checkpoints. Use /checkpoint [name] to save one.[/dim]")
-                    except Exception as e:
-                        console.print(f"[red]Checkpoint list failed:[/red] {e}")
-                    continue
-                elif cmd == "/index":
-                    if not db:
-                        console.print("[yellow]Indexing requires a database.[/yellow]")
-                        continue
-                    try:
-                        from forge.rag.indexer import index_directory
-                        stats = await index_directory(deps.cwd, db, project=rag_project_name)
-                        console.print(
-                            f"[green]Indexed:[/green] {stats['files_indexed']} files, "
-                            f"{stats['chunks_stored']} chunks "
-                            f"({stats['files_skipped']} skipped)"
-                        )
-                        if not rag_available:
-                            from forge.agent.tools import rag_search
-                            deps.rag_db = db
-                            deps.rag_project = rag_project_name
-                            rag_available = True
-                            extra_tools.append(rag_search)
-                            agent = _rebuild_agent(
-                                deps, system, extra_tools,
-                                toolsets=mcp_servers or None,
-                            )
-                            console.print("[green]RAG search enabled.[/green]")
-                    except Exception as e:
-                        console.print(f"[red]Indexing failed:[/red] {e}")
-                    continue
-                else:
-                    console.print(f"[dim]Unknown command: {cmd}[/dim]")
-                    continue
+                cmd_ctx = CommandContext(
+                    console=console,
+                    deps=deps,
+                    agent=agent,
+                    message_history=message_history,
+                    session_id=session_id,
+                    db=db,
+                    mcp_servers=mcp_servers,
+                    rag_available=rag_available,
+                    rag_project_name=rag_project_name,
+                    extra_tools=extra_tools,
+                    system=system,
+                    turn_counter=turn_counter,
+                )
+                result = await dispatch(cmd_ctx, user_input)
+                if result is not None:
+                    if result.should_break:
+                        break
+                    if result.message_history is not _UNCHANGED:
+                        message_history = result.message_history
+                    if result.agent is not _UNCHANGED:
+                        agent = result.agent
+                    if result.rag_available is not None:
+                        rag_available = result.rag_available
+                    if result.turn_counter is not None:
+                        turn_counter = result.turn_counter
+                continue
 
             # Auto-compact if history is getting large
             budget = settings.agent.token_budget
@@ -1044,17 +561,16 @@ async def agent_repl(
                     logger.debug("Title update failed", exc_info=True)
                 title_set = True
 
-            # Run agent with status tracking
+            # Run agent turn
             try:
                 turn_counter += 1
+                turn_counter_ref[0] = turn_counter
                 prompt = _maybe_prepend_think(user_input, deps)
                 message_history = await _run_with_status(
                     agent, prompt, deps, message_history, turn_number=turn_counter,
                 )
-                # Incremental save after each successful turn
                 if db and message_history:
                     asyncio.create_task(_save_agent_session(db, session_id, message_history))
-                # Persist task store
                 if db and deps.task_store:
                     try:
                         await db.save_task_store(session_id, deps.task_store.to_json())
@@ -1065,41 +581,9 @@ async def agent_repl(
             except Exception as e:
                 _handle_agent_error(console, e)
     finally:
-        # Emit SessionEnd
-        msg_count = len(message_history) if message_history else 0
-        await hook_registry.emit(SessionEnd(session_id=session_id, message_count=msg_count))
-
-        # Shut down MCP servers
-        await mcp_stack.aclose()
-
-        # Persist final state
-        if db and message_history:
-            await _save_agent_session(db, session_id, message_history)
-        if db and deps.task_store:
-            try:
-                await db.save_task_store(session_id, deps.task_store.to_json())
-            except Exception:
-                logger.debug("Final task store save failed", exc_info=True)
-        if db:
-            await db.close()
-
-        # Worktree cleanup
-        if deps.worktree:
-            from forge.agent.worktree import prompt_worktree_cleanup, remove_worktree
-
-            try:
-                keep = await prompt_worktree_cleanup(deps.worktree)
-                if keep:
-                    deps.worktree.unregister_atexit()
-                    console.print(
-                        f"[dim]Keeping worktree at {deps.worktree.path} "
-                        f"(branch: {deps.worktree.branch})[/dim]"
-                    )
-                else:
-                    remove_worktree(deps.worktree)
-                    console.print("[dim]Worktree removed.[/dim]")
-            except Exception:
-                logger.debug("Worktree cleanup failed", exc_info=True)
+        await cleanup(
+            deps, hook_registry, mcp_stack, db, session_id, message_history, console,
+        )
 
 
 def _maybe_prepend_think(prompt: str, deps: AgentDeps) -> str:
@@ -1127,6 +611,16 @@ async def _connect_db():
 def _handle_agent_error(console: Console, e: Exception) -> None:
     """Print a user-friendly agent error message."""
     from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from forge.agent.circuit_breaker import CircuitBreakerTripped
+
+    if isinstance(e, CircuitBreakerTripped):
+        console.print(
+            f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
+            "The model was stuck in a loop. Try rephrasing your request "
+            "or breaking it into smaller steps."
+        )
+        return
 
     if isinstance(e, UsageLimitExceeded):
         console.print(
