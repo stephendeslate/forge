@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Local config and state
+.claude/
+.forge/
