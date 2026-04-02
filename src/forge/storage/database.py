@@ -202,6 +202,22 @@ class Database:
         row = await self.pool.fetchrow("SELECT count(*) FROM sessions")
         return row["count"]
 
+    async def delete_agent_history(self, session_id: str) -> None:
+        """Delete the agent_history row for a session (before re-saving)."""
+        await self.pool.execute(
+            "DELETE FROM conversations WHERE session_id = $1 AND role = 'agent_history'",
+            session_id,
+        )
+
+    async def load_agent_history(self, session_id: str) -> str | None:
+        """Load the agent_history JSON blob for a session. Returns None if not found."""
+        row = await self.pool.fetchrow(
+            "SELECT content FROM conversations WHERE session_id = $1 AND role = 'agent_history' "
+            "ORDER BY created_at DESC LIMIT 1",
+            session_id,
+        )
+        return row["content"] if row else None
+
     async def get_project_stats(self, project: str) -> dict[str, Any]:
         """Get indexing stats for a project."""
         row = await self.pool.fetchrow(

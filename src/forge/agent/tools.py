@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 
 import httpx
-from pydantic_ai import RunContext
+from pydantic_ai import ModelRetry, RunContext, Tool
 
 from forge.agent.deps import AgentDeps
 from forge.agent.permissions import check_permission
@@ -35,9 +35,9 @@ async def read_file(
     """
     path = _resolve_path(ctx, file_path)
     if not path.exists():
-        return f"Error: File not found: {path}"
+        raise ModelRetry(f"File not found: {path} — check the path and try again")
     if not path.is_file():
-        return f"Error: Not a file: {path}"
+        raise ModelRetry(f"Not a file: {path} — this is a directory, use list_files instead")
 
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -109,7 +109,7 @@ async def edit_file(
 
     path = _resolve_path(ctx, file_path)
     if not path.exists():
-        return f"Error: File not found: {path}"
+        raise ModelRetry(f"File not found: {path} — check the path and try again")
 
     try:
         text = path.read_text(encoding="utf-8")
@@ -118,9 +118,14 @@ async def edit_file(
 
     count = text.count(old_text)
     if count == 0:
-        return f"Error: old_text not found in {path}"
+        raise ModelRetry(
+            f"old_text not found in {path} — read the file first to get the exact text"
+        )
     if count > 1:
-        return f"Error: old_text appears {count} times in {path} — must be unique"
+        raise ModelRetry(
+            f"old_text appears {count} times in {path} — provide more surrounding "
+            "context to make the match unique"
+        )
 
     new_content = text.replace(old_text, new_text, 1)
     try:
@@ -285,6 +290,9 @@ async def web_search(
     """Search the web for information. Use for weather, news, documentation lookups, API references,
     error messages, or any question requiring up-to-date information.
 
+    Search snippets often contain enough information to answer directly — only use web_fetch
+    if the snippets lack the specific detail you need.
+
     The results are raw search data — use them to formulate a direct answer to the user's question.
     Do NOT relay the raw results to the user; instead, read the results and answer their question.
 
@@ -325,9 +333,15 @@ async def web_search(
                         url = r.get("url", "")
                         snippet = r.get("content", "No description")
                         # Truncate long snippets
-                        if len(snippet) > 300:
-                            snippet = snippet[:300] + "..."
+                        if len(snippet) > 500:
+                            snippet = snippet[:500] + "..."
                         parts.append(f"{i}. {title}\n   {url}\n   {snippet}\n")
+
+                    parts.append(
+                        "---\n"
+                        "Tip: These snippets may already answer the question. "
+                        "Only fetch a URL if you need details not shown above."
+                    )
 
                     return "\n".join(parts)
             except (httpx.ConnectError, httpx.TimeoutException):
@@ -341,13 +355,63 @@ async def web_search(
         )
 
 
+def _assess_content_quality(text: str) -> str:
+    """Check extracted text for quality issues and return a warning string (empty if OK)."""
+    stripped = text.strip()
+    stripped_lower = stripped.lower()
+    warnings: list[str] = []
+
+    # Short content
+    if len(stripped) < 100:
+        warnings.append("very short")
+
+    # Blocked/gated content
+    blockers = (
+        "enable javascript", "access denied", "captcha", "please verify",
+        "just a moment", "checking your browser", "ray id",
+    )
+    if any(m in stripped_lower for m in blockers):
+        warnings.append("blocked/gated")
+
+    # Thin JS shell
+    unique_lines = set(line.strip() for line in stripped.splitlines() if line.strip())
+    if len(stripped) > 100 and len(unique_lines) < 8:
+        warnings.append("thin JS shell")
+
+    # Repetitive content
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) >= 5:
+        from collections import Counter
+
+        counts = Counter(lines)
+        most_common_line, most_common_count = counts.most_common(1)[0]
+        if most_common_count >= 3 and most_common_count / len(lines) > 0.3:
+            warnings.append(
+                f"repetitive ('{most_common_line[:40]}' x{most_common_count})"
+            )
+
+    # Ad-heavy content
+    ad_markers = ("advertisement", "sponsored", "subscribe now", "cookie", "sign up", "log in")
+    if lines:
+        ad_lines = sum(1 for l in lines if any(m in l.lower() for m in ad_markers))
+        if ad_lines / len(lines) > 0.25:
+            warnings.append(f"ad-heavy ({ad_lines}/{len(lines)} lines)")
+
+    if not warnings:
+        return ""
+    return (
+        f"Warning: This page has quality issues ({', '.join(warnings)}). "
+        "Do NOT retry — use the information you already have.\n\n"
+    )
+
+
 async def web_fetch(
     ctx: RunContext[AgentDeps],
     url: str,
     max_length: int = 10000,
 ) -> str:
-    """Fetch a web page and return its text content. Use to read documentation pages,
-    API references, or specific URLs from search results.
+    """Fetch a web page and return its text content. Only fetch when search snippets are
+    insufficient. Budget: at most 2 fetches per question.
 
     The fetched content is raw data for you to process. Extract the relevant information
     and present a clear answer to the user — do not dump raw page content.
@@ -358,14 +422,33 @@ async def web_fetch(
     """
     max_length = min(max_length, 50000)
 
+    # Check cache
+    if url in ctx.deps.url_cache:
+        return ctx.deps.url_cache[url]
+
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; Forge/0.1; +https://github.com)",
         "Accept": "text/html,text/plain,application/json",
     }
+    MAX_DOWNLOAD = 1_000_000  # 1MB cap
 
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, max_redirects=5) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
         try:
-            resp = await client.get(url, headers=headers)
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    return (
+                        f"Error: HTTP {resp.status_code} fetching {url}. "
+                        "Do NOT retry this URL — report the error to the user and move on."
+                    )
+
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in resp.aiter_bytes(4096):
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > MAX_DOWNLOAD:
+                        break
+                raw_bytes = b"".join(chunks)
         except httpx.TimeoutException:
             return f"Error: Request timed out fetching {url}. Do NOT retry — inform the user."
         except httpx.ConnectError as e:
@@ -373,29 +456,26 @@ async def web_fetch(
         except Exception as e:
             return f"Error fetching {url}: {e}. Do NOT retry — inform the user."
 
-        if resp.status_code >= 400:
-            return (
-                f"Error: HTTP {resp.status_code} fetching {url}. "
-                "Do NOT retry this URL — report the error to the user and move on."
-            )
-
         content_type = resp.headers.get("content-type", "")
+        text = raw_bytes.decode("utf-8", errors="replace")
 
         if "json" in content_type:
-            text = resp.text
+            pass  # text as-is
         elif "html" in content_type:
-            # Strip HTML tags for a readable text extraction
-            text = _strip_html(resp.text)
-        else:
-            text = resp.text
+            text = _strip_html(text, url=url)
 
         if len(text) > max_length:
-            text = text[:max_length] + f"\n... (truncated, {len(resp.text)} total chars)"
+            text = text[:max_length] + f"\n... (truncated, {len(text)} total chars)"
 
-        return f"Fetched: {url}\n{'─' * 40}\n{text}"
+        quality_warning = _assess_content_quality(text)
+        result = f"{quality_warning}Fetched: {url}\n{'─' * 40}\n{text}"
+
+        # Cache result
+        ctx.deps.url_cache[url] = result
+        return result
 
 
-def _strip_html(html: str) -> str:
+def _strip_html(html: str, url: str | None = None) -> str:
     """Extract main content from HTML, stripping boilerplate navigation/menus.
 
     Uses trafilatura for intelligent content extraction, with a regex fallback.
@@ -405,9 +485,11 @@ def _strip_html(html: str) -> str:
 
         text = trafilatura.extract(
             html,
+            url=url,
+            output_format="markdown",
             include_comments=False,
             include_tables=True,
-            favor_recall=True,
+            deduplicate=True,
         )
         if text and len(text) > 50:
             return text
@@ -440,7 +522,49 @@ def _strip_html_fallback(html: str) -> str:
     return text.strip()
 
 
-ALL_TOOLS = [
-    read_file, write_file, edit_file, run_command,
-    search_code, list_files, web_search, web_fetch,
+async def rag_search(
+    ctx: RunContext[AgentDeps],
+    query: str,
+    limit: int = 5,
+) -> str:
+    """Search the indexed codebase semantically. Returns relevant code chunks ranked by similarity.
+
+    Use this for conceptual queries like "how does routing work" or "where is authentication handled".
+    Use search_code for exact text/regex matches instead.
+
+    Args:
+        query: Natural language query describing what you're looking for.
+        limit: Maximum number of chunks to return (default 5).
+    """
+    if ctx.deps.rag_db is None or ctx.deps.rag_project is None:
+        return "RAG search unavailable — project is not indexed. Use search_code for text search."
+
+    try:
+        from forge.rag.retriever import format_context, retrieve
+
+        chunks = await retrieve(
+            query,
+            ctx.deps.rag_project,
+            ctx.deps.rag_db,  # type: ignore[arg-type]
+            limit=limit,
+        )
+        if not chunks:
+            return f"No relevant code found for: {query}"
+
+        return format_context(chunks)
+    except Exception as e:
+        return f"RAG search error: {e}. Use search_code as fallback."
+
+
+ALL_TOOLS: list[Tool | object] = [
+    # Read-only tools — safe for parallel execution
+    read_file,
+    search_code,
+    list_files,
+    web_search,
+    web_fetch,
+    # Write/execute tools — sequential to prevent races
+    Tool(write_file, sequential=True),
+    Tool(edit_file, sequential=True),
+    Tool(run_command, sequential=True),
 ]

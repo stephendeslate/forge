@@ -64,11 +64,11 @@ class TestTruncate:
         assert "truncated" in result
 
     def test_exact_limit(self):
-        text = "x" * 2000
+        text = "x" * 500
         assert _truncate(text) == text
 
     def test_one_over_limit(self):
-        text = "x" * 2001
+        text = "x" * 501
         assert "truncated" in _truncate(text)
 
 

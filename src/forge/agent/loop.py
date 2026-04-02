@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+
 import os
 import sys
 import uuid
@@ -14,15 +14,17 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 
 from forge import __version__
-from forge.agent.context import compact_history, count_messages_tokens
+from forge.agent.context import count_messages_tokens, smart_compact_history
 from forge.agent.deps import AgentDeps
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
 from forge.agent.status import StatusTracker
 from forge.agent.tools import ALL_TOOLS
+from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
 
 AGENT_SYSTEM = """\
@@ -30,7 +32,15 @@ You are Forge, a versatile local AI assistant. You help users with coding, writi
 
 You have access to tools for reading files, writing files, editing files, running shell commands, searching code, listing files, web search, and web fetch. Use them to accomplish the user's request.
 
-Guidelines:
+## Web research rules
+1. Search snippets are often enough — if they answer the question, STOP and respond immediately.
+2. Fetch a page ONLY when snippets lack the specific detail needed.
+3. Budget per turn: at most 2 web_search + at most 2 web_fetch calls total. If you still lack info after that, answer with what you have and note gaps.
+4. Never re-fetch a URL that returned an error.
+5. Never fetch more than 3 URLs total in one turn.
+6. For well-known facts, history, math, and science fundamentals, answer from your knowledge without searching.
+
+## General guidelines
 - Read files before editing them to understand existing code.
 - Use edit_file for targeted changes (exact string replacement). Use write_file only for new files or complete rewrites.
 - When searching, use search_code with ripgrep patterns. Use list_files to understand project structure.
@@ -64,7 +74,12 @@ def _ensure_ollama_env() -> None:
         os.environ["OLLAMA_BASE_URL"] = base
 
 
-def create_agent(system: str = AGENT_SYSTEM, cwd: Path | None = None) -> Agent[AgentDeps, str]:
+def create_agent(
+    system: str = AGENT_SYSTEM,
+    cwd: Path | None = None,
+    model: str | None = None,
+    tools: list | None = None,
+) -> Agent[AgentDeps, str]:
     """Create a pydantic-ai Agent with coding tools."""
     from forge.core.project import build_project_context
 
@@ -74,12 +89,15 @@ def create_agent(system: str = AGENT_SYSTEM, cwd: Path | None = None) -> Agent[A
     if cwd:
         full_system += "\n\n" + build_project_context(cwd)
 
+    model_name = model or settings.ollama.heavy_model
+
     return Agent(
-        model=f"ollama:{settings.ollama.heavy_model}",
+        model=f"ollama:{model_name}",
         instructions=full_system,
-        tools=ALL_TOOLS,
+        tools=tools if tools is not None else ALL_TOOLS,
         deps_type=AgentDeps,
         model_settings=ModelSettings(timeout=300),
+        retries=3,
     )
 
 
@@ -96,25 +114,47 @@ async def _run_with_status(
     tracker = StatusTracker(console=deps.console, visible=deps.status_visible)
     deps.status_tracker = tracker
 
+    # Create turn buffer for this turn
+    turn_buffer = TurnBuffer(console=deps.console)
+    deps.turn_buffer = turn_buffer
+
     def _on_toggle(visible: bool) -> None:
         deps.status_visible = visible
 
-    tracker.start(on_toggle=_on_toggle)
+    def _on_tools_toggle() -> None:
+        deps.tools_visible = not deps.tools_visible
+
+    tracker.start(on_toggle=_on_toggle, on_tools_toggle=_on_tools_toggle)
 
     try:
-        result = await agent.run(
-            prompt,
+        run_kwargs: dict = dict(
             deps=deps,
             message_history=message_history,
             event_stream_handler=render_events,
-            usage_limits=UsageLimits(request_limit=25),
+            usage_limits=UsageLimits(request_limit=15),
         )
-        return result.all_messages()
-    finally:
+        if deps.model_override:
+            run_kwargs["model"] = f"ollama:{deps.model_override}"
+
+        result = await agent.run(prompt, **run_kwargs)
+        # Pause tracker before printing to prevent status line garbling output
+        tracker.pause()
+
+        # Add final answer + summary to turn buffer, then print via buffer
+        if isinstance(result.output, str) and result.output.strip():
+            turn_buffer.add(Markdown(result.output), is_tool=False)
         tracker.stop()
-        # Print summary after clearing status line
+        turn_buffer.add(tracker.summary(), is_tool=False)
+        turn_buffer.print_final(deps.tools_visible)
+
+        deps.status_tracker = None
+        return result.all_messages()
+    except BaseException:
+        tracker.stop()
         deps.console.print(tracker.summary())
         deps.status_tracker = None
+        deps.turn_buffer = None
+        raise
 
 
 async def _plan_and_execute(
@@ -180,8 +220,23 @@ async def _plan_and_execute(
         return message_history
 
     # Phase 3: Execute with full agent
-    execution_prompt = f"Execute this plan:\n\n{plan_text}\n\nOriginal request: {prompt}"
-    return await _run_with_status(agent, execution_prompt, deps, message_history)
+    deps.active_plan = plan_text
+    execution_prompt = (
+        f"Execute this plan step by step:\n\n{plan_text}\n\n"
+        f"Original request: {prompt}\n\n"
+        "As you complete each step, note it as done. If a step fails, "
+        "explain why and adjust your approach before continuing."
+    )
+    try:
+        result = await _run_with_status(agent, execution_prompt, deps, message_history)
+    finally:
+        deps.active_plan = None
+    return result
+
+
+from pydantic import TypeAdapter
+
+_message_list_adapter = TypeAdapter(list[ModelMessage])
 
 
 async def _save_agent_session(
@@ -191,18 +246,25 @@ async def _save_agent_session(
 ) -> None:
     """Persist agent message history as JSON to the conversations table."""
     try:
-        # Serialize pydantic-ai messages to JSON
-        serialized = []
-        for msg in messages:
-            if hasattr(msg, "model_dump"):
-                serialized.append(msg.model_dump(mode="json"))
-            else:
-                serialized.append(str(msg))
-
-        history_json = json.dumps(serialized)
+        history_json = _message_list_adapter.dump_json(messages).decode()
+        await db.delete_agent_history(session_id)  # type: ignore[union-attr]
         await db.save_message(session_id, "agent_history", history_json, model="")  # type: ignore[union-attr]
     except Exception:
         pass  # Best-effort persistence
+
+
+async def _load_agent_history(
+    db: object,
+    session_id: str,
+) -> list[ModelMessage] | None:
+    """Load agent message history from the database. Returns None if not found."""
+    try:
+        raw = await db.load_agent_history(session_id)  # type: ignore[union-attr]
+        if raw is None:
+            return None
+        return _message_list_adapter.validate_json(raw)
+    except Exception:
+        return None
 
 
 async def agent_repl(
@@ -241,6 +303,21 @@ async def agent_repl(
         sys.stderr.write(f"\r\033[2K\033[2mStatus line: {state} (Ctrl-O to toggle)\033[0m\n")
         sys.stderr.flush()
 
+    @kb.add("c-r")
+    def _toggle_tools(event):
+        deps.tools_visible = not deps.tools_visible
+        if deps.turn_buffer and deps.turn_buffer._items:
+            # Erase prompt_toolkit's prompt display before rerendering
+            event.app.renderer.erase()
+            deps.turn_buffer.rerender(deps.tools_visible)
+            # Force prompt_toolkit to redraw the prompt
+            event.app.renderer.reset()
+            event.app.invalidate()
+        else:
+            state = "visible" if deps.tools_visible else "hidden"
+            sys.stderr.write(f"\r\033[2K\033[2mTool results: {state} (Ctrl-R to toggle)\033[0m\n")
+            sys.stderr.flush()
+
     session: PromptSession[str] = PromptSession(
         history=InMemoryHistory(), key_bindings=kb
     )
@@ -249,11 +326,40 @@ async def agent_repl(
     db = await _connect_db()
     session_id = resume_session_id or str(uuid.uuid4())
 
-    if db and not resume_session_id:
+    if db and resume_session_id:
+        # Resume: load existing message history
+        loaded = await _load_agent_history(db, session_id)
+        if loaded:
+            message_history = loaded
+            console.print(f"[dim]Resumed session with {len(loaded)} messages.[/dim]")
+    elif db:
         try:
             await db.create_session(session_id, mode="agent" if system is AGENT_SYSTEM else "chat")
         except Exception:
             db = None
+
+    # RAG integration — check if cwd is indexed
+    rag_available = False
+    if db:
+        try:
+            stats = await db.get_project_stats(cwd.name)
+            if stats.get("chunk_count", 0) > 0:
+                deps.rag_db = db
+                deps.rag_project = cwd.name
+                rag_available = True
+        except Exception:
+            pass
+
+    # Build agent with RAG tool if available
+    if rag_available:
+        from forge.agent.tools import rag_search
+
+        agent = create_agent(
+            system=system + "\n\nUse rag_search for semantic code search (conceptual queries). "
+            "Use search_code for exact text/regex matches.",
+            cwd=cwd,
+            tools=ALL_TOOLS + [rag_search],
+        )
 
     # Show project context info
     from forge.core.project import INSTRUCTION_FILES, detect_project_type
@@ -262,19 +368,21 @@ async def agent_repl(
     project_info = f"Project: [cyan]{project_type}[/cyan] | " if project_type else ""
     instructions_loaded = any((cwd / f).is_file() for f in INSTRUCTION_FILES)
     instr_info = "[green]instructions loaded[/green]" if instructions_loaded else ""
+    rag_info = " | [green]RAG indexed[/green]" if rag_available else ""
 
     persist_info = f"\nSession: [dim]{session_id[:8]}…[/dim]" if db else ""
 
+    active_model = deps.model_override or settings.ollama.heavy_model
     console.print(
         Panel(
             f"[bold]Forge v{__version__}[/bold] — {'agentic coding mode' if system is AGENT_SYSTEM else 'chat + tools'}\n"
-            f"Model: [green]{settings.ollama.heavy_model}[/green]\n"
+            f"Model: [green]{active_model}[/green]\n"
             f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
             f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
-            f"{project_info}{instr_info}\n"
+            f"{project_info}{instr_info}{rag_info}\n"
             f"Working directory: [dim]{deps.cwd}[/dim]"
             f"{persist_info}\n"
-            "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] toggle status, [bold]Ctrl-D[/bold] to exit",
+            "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] status, [bold]Ctrl-R[/bold] tools, [bold]Ctrl-D[/bold] exit",
             title="forge agent" if system is AGENT_SYSTEM else "forge",
             border_style="magenta",
         )
@@ -286,6 +394,9 @@ async def agent_repl(
         try:
             prompt = _maybe_prepend_think(initial_prompt, deps)
             message_history = await _run_with_status(agent, prompt, deps, message_history)
+            # Incremental save
+            if db and message_history:
+                asyncio.create_task(_save_agent_session(db, session_id, message_history))
             if db:
                 # Auto-title from first prompt
                 title = initial_prompt[:60].strip()
@@ -327,7 +438,8 @@ async def agent_repl(
                 elif cmd == "/compact":
                     if message_history:
                         before = len(message_history)
-                        message_history = compact_history(message_history)
+                        console.print("[dim]Compacting with LLM summarization...[/dim]")
+                        message_history = await smart_compact_history(message_history)
                         after = len(message_history)
                         _, tokens = count_messages_tokens(message_history)
                         console.print(
@@ -384,6 +496,42 @@ async def agent_repl(
                     except Exception as e:
                         _handle_agent_error(console, e)
                     continue
+                elif cmd == "/tools":
+                    deps.tools_visible = not deps.tools_visible
+                    if deps.turn_buffer and deps.turn_buffer._items:
+                        deps.turn_buffer.rerender(deps.tools_visible)
+                    else:
+                        state = "visible" if deps.tools_visible else "hidden"
+                        console.print(f"[dim]Tool results: {state}[/dim]")
+                    continue
+                elif cmd == "/model":
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        current = deps.model_override or settings.ollama.heavy_model
+                        console.print(
+                            f"[dim]Current model: {current}\n"
+                            f"Usage: /model fast | /model heavy | /model <name>[/dim]"
+                        )
+                        continue
+                    arg = parts[1].strip()
+                    if arg == "heavy":
+                        deps.model_override = None
+                        console.print(f"[dim]Model: {settings.ollama.heavy_model} (heavy)[/dim]")
+                    elif arg == "fast":
+                        deps.model_override = settings.ollama.fast_model
+                        console.print(f"[dim]Model: {settings.ollama.fast_model} (fast)[/dim]")
+                    else:
+                        deps.model_override = arg
+                        console.print(f"[dim]Model: {arg}[/dim]")
+                    continue
+                elif cmd == "/plan-status":
+                    if deps.active_plan:
+                        console.print(
+                            Panel(deps.active_plan, title="Active Plan", border_style="cyan")
+                        )
+                    else:
+                        console.print("[dim]No active plan.[/dim]")
+                    continue
                 elif cmd == "/help":
                     console.print(
                         Panel(
@@ -391,9 +539,12 @@ async def agent_repl(
                             "/compact  — compact history to fit token budget\n"
                             "/tokens   — show estimated token count\n"
                             "/messages — list message history\n"
+                            "/model    — switch model (fast/heavy/<name>)\n"
                             "/status   — toggle status line (or Ctrl-O)\n"
+                            "/tools    — toggle tool result display (or Ctrl-R)\n"
                             "/think    — toggle extended thinking on/off\n"
                             "/plan     — plan before executing (e.g. /plan refactor X)\n"
+                            "/plan-status — show active plan\n"
                             "/cwd      — show working directory\n"
                             "/cd <dir> — change working directory\n"
                             "/quit     — exit",
@@ -426,7 +577,7 @@ async def agent_repl(
 
             # Auto-compact if history is getting large
             if message_history and len(message_history) > 40:
-                message_history = compact_history(message_history)
+                message_history = await smart_compact_history(message_history)
 
             # Auto-title from first user message
             if db and not title_set:
@@ -445,6 +596,9 @@ async def agent_repl(
                 message_history = await _run_with_status(
                     agent, prompt, deps, message_history
                 )
+                # Incremental save after each successful turn
+                if db and message_history:
+                    asyncio.create_task(_save_agent_session(db, session_id, message_history))
             except KeyboardInterrupt:
                 console.print("\n[dim]Interrupted.[/dim]")
             except Exception as e:
@@ -484,7 +638,7 @@ def _handle_agent_error(console: Console, e: Exception) -> None:
 
     if isinstance(e, UsageLimitExceeded):
         console.print(
-            "[yellow]Agent hit the request limit (25 iterations).[/yellow] "
+            "[yellow]Agent hit the request limit (15 iterations).[/yellow] "
             "This usually means the model was stuck in a loop. "
             "The partial result has been preserved in history."
         )

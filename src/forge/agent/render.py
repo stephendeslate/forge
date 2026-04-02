@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.text import Text
 
 from pydantic_ai import RunContext
@@ -70,7 +71,7 @@ def _format_tool_args(args: str | dict | None) -> str:
     return str(args)
 
 
-def _truncate(text: str, max_len: int = 2000) -> str:
+def _truncate(text: str, max_len: int = 500) -> str:
     """Truncate text for display."""
     if len(text) <= max_len:
         return text
@@ -120,8 +121,31 @@ async def render_events(
     tracker = ctx.deps.status_tracker
     text_chunks: list[str] = []
     live: Live | None = None
+    thinking_live: Live | None = None
     tool_call_count = 0
     has_thinking = False
+
+    def _stop_thinking_spinner() -> None:
+        nonlocal thinking_live
+        if thinking_live is not None:
+            thinking_live.stop()
+            thinking_live = None
+            if tracker:
+                tracker.resume()
+
+    def _finalize_live() -> None:
+        """Stop transient Live and clean up state.
+
+        Does not print — the transient Live handles streaming display,
+        and loop.py prints the authoritative result.output after run().
+        """
+        nonlocal live, has_thinking
+        if live is None:
+            return
+        live.stop()
+        live = None
+        text_chunks.clear()
+        has_thinking = False
 
     # Start with THINKING phase
     if tracker:
@@ -132,6 +156,7 @@ async def render_events(
             if event.event_kind == "part_start":
                 assert isinstance(event, PartStartEvent)
                 if isinstance(event.part, TextPart):
+                    _stop_thinking_spinner()
                     # Start streaming text
                     if event.part.content:
                         text_chunks.append(event.part.content)
@@ -146,6 +171,7 @@ async def render_events(
                             console=console,
                             refresh_per_second=12,
                             vertical_overflow="visible",
+                            transient=True,
                         )
                         live.start()
 
@@ -155,16 +181,8 @@ async def render_events(
                     live.update(visible)
 
                 elif isinstance(event.part, ToolCallPart):
-                    # A tool call is starting — finalize any text stream
-                    if live is not None:
-                        visible = _render_text_with_thinking(
-                            "".join(text_chunks), console, has_thinking
-                        )
-                        live.update(visible)
-                        live.stop()
-                        live = None
-                        text_chunks.clear()
-                        has_thinking = False
+                    _stop_thinking_spinner()
+                    _finalize_live()
 
                     if tracker:
                         tracker.resume()
@@ -187,38 +205,50 @@ async def render_events(
                         live.update(visible)
 
             elif event.event_kind == "function_tool_call":
+                _stop_thinking_spinner()
                 assert isinstance(event, FunctionToolCallEvent)
                 tool_call_count += 1
                 if tracker:
                     tracker.increment_tool_calls()
 
-                # Finalize text stream if active
-                if live is not None:
-                    visible = _render_text_with_thinking(
-                        "".join(text_chunks), console, has_thinking
-                    )
-                    live.update(visible)
-                    live.stop()
-                    live = None
-                    text_chunks.clear()
-                    has_thinking = False
-
-                if tracker:
-                    tracker.resume()
-                    tracker.set_phase(Phase.TOOL_EXEC, event.part.tool_name)
+                _finalize_live()
 
                 tool_name = event.part.tool_name
                 style = _tool_style(tool_name)
                 args_str = _format_tool_args(event.part.args)
 
-                console.print(
-                    Panel(
-                        Text(args_str, style="dim") if args_str else Text("(no args)", style="dim"),
+                # Build the full panel (always with title for buffer rerenders)
+                if args_str:
+                    panel = Panel(
+                        Text(args_str, style="dim"),
                         title=f"[bold]{tool_name}[/bold]",
                         border_style=style,
                         padding=(0, 1),
                     )
-                )
+                else:
+                    panel = Panel(
+                        Text("(no args)", style="dim"),
+                        title=f"[bold]{tool_name}[/bold]",
+                        border_style=style,
+                        padding=(0, 1),
+                    )
+
+                printed = False
+                if ctx.deps.tools_visible:
+                    if tracker:
+                        tracker.pause()
+                    console.print(panel)
+                    printed = True
+                    if tracker:
+                        tracker.resume()
+
+                # Store in turn buffer for rerender
+                turn_buffer = ctx.deps.turn_buffer
+                if turn_buffer:
+                    turn_buffer.add(panel, is_tool=True, already_printed=printed)
+
+                if tracker:
+                    tracker.set_phase(Phase.TOOL_EXEC, tool_name)
 
             elif event.event_kind == "function_tool_result":
                 assert isinstance(event, FunctionToolResultEvent)
@@ -228,38 +258,49 @@ async def render_events(
                 outcome = getattr(event.result, "outcome", "success")
                 result_style = "dim green" if outcome == "success" else "dim red"
 
-                console.print(
-                    Panel(
-                        Text(content_str, style="dim"),
-                        title="[dim]result[/dim]",
-                        border_style=result_style,
-                        padding=(0, 1),
-                    )
+                result_panel = Panel(
+                    Text(content_str, style="dim"),
+                    title="[dim]result[/dim]",
+                    border_style=result_style,
+                    padding=(0, 1),
                 )
 
-                # Back to thinking after tool result
+                printed = False
+                if ctx.deps.tools_visible:
+                    if tracker:
+                        tracker.pause()
+                    console.print(result_panel)
+                    printed = True
+                    if tracker:
+                        tracker.resume()
+
+                # Store in turn buffer for rerender
+                turn_buffer = ctx.deps.turn_buffer
+                if turn_buffer:
+                    turn_buffer.add(result_panel, is_tool=True, already_printed=printed)
+
                 if tracker:
                     tracker.set_phase(Phase.THINKING)
 
-            elif event.event_kind == "final_result":
-                # Finalize any remaining text
-                if live is not None:
-                    visible = _render_text_with_thinking(
-                        "".join(text_chunks), console, has_thinking
+                # Show inline thinking spinner only when status line is hidden
+                if not ctx.deps.status_visible:
+                    if tracker:
+                        tracker.pause()
+                    thinking_live = Live(
+                        Spinner("dots", text="thinking...", style="dim"),
+                        console=console,
+                        refresh_per_second=10,
+                        transient=True,
                     )
-                    live.update(visible)
-                    live.stop()
-                    live = None
-                    text_chunks.clear()
+                    thinking_live.start()
+
+            elif event.event_kind == "final_result":
+                _stop_thinking_spinner()
+                _finalize_live()
 
     finally:
-        if live is not None:
-            if text_chunks:
-                visible = _render_text_with_thinking(
-                    "".join(text_chunks), console, has_thinking
-                )
-                live.update(visible)
-            live.stop()
+        _stop_thinking_spinner()
+        _finalize_live()
 
         # Resume tracker so caller can stop it cleanly
         if tracker:

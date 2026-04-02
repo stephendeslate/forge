@@ -8,17 +8,20 @@ from unittest.mock import MagicMock
 
 has_rg = shutil.which("rg") is not None
 
+from pydantic_ai import ModelRetry, Tool
 from rich.console import Console
 
 from forge.agent.deps import AgentDeps
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.tools import (
+    ALL_TOOLS,
     read_file,
     write_file,
     edit_file,
     run_command,
     search_code,
     list_files,
+    rag_search,
     _resolve_path,
 )
 
@@ -54,10 +57,9 @@ class TestReadFile:
         assert "line 2" in result
         assert "3 lines" in result
 
-    async def test_read_nonexistent_file(self, ctx):
-        result = await read_file(ctx, "missing.txt")
-        assert "Error" in result
-        assert "not found" in result.lower()
+    async def test_read_nonexistent_file_raises_model_retry(self, ctx):
+        with pytest.raises(ModelRetry, match="File not found"):
+            await read_file(ctx, "missing.txt")
 
     async def test_read_with_offset(self, ctx, tmp_path):
         f = tmp_path / "lines.txt"
@@ -74,11 +76,11 @@ class TestReadFile:
         assert "line 4" in result
         assert "showing lines" in result.lower()
 
-    async def test_read_directory_returns_error(self, ctx, tmp_path):
+    async def test_read_directory_raises_model_retry(self, ctx, tmp_path):
         d = tmp_path / "subdir"
         d.mkdir()
-        result = await read_file(ctx, "subdir")
-        assert "Error" in result
+        with pytest.raises(ModelRetry, match="directory"):
+            await read_file(ctx, "subdir")
 
 
 class TestWriteFile:
@@ -107,24 +109,21 @@ class TestEditFile:
         assert "Edited" in result
         assert "goodbye" in f.read_text()
 
-    async def test_edit_nonexistent_file(self, ctx):
-        result = await edit_file(ctx, "missing.py", "a", "b")
-        assert "Error" in result
-        assert "not found" in result.lower()
+    async def test_edit_nonexistent_file_raises_model_retry(self, ctx):
+        with pytest.raises(ModelRetry, match="File not found"):
+            await edit_file(ctx, "missing.py", "a", "b")
 
-    async def test_edit_text_not_found(self, ctx, tmp_path):
+    async def test_edit_text_not_found_raises_model_retry(self, ctx, tmp_path):
         f = tmp_path / "test.py"
         f.write_text("hello world")
-        result = await edit_file(ctx, "test.py", "nonexistent text", "replacement")
-        assert "Error" in result
-        assert "not found" in result.lower()
+        with pytest.raises(ModelRetry, match="old_text not found"):
+            await edit_file(ctx, "test.py", "nonexistent text", "replacement")
 
-    async def test_edit_non_unique_text(self, ctx, tmp_path):
+    async def test_edit_non_unique_text_raises_model_retry(self, ctx, tmp_path):
         f = tmp_path / "dup.py"
         f.write_text("x = 1\nx = 1\n")
-        result = await edit_file(ctx, "dup.py", "x = 1", "x = 2")
-        assert "Error" in result
-        assert "2 times" in result
+        with pytest.raises(ModelRetry, match="appears 2 times"):
+            await edit_file(ctx, "dup.py", "x = 1", "x = 2")
 
 
 class TestRunCommand:
@@ -220,3 +219,59 @@ class TestListFiles:
         result = await list_files(ctx)
         assert "module.py" in result
         assert "__pycache__" not in result
+
+
+class TestModelRetry:
+    """Verify retryable errors raise ModelRetry, non-retryable return strings."""
+
+    async def test_edit_permission_denied_returns_string(self, ctx, tmp_path):
+        """Permission denials return strings (not retryable)."""
+        from unittest.mock import AsyncMock, patch
+
+        with patch("forge.agent.tools.check_permission", new_callable=AsyncMock, return_value=False):
+            result = await edit_file(ctx, "whatever.py", "a", "b")
+        assert result == "Permission denied by user."
+
+    async def test_write_permission_denied_returns_string(self, ctx, tmp_path):
+        from unittest.mock import AsyncMock, patch
+
+        with patch("forge.agent.tools.check_permission", new_callable=AsyncMock, return_value=False):
+            result = await write_file(ctx, "whatever.py", "content")
+        assert result == "Permission denied by user."
+
+
+class TestParallelToolMarking:
+    """Verify ALL_TOOLS has correct sequential/parallel marking."""
+
+    def test_read_only_tools_are_plain_functions(self):
+        plain = [t for t in ALL_TOOLS if not isinstance(t, Tool)]
+        names = {t.__name__ for t in plain}
+        assert "read_file" in names
+        assert "search_code" in names
+        assert "list_files" in names
+        assert "web_search" in names
+        assert "web_fetch" in names
+
+    def test_write_tools_are_sequential(self):
+        seq_tools = [t for t in ALL_TOOLS if isinstance(t, Tool) and t.sequential]
+        names = {t.name for t in seq_tools}
+        assert "write_file" in names
+        assert "edit_file" in names
+        assert "run_command" in names
+
+    def test_no_write_tool_is_parallel(self):
+        for t in ALL_TOOLS:
+            if isinstance(t, Tool) and t.name in ("write_file", "edit_file", "run_command"):
+                assert t.sequential is True
+
+
+class TestRagSearch:
+    """Test rag_search tool graceful fallback."""
+
+    async def test_rag_unavailable_returns_fallback(self, ctx):
+        """When RAG is not configured, returns a helpful message."""
+        ctx.deps.rag_db = None
+        ctx.deps.rag_project = None
+        result = await rag_search(ctx, "how does routing work")
+        assert "unavailable" in result.lower()
+        assert "search_code" in result

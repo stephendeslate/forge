@@ -13,8 +13,10 @@ from pydantic_ai.messages import (
 from forge.agent.context import (
     estimate_tokens,
     compact_history,
+    smart_compact_history,
     count_messages_tokens,
     _message_text,
+    _message_to_readable,
     _truncate_tool_results,
     MIN_RECENT_MESSAGES,
     TOOL_RESULT_TRUNCATE,
@@ -138,3 +140,48 @@ class TestCountMessagesTokens:
         count, tokens = count_messages_tokens(msgs)
         assert count == 2
         assert tokens > 0
+
+
+class TestMessageToReadable:
+    def test_user_message(self):
+        msg = _make_user_msg("explain this code")
+        result = _message_to_readable(msg)
+        assert "User: explain this code" in result
+
+    def test_response_message(self):
+        msg = _make_response("here is the explanation")
+        result = _message_to_readable(msg)
+        assert "Assistant: here is the explanation" in result
+
+    def test_tool_result_message(self):
+        msg = _make_tool_result("read_file", "file contents here")
+        result = _message_to_readable(msg)
+        assert "Tool result (read_file)" in result
+        assert "file contents here" in result
+
+    def test_long_tool_result_truncated(self):
+        msg = _make_tool_result("read_file", "x" * 500)
+        result = _message_to_readable(msg)
+        assert "..." in result
+        assert len(result) < 500
+
+
+class TestSmartCompactHistory:
+    async def test_short_history_unchanged(self):
+        msgs = [_make_user_msg("hi"), _make_response("hello")]
+        result = await smart_compact_history(msgs)
+        assert len(result) == 2
+
+    async def test_falls_back_on_llm_failure(self):
+        """When LLM is unavailable, falls back to mechanical compaction."""
+        msgs = []
+        for i in range(20):
+            # Use longer messages so they exceed the token budget
+            msgs.append(_make_user_msg(f"message number {i} " * 50))
+            msgs.append(_make_response(f"response number {i} " * 50))
+
+        # This will fail because no Ollama is running in tests,
+        # falling back to mechanical compaction. Use small budget to force drops.
+        result = await smart_compact_history(msgs, token_budget=500)
+        assert len(result) < len(msgs)
+        assert len(result) >= MIN_RECENT_MESSAGES

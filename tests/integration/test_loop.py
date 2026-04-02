@@ -3,8 +3,9 @@
 import os
 from unittest.mock import patch
 
-from forge.agent.loop import _ensure_ollama_env, _maybe_prepend_think, AGENT_SYSTEM
+from forge.agent.loop import _ensure_ollama_env, _maybe_prepend_think, _run_with_status, create_agent, AGENT_SYSTEM
 from forge.agent.deps import AgentDeps
+from forge.config import settings
 from forge.core.project import detect_project_type, load_project_instructions
 
 from pathlib import Path
@@ -90,6 +91,23 @@ class TestAgentSystemPrompt:
         # Should mention using tools to gather info, then responding
         assert "clear answer" in AGENT_SYSTEM.lower() or "natural answer" in AGENT_SYSTEM.lower()
 
+    def test_system_prompt_has_web_research_rules(self):
+        """System prompt must contain explicit web research rules section."""
+        assert "## Web research rules" in AGENT_SYSTEM
+        assert "snippets are often enough" in AGENT_SYSTEM.lower()
+        assert "budget" in AGENT_SYSTEM.lower()
+        assert "never re-fetch" in AGENT_SYSTEM.lower()
+        assert "never fetch more than 3" in AGENT_SYSTEM.lower()
+
+    def test_request_limit_is_15(self):
+        """Request limit should be 15 to catch runaway loops faster."""
+        from forge.agent.loop import UsageLimits
+        # Verify the limit by checking that the constant is used correctly
+        # (The actual limit is set in _run_with_status, tested via source inspection)
+        import inspect
+        source = inspect.getsource(_run_with_status)
+        assert "request_limit=15" in source
+
 
 class TestEnsureOllamaEnv:
     def test_sets_env_var(self):
@@ -103,6 +121,42 @@ class TestEnsureOllamaEnv:
         with patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://custom:1234/v1"}):
             _ensure_ollama_env()
             assert os.environ["OLLAMA_BASE_URL"] == "http://custom:1234/v1"
+
+
+class TestCreateAgent:
+    def test_default_model(self):
+        agent = create_agent()
+        assert agent.model.model_name == settings.ollama.heavy_model
+
+    def test_custom_model(self):
+        agent = create_agent(model="test-model:latest")
+        assert agent.model.model_name == "test-model:latest"
+
+    def test_retries_set(self):
+        agent = create_agent()
+        assert agent._max_tool_retries == 3
+
+
+class TestModelSwitching:
+    def test_model_override_on_deps(self):
+        deps = AgentDeps(cwd=Path("/tmp"), console=Console(file=None))
+        assert deps.model_override is None
+        deps.model_override = "fast-model:latest"
+        assert deps.model_override == "fast-model:latest"
+
+
+class TestPlanTracking:
+    def test_active_plan_on_deps(self):
+        deps = AgentDeps(cwd=Path("/tmp"), console=Console(file=None))
+        assert deps.active_plan is None
+        deps.active_plan = "Step 1: Do X\nStep 2: Do Y"
+        assert "Step 1" in deps.active_plan
+
+    def test_plan_cleared(self):
+        deps = AgentDeps(cwd=Path("/tmp"), console=Console(file=None))
+        deps.active_plan = "some plan"
+        deps.active_plan = None
+        assert deps.active_plan is None
 
 
 class TestMaybePrependThink:

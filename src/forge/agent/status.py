@@ -75,20 +75,27 @@ class StatusTracker:
     _paused: bool = field(default=False, init=False)
     _active: bool = field(default=False, init=False)
     _on_toggle: object | None = field(default=None, init=False)  # callback
+    _on_tools_toggle: object | None = field(default=None, init=False)  # callback
 
     @property
     def tool_calls(self) -> int:
         return self._tool_calls
 
-    def start(self, on_toggle: object | None = None) -> None:
+    def start(
+        self,
+        on_toggle: object | None = None,
+        on_tools_toggle: object | None = None,
+    ) -> None:
         """Start the status ticker and optional keypress monitor.
 
         Args:
             on_toggle: Callable invoked with (visible: bool) when Ctrl-O is pressed.
+            on_tools_toggle: Callable invoked (no args) when Ctrl-R is pressed.
         """
         self._start_time = time.monotonic()
         self._active = True
         self._on_toggle = on_toggle
+        self._on_tools_toggle = on_tools_toggle
         if not self.console.is_terminal:
             return
         self._phase = Phase.THINKING
@@ -200,6 +207,9 @@ class StatusTracker:
                             self._clear_line()
                         if self._on_toggle:
                             self._on_toggle(self.visible)  # type: ignore[operator]
+                    elif ch == 0x12:  # Ctrl-R
+                        if self._on_tools_toggle:
+                            self._on_tools_toggle()  # type: ignore[operator]
                     await asyncio.sleep(0.05)
             finally:
                 _restore_flags(fd, old_flags)
