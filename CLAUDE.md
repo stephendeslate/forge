@@ -94,10 +94,12 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
 - **Hooks** event-driven system (`PreToolUse`, `PostToolUse`, `SessionStart/End`, etc.) with priority ordering and block/allow semantics
 - **Tasks** in-memory store with `PENDING → IN_PROGRESS → COMPLETED` lifecycle, dependency tracking, system prompt injection
 - **Memory** cross-session persistence via pgvector embeddings — categories: `feedback`, `project`, `user`, `reference`; semantic recall + auto-pruning
-- **MCP** discovers `.forge/mcp.json` (project-local) and `~/.config/forge/mcp.json` (global), expands `${VAR}` env refs, project overrides global
+- **MCP** discovers `.forge/mcp.json` (project-local) and `~/.config/forge/mcp.json` (global); `${VAR}` expanded by pydantic-ai natively; project overrides global; built-in Playwright browser server auto-discovered if npx is on PATH; set server to `false` in config to disable
 - **Context compaction** 3-tier: truncate tool results → summarize task sequences → full LLM summarization with domain-aware prompt; auto-triggers at 80% token budget
 - **Worktrees** git worktree isolation via `--worktree` flag or `/worktree` command; atexit crash safety, cleanup prompt on exit
 - **RAG** tree-sitter AST chunking → nomic-embed-text-v2-moe (768d) → pgvector cosine search
+- **Sandbox** command blocklist hook (`sandbox.py`) blocks dangerous commands (sudo, rm -rf /, curl|sh, etc.) and path boundary enforcement restricts file tools to cwd + /tmp; configurable via `SandboxSettings`
+- **Multimodal** `@path/to/image.png` syntax in REPL input attaches images via `BinaryContent`; auto-routes to `vision_model` if configured; `read_file` detects images and returns metadata
 - **Database** PostgreSQL on Unix socket (port 5433), pgvector 0.6.0 with `vector` type (not halfvec)
 
 ## Key Implementation Notes
@@ -111,10 +113,16 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
 - tree-sitter 0.25+ requires individual language packages (`tree-sitter-python`, etc.), not `tree-sitter-languages`
 - Conversation persistence: `sessions` table (metadata) + `conversations` table (messages), async fire-and-forget writes
 - Disable persistence with `FORGE_PERSIST_HISTORY=false`
-- MCP config format: `{"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}` — same schema as Claude Desktop
+- MCP config format: `{"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}` — same schema as Claude Desktop; set `"name": false` to disable a built-in server
+- Playwright browser MCP auto-discovered if `npx` is on PATH (headless mode); MCP tools are passed to sub-agents via `toolsets` param
 - Memory stored in `memories` table with 768d embeddings; recalled via cosine similarity; auto-prunes at 50 entries
 - Task store is in-memory per session, serialized to DB for resume; injected into system prompt via `to_prompt()`
 - Hook registry: `HookRegistry.on(EventType, handler)` with priority ordering; `@with_hooks` decorator wraps tools
+- Sandbox hooks registered at priority -50 (before permission hook at 0); command blocklist + path boundary enforcement
+- Multimodal: `parse_multimodal_input()` extracts `@path.png` refs → `BinaryContent.from_path()`; `ModelMessagesTypeAdapter` used for serialization (supports base64 bytes)
+- Vision model configured via `ollama.vision_model` in config.toml (e.g. `gemma3:12b`); empty = disabled
+- `fastmcp` is a direct dependency (used by `mcp_server.py`); `mcp` removed (transitive via pydantic-ai)
+- Executor uses `start_new_session=True` + process group kill; temp files in `.forge/tmp/` when cwd is set
 
 ## Testing
 
@@ -145,3 +153,4 @@ uv run forge agent --worktree                  # Agent in isolated worktree
 - [x] Phase 7B: Worktrees + improved compaction — git worktree isolation, 3-tier context compaction with domain-aware summarization
 - [x] Phase 7C: MCP integration — discover and connect external MCP tool servers via pydantic-ai
 - [x] Phase 8: Conversation checkpoints + RAG auto-index — named save/restore within sessions, staleness detection, post-write reindex hooks, /index command
+- [x] Phase 9: Sandboxing, multimodal, web browsing, dependency fixes — command blocklist + path boundaries, @image input with vision routing, Playwright MCP auto-discovery, fastmcp direct dep, MCP in sub-agents

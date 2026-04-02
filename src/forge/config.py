@@ -23,6 +23,7 @@ class OllamaSettings(BaseSettings):
     heavy_model: str = "qwen3-coder-next:q8_0"
     fast_model: str = "qwen3.5:4b"
     embed_model: str = "nomic-embed-text-v2-moe"
+    vision_model: str = ""
 
 
 class NPUSettings(BaseSettings):
@@ -91,6 +92,37 @@ class AgentSettings(BaseSettings):
     escalation_threshold: float = Field(default=5.0, description="Cumulative signal weight to trigger escalation")
 
 
+DEFAULT_BLOCKED_PATTERNS = [
+    r"\brm\s+(-[rfv]*\s+)?/",          # rm -rf /
+    r"\bsudo\b",                         # sudo anything
+    r"\bchmod\s+777\b",                  # chmod 777
+    r"\bmkfs\b",                         # format disk
+    r"\bdd\s+.*of=/",                    # dd to device
+    r"\bcurl\b.*\|\s*(bash|sh|zsh)\b",   # curl pipe to shell
+    r"\bwget\b.*\|\s*(bash|sh|zsh)\b",   # wget pipe to shell
+    r">\s*/etc/",                         # redirect to /etc
+    r">\s*~/\.ssh/",                      # redirect to .ssh
+    r"\bgit\s+push\s+.*--force\b",       # force push
+    r"\bgit\s+reset\s+--hard\b",         # hard reset
+]
+
+DEFAULT_WARN_PATTERNS = [
+    r"\brm\s+-r",                        # recursive delete (non-root)
+    r"\bkill\s+-9\b",                    # kill -9
+    r"\bpkill\b",                        # pkill
+]
+
+
+class SandboxSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FORGE_SANDBOX_")
+
+    enabled: bool = True
+    blocked_patterns: list[str] = Field(default_factory=lambda: list(DEFAULT_BLOCKED_PATTERNS))
+    warn_patterns: list[str] = Field(default_factory=lambda: list(DEFAULT_WARN_PATTERNS))
+    restrict_paths: bool = True
+    allowed_paths: list[str] = Field(default_factory=list, description="Extra allowed paths beyond cwd + /tmp")
+
+
 class MemorySettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_MEMORY_")
 
@@ -118,6 +150,7 @@ class Settings(BaseSettings):
     hooks: HookSettings = Field(default_factory=HookSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
 
     @classmethod
     def ensure_config_dir(cls) -> Path:

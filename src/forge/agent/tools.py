@@ -46,6 +46,15 @@ async def read_file(
     if not path.is_file():
         raise ModelRetry(f"Not a file: {path} — this is a directory, use list_files instead")
 
+    # Detect image files — return metadata instead of garbled binary
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+    if path.suffix.lower() in IMAGE_EXTENSIONS:
+        size = path.stat().st_size
+        return (
+            f"[Image file: {path} ({path.suffix.lower()}, {size:,} bytes)]\n"
+            "To view this image, the user should reference it with @path syntax in their prompt."
+        )
+
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -886,6 +895,7 @@ async def delegate(
         cwd=ctx.deps.cwd,
         model=model,
         parent_hooks=ctx.deps.hook_registry,
+        mcp_servers=ctx.deps.mcp_servers,
     )
     if not result.success:
         raise ModelRetry(f"Sub-agent failed: {result.output}")

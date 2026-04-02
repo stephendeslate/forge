@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,8 +56,15 @@ async def execute_code(
     if os.environ.get("FORGE_EXECUTOR_DISABLED"):
         raise RuntimeError("Code execution is disabled (FORGE_EXECUTOR_DISABLED is set)")
 
+    # Use project-local tmp dir if cwd is provided, else system tmp
+    tmp_dir = None
+    if cwd:
+        forge_tmp = Path(cwd) / ".forge" / "tmp"
+        forge_tmp.mkdir(parents=True, exist_ok=True)
+        tmp_dir = str(forge_tmp)
+
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False,
+        mode="w", suffix=".py", delete=False, dir=tmp_dir,
     ) as f:
         f.write(code)
         script_path = f.name
@@ -67,13 +75,18 @@ async def execute_code(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
+            # Kill entire process group for clean cleanup
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
             await proc.communicate()
             return ExecutionResult(
                 code=code,

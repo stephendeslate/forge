@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.messages import ModelMessage
@@ -17,10 +17,7 @@ from forge.agent.deps import AgentDeps
 from forge.agent.hooks import (
     HookRegistry,
     PostToolUse,
-    PreToolUse,
-    SessionStart,
     TurnEnd,
-    make_permission_handler,
 )
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.task_store import TaskStore
@@ -57,7 +54,7 @@ async def setup_model_monitor(deps: AgentDeps, console: Console) -> None:
             if ok:
                 console.print(f"[dim]Model {model} loaded.[/dim]")
             else:
-                console.print(f"[yellow]Model preload timed out — will load on first request.[/yellow]")
+                console.print("[yellow]Model preload timed out — will load on first request.[/yellow]")
 
 
 def setup_worktree(
@@ -237,6 +234,9 @@ def build_agent_with_tools(
             "(e.g. \"filesystem_read_file\"). Use them like any other tool. "
             "If an MCP tool fails, report the error to the user."
         )
+
+    # Store MCP servers in deps so delegate tool can pass them to sub-agents
+    deps.mcp_servers = mcp_servers or None
 
     agent = create_agent(
         system=system, cwd=cwd, tools=ALL_TOOLS + extra_tools,

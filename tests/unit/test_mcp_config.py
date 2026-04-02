@@ -2,12 +2,17 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from forge.agent.mcp_config import (
-    _expand_env_vars,
     find_mcp_configs,
     load_all_mcp_servers,
 )
+
+
+def _no_npx(_name):
+    """Stub shutil.which to hide npx so built-in browser default is suppressed."""
+    return None
 
 
 def test_find_configs_none(tmp_path):
@@ -72,29 +77,13 @@ def test_find_configs_both(tmp_path, monkeypatch):
     assert result[1] == global_config  # global second
 
 
+@patch("forge.agent.mcp_config.shutil.which", _no_npx)
 def test_load_all_empty(tmp_path):
-    """No configs → empty server list."""
+    """No configs and no npx → empty server list."""
     assert load_all_mcp_servers(tmp_path) == []
 
 
-def test_expand_env_vars_basic(monkeypatch):
-    """${VAR} references are expanded from environment."""
-    monkeypatch.setenv("MY_TOKEN", "secret123")
-    assert _expand_env_vars("Bearer ${MY_TOKEN}") == "Bearer secret123"
-
-
-def test_expand_env_vars_missing():
-    """Missing env vars are left as-is."""
-    assert _expand_env_vars("${NONEXISTENT_VAR_XYZ}") == "${NONEXISTENT_VAR_XYZ}"
-
-
-def test_expand_env_vars_nested(monkeypatch):
-    """Recursively expands in dicts and lists."""
-    monkeypatch.setenv("KEY", "val")
-    result = _expand_env_vars({"env": {"TOKEN": "${KEY}"}, "args": ["--key=${KEY}"]})
-    assert result == {"env": {"TOKEN": "val"}, "args": ["--key=val"]}
-
-
+@patch("forge.agent.mcp_config.shutil.which", _no_npx)
 def test_load_servers_from_config(tmp_path, monkeypatch):
     """Load servers from a valid config file."""
     fake_home = tmp_path / "home"
@@ -117,6 +106,7 @@ def test_load_servers_from_config(tmp_path, monkeypatch):
     assert servers[0].command == "echo"
 
 
+@patch("forge.agent.mcp_config.shutil.which", _no_npx)
 def test_load_servers_project_overrides_global(tmp_path, monkeypatch):
     """Project config overrides global on name collision."""
     fake_home = tmp_path / "home"
@@ -145,3 +135,38 @@ def test_load_servers_project_overrides_global(tmp_path, monkeypatch):
     assert len(by_id) == 2
     assert by_id["myserver"].command == "project-cmd"  # project wins
     assert by_id["global-only"].command == "only-global"  # global-only preserved
+
+
+def test_default_browser_discovered_when_npx_exists(tmp_path, monkeypatch):
+    """Built-in browser server is included when npx is on PATH."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    with patch("forge.agent.mcp_config.shutil.which", return_value="/usr/bin/npx"):
+        servers = load_all_mcp_servers(tmp_path)
+
+    by_id = {s.id: s for s in servers}
+    assert "browser" in by_id
+    assert by_id["browser"].command == "npx"
+
+
+@patch("forge.agent.mcp_config.shutil.which", return_value="/usr/bin/npx")
+def test_disable_builtin_server(_, tmp_path, monkeypatch):
+    """Setting a server to false disables it."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    cwd = tmp_path / "project"
+    project_dir = cwd / ".forge"
+    project_dir.mkdir(parents=True)
+    (project_dir / "mcp.json").write_text(json.dumps({
+        "mcpServers": {
+            "browser": False,
+        }
+    }))
+
+    servers = load_all_mcp_servers(cwd)
+    by_id = {s.id: s for s in servers}
+    assert "browser" not in by_id

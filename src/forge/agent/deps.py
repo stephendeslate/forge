@@ -60,3 +60,5 @@ class AgentDeps:
     circuit_breaker: ToolCallTracker | None = None
     # Model escalation
     escalator: ModelEscalator | None = None
+    # MCP servers (for passing to sub-agents)
+    mcp_servers: list | None = None

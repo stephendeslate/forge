@@ -780,8 +780,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "duckduckgo-search" },
+    { name = "fastmcp" },
     { name = "httpx" },
-    { name = "mcp" },
     { name = "prompt-toolkit" },
     { name = "pydantic-ai" },
     { name = "pydantic-settings" },
@@ -824,8 +824,8 @@ rag = [
 requires-dist = [
     { name = "asyncpg", marker = "extra == 'rag'", specifier = ">=0.30" },
     { name = "duckduckgo-search", specifier = ">=7" },
+    { name = "fastmcp", specifier = ">=2.14" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "mcp", specifier = ">=1.20" },
     { name = "pgvector", marker = "extra == 'rag'", specifier = ">=0.3" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pydantic-ai", specifier = ">=1.75" },

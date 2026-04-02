@@ -14,7 +14,6 @@ from forge.agent.deps import AgentDeps
 from forge.agent.hooks import HookRegistry, PostToolUse
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.tools import (
-    ALL_TOOLS,
     edit_file,
     list_files,
     read_file,
@@ -211,6 +210,7 @@ async def run_subagent(
     timeout: float = 300.0,
     system: str = SUBAGENT_SYSTEM,
     parent_hooks: HookRegistry | None = None,
+    mcp_servers: list | None = None,
 ) -> SubagentResult:
     """Spawn a sub-agent to handle a contained task.
 
@@ -226,10 +226,10 @@ async def run_subagent(
     Returns:
         SubagentResult with output, worktree info, and message history.
     """
-    from forge.core.project import build_project_context
-
     # Ensure OLLAMA_BASE_URL is set
     import os
+
+    from forge.core.project import build_project_context
 
     if "OLLAMA_BASE_URL" not in os.environ:
         base = settings.ollama.base_url.rstrip("/")
@@ -262,6 +262,7 @@ async def run_subagent(
         model=f"ollama:{model_name}",
         instructions=full_system,
         tools=SUBAGENT_TOOLS,
+        toolsets=mcp_servers or [],
         deps_type=AgentDeps,
         model_settings=_model_settings(timeout=int(timeout), num_ctx=min(settings.agent.num_ctx, 32768)),
         retries=2,
@@ -318,6 +319,7 @@ async def run_subagent_and_merge(
     timeout: float = 300.0,
     parent_hooks: HookRegistry | None = None,
     auto_merge: bool = True,
+    mcp_servers: list | None = None,
 ) -> SubagentResult:
     """Run a sub-agent in a worktree, validate output, and optionally merge.
 
@@ -335,7 +337,7 @@ async def run_subagent_and_merge(
     """
     result = await run_subagent(
         task, cwd, model=model, isolate=True, timeout=timeout,
-        parent_hooks=parent_hooks,
+        parent_hooks=parent_hooks, mcp_servers=mcp_servers,
     )
 
     # Validate output for error indicators

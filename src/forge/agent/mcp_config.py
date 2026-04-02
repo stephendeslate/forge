@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
-import re
+import shutil
 from pathlib import Path
 
 from forge.log import get_logger
@@ -12,6 +11,18 @@ from forge.log import get_logger
 logger = get_logger(__name__)
 
 MCP_CONFIG_NAME = "mcp.json"
+
+
+def _default_mcp_servers() -> dict:
+    """Built-in MCP servers available if their runtime exists."""
+    servers: dict = {}
+    # Playwright browser — available if npx is on PATH
+    if shutil.which("npx"):
+        servers["browser"] = {
+            "command": "npx",
+            "args": ["@playwright/mcp", "--headless"],
+        }
+    return servers
 
 
 def find_mcp_configs(cwd: Path) -> list[Path]:
@@ -26,57 +37,56 @@ def find_mcp_configs(cwd: Path) -> list[Path]:
     return paths
 
 
-def _expand_env_vars(obj: object) -> object:
-    """Recursively expand ${VAR} references in string values."""
-    if isinstance(obj, str):
-        return re.sub(
-            r"\$\{(\w+)\}",
-            lambda m: os.environ.get(m.group(1), m.group(0)),
-            obj,
-        )
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(v) for v in obj]
-    return obj
-
-
 def load_all_mcp_servers(cwd: Path) -> list:
     """Load and merge MCP servers from all config files.
 
-    Project-local (.forge/mcp.json) overrides global (~/.config/forge/mcp.json)
-    on name collision. Environment variables in ${VAR} syntax are expanded.
+    Priority (lowest to highest): built-in defaults → global → project-local.
+    Setting a server name to ``false`` in any config disables it.
+    Environment variables in ``${VAR}`` syntax are expanded by pydantic-ai natively.
 
     Returns a list of pydantic-ai MCP server objects.
     """
     from pydantic_ai.mcp import load_mcp_servers
 
+    # Start with built-in defaults
+    merged: dict = _default_mcp_servers()
+
     configs = find_mcp_configs(cwd)
-    if not configs:
-        return []
 
-    servers_by_name: dict[str, object] = {}
-
-    # Load in reverse priority order (global first, project overrides)
+    # Load in reverse priority order (global first, then project overrides)
     for config_path in reversed(configs):
         try:
-            # Expand env vars before passing to pydantic-ai
             raw = json.loads(config_path.read_text())
-            expanded = _expand_env_vars(raw)
-            # Write expanded config to a temp location for load_mcp_servers
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as tmp:
-                json.dump(expanded, tmp)
-                tmp_path = tmp.name
-            try:
-                for server in load_mcp_servers(tmp_path):
-                    servers_by_name[server.id] = server
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
+            mcp_servers = raw.get("mcpServers", {})
+            for name, value in mcp_servers.items():
+                if value is False:
+                    # Explicit disable — remove from merged
+                    merged.pop(name, None)
+                else:
+                    merged[name] = value
         except Exception:
             logger.warning("Failed to load MCP config: %s", config_path, exc_info=True)
 
-    return list(servers_by_name.values())
+    if not merged:
+        return []
+
+    # Write merged config to temp file for pydantic-ai's load_mcp_servers
+    # (which handles ${VAR} expansion natively — no need to pre-expand)
+    import tempfile
+
+    config_data = {"mcpServers": merged}
+    servers: list = []
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False,
+        ) as tmp:
+            json.dump(config_data, tmp)
+            tmp_path = tmp.name
+        try:
+            servers = list(load_mcp_servers(tmp_path))
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Failed to load merged MCP config", exc_info=True)
+
+    return servers

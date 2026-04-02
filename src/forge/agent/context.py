@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelRequestPart,
@@ -92,6 +93,9 @@ def _estimate_part_tokens(part) -> int:
         content = str(part.content) if part.content else ""
         cpt = CHARS_PER_TOKEN_CODE if _is_code_heavy(content) else CHARS_PER_TOKEN_PROSE
         tokens = int(len(content) / cpt)
+    elif isinstance(part, BinaryContent):
+        # Vision models typically charge ~85 tokens per image tile
+        tokens = 85
     elif hasattr(part, "content"):
         content = str(part.content) if part.content else ""
         tokens = int(len(content) / CHARS_PER_TOKEN_PROSE)
@@ -162,6 +166,40 @@ def _message_text(msg: ModelMessage) -> str:
                 parts_text.append(str(part.args))
         return "\n".join(parts_text)
     return str(msg)
+
+
+def _strip_binary_content(msg: ModelMessage) -> ModelMessage:
+    """Replace BinaryContent in old messages with text placeholders."""
+    if not isinstance(msg, ModelRequest):
+        return msg
+
+    new_parts: list[ModelRequestPart] = []
+    changed = False
+    for part in msg.parts:
+        if isinstance(part, BinaryContent):
+            media_type = getattr(part, "media_type", "unknown")
+            new_parts.append(UserPromptPart(content=f"[image: {media_type}]"))
+            changed = True
+        elif isinstance(part, UserPromptPart) and isinstance(part.content, list):
+            # UserPromptPart can contain a list of content items
+            filtered = []
+            for item in part.content:
+                if isinstance(item, BinaryContent):
+                    media_type = getattr(item, "media_type", "unknown")
+                    filtered.append(f"[image: {media_type}]")
+                    changed = True
+                else:
+                    filtered.append(item)
+            if changed:
+                new_parts.append(UserPromptPart(content=" ".join(str(f) for f in filtered)))
+            else:
+                new_parts.append(part)
+        else:
+            new_parts.append(part)
+
+    if changed:
+        return ModelRequest(parts=new_parts)
+    return msg
 
 
 def _truncate_tool_results(msg: ModelMessage, max_len: int = TOOL_RESULT_TRUNCATE) -> ModelMessage:
@@ -382,8 +420,8 @@ async def smart_compact_history(
     older = list(messages[:-recent_count])
     recent = list(messages[-recent_count:])
 
-    # Tier 1: Truncate tool results (no LLM call)
-    truncated_older = [_truncate_tool_results(m) for m in older]
+    # Tier 1: Truncate tool results and strip binary content (no LLM call)
+    truncated_older = [_truncate_tool_results(_strip_binary_content(m)) for m in older]
     trial = truncated_older + recent
     _, tokens = count_messages_tokens(trial)
     if tokens <= token_budget:

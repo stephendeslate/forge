@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import UsageLimits
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.panel import Panel
 
 from forge.agent.context import (
     count_messages_tokens,
@@ -126,7 +128,7 @@ def create_agent(
 
 async def _run_with_status(
     agent: Agent[AgentDeps, str],
-    prompt: str,
+    prompt: str | Sequence,
     deps: AgentDeps,
     message_history: list[ModelMessage] | None,
     turn_number: int = 0,
@@ -293,9 +295,9 @@ async def _plan_and_execute(
     return result
 
 
-from pydantic import TypeAdapter
+from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-_message_list_adapter = TypeAdapter(list[ModelMessage])
+_message_list_adapter = ModelMessagesTypeAdapter
 
 
 async def _save_agent_session(
@@ -350,19 +352,19 @@ async def agent_repl(
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.key_binding import KeyBindings
 
-    from forge.agent.commands import CommandContext, dispatch, _UNCHANGED
+    from forge.agent.commands import _UNCHANGED, CommandContext, dispatch
     from forge.agent.session import (
-        setup_worktree,
-        setup_persistence,
+        build_agent_with_tools,
+        cleanup,
+        print_welcome,
+        setup_mcp,
         setup_memory,
         setup_model_monitor,
+        setup_persistence,
         setup_rag,
-        setup_mcp,
-        build_agent_with_tools,
+        setup_worktree,
         wire_dynamic_prompts,
         wire_rag_hooks,
-        print_welcome,
-        cleanup,
     )
 
     console = Console()
@@ -383,6 +385,13 @@ async def agent_repl(
 
     hook_registry = HookRegistry()
     from forge.agent.hooks import PreToolUse
+
+    # Sandbox hooks run first (priority 50) — before permission hook (default 0)
+    # Lower priority number = runs first, so sandbox at -50 runs before permission at 0
+    from forge.agent.sandbox import make_command_blocklist_handler, make_path_boundary_handler
+    hook_registry.on(PreToolUse, make_command_blocklist_handler(), priority=-50)
+    hook_registry.on(PreToolUse, make_path_boundary_handler(cwd), priority=-50)
+
     hook_registry.on(PreToolUse, make_permission_handler(deps))
     deps.hook_registry = hook_registry
     deps.task_store = TaskStore()
@@ -475,10 +484,23 @@ async def agent_repl(
         turn_counter_ref[0] = turn_counter
         console.print(f"\n[bold]> {initial_prompt}[/bold]")
         try:
-            prompt = _maybe_prepend_think(initial_prompt, deps)
+            from forge.agent.multimodal import parse_multimodal_input
+            parsed_initial = parse_multimodal_input(initial_prompt, deps.cwd)
+
+            # Route to vision model if images detected
+            vision_override = None
+            if isinstance(parsed_initial, list) and settings.ollama.vision_model:
+                vision_override = deps.model_override
+                deps.model_override = settings.ollama.vision_model
+
+            prompt = _maybe_prepend_think(parsed_initial, deps)
             message_history = await _run_with_status(
                 agent, prompt, deps, message_history, turn_number=turn_counter,
             )
+
+            # Restore model after vision turn
+            if vision_override is not None or (isinstance(parsed_initial, list) and settings.ollama.vision_model):
+                deps.model_override = vision_override
             if db and message_history:
                 asyncio.create_task(_save_agent_session(db, session_id, message_history))
             if db:
@@ -565,10 +587,25 @@ async def agent_repl(
             try:
                 turn_counter += 1
                 turn_counter_ref[0] = turn_counter
-                prompt = _maybe_prepend_think(user_input, deps)
+
+                # Parse multimodal input (@image.png references)
+                from forge.agent.multimodal import parse_multimodal_input
+                parsed = parse_multimodal_input(user_input, deps.cwd)
+
+                # Route to vision model if images detected
+                vision_override = None
+                if isinstance(parsed, list) and settings.ollama.vision_model:
+                    vision_override = deps.model_override
+                    deps.model_override = settings.ollama.vision_model
+
+                prompt = _maybe_prepend_think(parsed, deps)
                 message_history = await _run_with_status(
                     agent, prompt, deps, message_history, turn_number=turn_counter,
                 )
+
+                # Restore model after vision turn
+                if vision_override is not None or (isinstance(parsed, list) and settings.ollama.vision_model):
+                    deps.model_override = vision_override
                 if db and message_history:
                     asyncio.create_task(_save_agent_session(db, session_id, message_history))
                 if db and deps.task_store:
@@ -586,11 +623,20 @@ async def agent_repl(
         )
 
 
-def _maybe_prepend_think(prompt: str, deps: AgentDeps) -> str:
+def _maybe_prepend_think(prompt: str | Sequence, deps: AgentDeps) -> str | Sequence:
     """Prepend /think or /no_think tag based on thinking_enabled setting."""
-    if deps.thinking_enabled:
+    if not deps.thinking_enabled:
+        return prompt
+    if isinstance(prompt, str):
         return f"/think\n{prompt}"
-    return prompt
+    # Multimodal: prepend think tag to first text element
+    result = list(prompt)
+    for i, part in enumerate(result):
+        if isinstance(part, str):
+            result[i] = f"/think\n{part}"
+            return result
+    # No text part found — prepend one
+    return ["/think", *result]
 
 
 async def _connect_db():
