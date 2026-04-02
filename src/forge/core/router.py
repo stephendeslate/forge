@@ -23,10 +23,16 @@ _HEAVY_KEYWORDS = re.compile(
 )
 
 # Keywords that signal lightweight tasks
+# NOTE: "translate" and "convert" omitted — ambiguous between fast (language translation)
+# and heavy (code conversion); better to fall through to length-based routing.
 _FAST_KEYWORDS = re.compile(
-    r"\b(what is|explain|summarize|define|list|how does|translate|convert)\b",
+    r"\b(what is|explain|summarize|define|list|how does)\b",
     re.IGNORECASE,
 )
+
+
+_SHORT_PROMPT_THRESHOLD = 30
+_LONG_PROMPT_THRESHOLD = 200
 
 
 def classify(prompt: str, *, force: Route | None = None, has_npu: bool = False) -> Route:
@@ -34,8 +40,8 @@ def classify(prompt: str, *, force: Route | None = None, has_npu: bool = False) 
     if force is not None:
         return force
 
-    # Short prompts (< 30 chars) are usually quick questions → NPU if available
-    if len(prompt) < 30 and not _HEAVY_KEYWORDS.search(prompt):
+    # Short prompts are usually quick questions → NPU if available
+    if len(prompt) < _SHORT_PROMPT_THRESHOLD and not _HEAVY_KEYWORDS.search(prompt):
         return Route.NPU if has_npu else Route.FAST
 
     # Check for heavy keywords first (code generation, debugging)
@@ -47,7 +53,7 @@ def classify(prompt: str, *, force: Route | None = None, has_npu: bool = False) 
         return Route.FAST
 
     # Default: heavy for longer prompts, fast for shorter
-    return Route.HEAVY if len(prompt) > 200 else Route.FAST
+    return Route.HEAVY if len(prompt) > _LONG_PROMPT_THRESHOLD else Route.FAST
 
 
 class ModelRouter:

@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-
-import os
 import sys
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
@@ -18,14 +17,35 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from forge import __version__
-from forge.agent.context import count_messages_tokens, smart_compact_history
+from forge.agent.context import (
+    DEFAULT_TOKEN_BUDGET,
+    count_messages_tokens,
+    smart_compact_history,
+)
 from forge.agent.deps import AgentDeps
+from forge.agent.hooks import (
+    HookRegistry,
+    PreToolUse,
+    SessionEnd,
+    SessionStart,
+    TurnEnd,
+    TurnStart,
+    make_permission_handler,
+)
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
 from forge.agent.status import StatusTracker
-from forge.agent.tools import ALL_TOOLS
+from forge.agent.task_store import TaskStore
+from forge.agent.tools import ALL_TOOLS, MEMORY_TOOLS, TASK_TOOLS
 from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
+from forge.log import get_logger
+from forge.models.ollama import _ensure_ollama_env
+
+if TYPE_CHECKING:
+    from forge.storage.database import Database
+
+logger = get_logger(__name__)
 
 AGENT_SYSTEM = """\
 You are Forge, a versatile local AI assistant. You help users with coding, writing, analysis, research, and general questions — as well as reading, understanding, editing, and creating code.
@@ -50,6 +70,17 @@ You have access to tools for reading files, writing files, editing files, runnin
 - All file paths are relative to the working directory unless absolute.
 - IMPORTANT: When you use tools like web_search or web_fetch, the results are raw data for YOU to process. Always synthesize tool results into a direct, natural answer to the user's question. Never dump raw search results or tool output as your response — interpret, summarize, and answer the question.
 - If the user asks a question (e.g. "what's the weather?"), use the appropriate tool to gather information, then respond with a clear answer based on what you found.
+
+## Task management
+When your work involves 3+ distinct steps, create tasks to track progress.
+Mark tasks in_progress when starting, completed when done.
+If you discover additional work, create new tasks.
+Do not create tasks for single simple operations.
+
+## Memory
+When the user asks you to remember something, use save_memory with an appropriate category.
+When you need to recall past context, use recall_memories.
+Categories: feedback (user corrections), project (decisions/context), user (role/preferences), reference (external pointers).
 """
 
 PLAN_OVERLAY = """\
@@ -65,20 +96,12 @@ Be specific and actionable. The plan will be reviewed before execution.
 """
 
 
-def _ensure_ollama_env() -> None:
-    """Set OLLAMA_BASE_URL env var for pydantic-ai's Ollama provider."""
-    if "OLLAMA_BASE_URL" not in os.environ:
-        base = settings.ollama.base_url.rstrip("/")
-        if not base.endswith("/v1"):
-            base = f"{base}/v1"
-        os.environ["OLLAMA_BASE_URL"] = base
-
-
 def create_agent(
     system: str = AGENT_SYSTEM,
     cwd: Path | None = None,
     model: str | None = None,
-    tools: list | None = None,
+    tools: list[Tool] | None = None,
+    toolsets: list | None = None,
 ) -> Agent[AgentDeps, str]:
     """Create a pydantic-ai Agent with coding tools."""
     from forge.core.project import build_project_context
@@ -95,6 +118,7 @@ def create_agent(
         model=f"ollama:{model_name}",
         instructions=full_system,
         tools=tools if tools is not None else ALL_TOOLS,
+        toolsets=toolsets or [],
         deps_type=AgentDeps,
         model_settings=ModelSettings(timeout=300),
         retries=3,
@@ -106,6 +130,7 @@ async def _run_with_status(
     prompt: str,
     deps: AgentDeps,
     message_history: list[ModelMessage] | None,
+    turn_number: int = 0,
 ) -> list[ModelMessage]:
     """Run agent with status tracker lifecycle management.
 
@@ -118,6 +143,12 @@ async def _run_with_status(
     turn_buffer = TurnBuffer(console=deps.console)
     deps.turn_buffer = turn_buffer
 
+    # Show active task in status detail
+    if deps.task_store:
+        active_task = deps.task_store.get_active()
+        if active_task and active_task.active_form:
+            tracker.set_phase(tracker._phase, active_task.active_form)
+
     def _on_toggle(visible: bool) -> None:
         deps.status_visible = visible
 
@@ -125,6 +156,14 @@ async def _run_with_status(
         deps.tools_visible = not deps.tools_visible
 
     tracker.start(on_toggle=_on_toggle, on_tools_toggle=_on_tools_toggle)
+
+    # Emit TurnStart
+    registry = deps.hook_registry
+    if registry:
+        await registry.emit(TurnStart(turn_number=turn_number, prompt=prompt))
+
+    import time as _time
+    turn_start = _time.monotonic()
 
     try:
         run_kwargs: dict = dict(
@@ -146,6 +185,15 @@ async def _run_with_status(
         tracker.stop()
         turn_buffer.add(tracker.summary(), is_tool=False)
         turn_buffer.print_final(deps.tools_visible)
+
+        # Emit TurnEnd
+        if registry:
+            elapsed = _time.monotonic() - turn_start
+            await registry.emit(TurnEnd(
+                turn_number=turn_number,
+                tool_call_count=tracker.tool_calls,
+                elapsed=elapsed,
+            ))
 
         deps.status_tracker = None
         return result.all_messages()
@@ -207,7 +255,7 @@ async def _plan_and_execute(
     try:
         from prompt_toolkit import prompt as pt_prompt
 
-        answer = await asyncio.get_event_loop().run_in_executor(
+        answer = await asyncio.get_running_loop().run_in_executor(
             None, lambda: pt_prompt("Execute this plan? [Y/n] ")
         )
         answer = answer.strip().lower()
@@ -240,31 +288,43 @@ _message_list_adapter = TypeAdapter(list[ModelMessage])
 
 
 async def _save_agent_session(
-    db: object,
+    db: Database,
     session_id: str,
     messages: list[ModelMessage],
 ) -> None:
     """Persist agent message history as JSON to the conversations table."""
     try:
         history_json = _message_list_adapter.dump_json(messages).decode()
-        await db.delete_agent_history(session_id)  # type: ignore[union-attr]
-        await db.save_message(session_id, "agent_history", history_json, model="")  # type: ignore[union-attr]
+        await db.delete_agent_history(session_id)
+        await db.save_message(session_id, "agent_history", history_json, model="")
     except Exception:
-        pass  # Best-effort persistence
+        logger.debug("Failed to save session", exc_info=True)
 
 
 async def _load_agent_history(
-    db: object,
+    db: Database,
     session_id: str,
 ) -> list[ModelMessage] | None:
     """Load agent message history from the database. Returns None if not found."""
     try:
-        raw = await db.load_agent_history(session_id)  # type: ignore[union-attr]
+        raw = await db.load_agent_history(session_id)
         if raw is None:
             return None
         return _message_list_adapter.validate_json(raw)
     except Exception:
+        logger.debug("Failed to load history", exc_info=True)
         return None
+
+
+def _rebuild_agent(
+    deps: AgentDeps,
+    system: str,
+    extra_tools: list[Tool] | None = None,
+    toolsets: list | None = None,
+) -> Agent[AgentDeps, str]:
+    """Rebuild agent with fresh project context for current deps.cwd."""
+    tools = ALL_TOOLS + (extra_tools or [])
+    return create_agent(system=system, cwd=deps.cwd, tools=tools, toolsets=toolsets)
 
 
 async def agent_repl(
@@ -272,6 +332,7 @@ async def agent_repl(
     permission: PermissionPolicy | None = None,
     resume_session_id: str | None = None,
     system: str = AGENT_SYSTEM,
+    worktree_name: str | None = None,
 ) -> None:
     """Run the agentic REPL with tool use."""
     from prompt_toolkit import PromptSession
@@ -280,12 +341,42 @@ async def agent_repl(
 
     console = Console()
     cwd = Path.cwd()
-    agent = create_agent(system=system, cwd=cwd)
+
+    # Create worktree if requested via CLI flag
+    worktree_info = None
+    if worktree_name is not None:
+        from forge.agent.worktree import create_worktree, is_git_repo
+
+        if not is_git_repo(cwd):
+            console.print("[red]Not a git repository — cannot create worktree.[/red]")
+            return
+        try:
+            worktree_info = create_worktree(cwd, worktree_name or None)
+            cwd = worktree_info.path
+            console.print(
+                f"[green]Worktree created:[/green] {worktree_info.path}\n"
+                f"[green]Branch:[/green] {worktree_info.branch}"
+            )
+        except RuntimeError as e:
+            console.print(f"[red]Worktree error:[/red] {e}")
+            return
+
     deps = AgentDeps(
         cwd=cwd,
         console=console,
         permission=permission or PermissionPolicy.AUTO,
+        worktree=worktree_info,
     )
+
+    # Hook registry — permission enforcement
+    hook_registry = HookRegistry()
+    hook_registry.on(PreToolUse, make_permission_handler(deps))
+    deps.hook_registry = hook_registry
+
+    # Task tracking — always available
+    deps.task_store = TaskStore()
+
+    agent = create_agent(system=system, cwd=cwd)
     message_history: list[ModelMessage] | None = None
 
     # Custom key bindings
@@ -332,34 +423,114 @@ async def agent_repl(
         if loaded:
             message_history = loaded
             console.print(f"[dim]Resumed session with {len(loaded)} messages.[/dim]")
+        # Resume task store
+        try:
+            task_json = await db.load_task_store(session_id)
+            if task_json:
+                deps.task_store = TaskStore.from_json(task_json)
+                open_tasks = deps.task_store.list_open()
+                if open_tasks:
+                    console.print(f"[dim]Restored {len(open_tasks)} open task(s).[/dim]")
+        except Exception:
+            logger.debug("Task store load failed", exc_info=True)
     elif db:
         try:
             await db.create_session(session_id, mode="agent" if system is AGENT_SYSTEM else "chat")
         except Exception:
+            logger.warning("Session creation failed, disabling persistence", exc_info=True)
             db = None
 
+    # Memory integration — wire DB for cross-session memory
+    memory_count = 0
+    if db:
+        deps.memory_db = db
+        deps.memory_project = cwd.name
+        try:
+            memory_count = await db.count_memories(cwd.name)
+        except Exception:
+            logger.debug("Memory count failed", exc_info=True)
+
     # RAG integration — check if cwd is indexed
+    # When in a worktree, use the base repo name for project lookup
+    rag_project_name = worktree_info.base_dir.name if worktree_info else cwd.name
     rag_available = False
     if db:
         try:
-            stats = await db.get_project_stats(cwd.name)
+            stats = await db.get_project_stats(rag_project_name)
             if stats.get("chunk_count", 0) > 0:
                 deps.rag_db = db
-                deps.rag_project = cwd.name
+                deps.rag_project = rag_project_name
                 rag_available = True
         except Exception:
-            pass
+            logger.debug("RAG stats check failed", exc_info=True)
 
-    # Build agent with RAG tool if available
+    # MCP server integration
+    from contextlib import AsyncExitStack
+
+    from forge.agent.mcp_config import load_all_mcp_servers
+
+    mcp_servers = load_all_mcp_servers(cwd)
+    mcp_stack = AsyncExitStack()
+    mcp_started: list = []
+    for server in mcp_servers:
+        try:
+            await mcp_stack.enter_async_context(server)
+            mcp_started.append(server)
+        except Exception:
+            sid = getattr(server, "id", server)
+            logger.warning("Failed to start MCP server: %s", sid, exc_info=True)
+    mcp_servers = mcp_started  # Only pass successfully started servers
+
+    # Build agent with conditional tools
+    extra_tools: list[Tool] = list(TASK_TOOLS)  # Always add task tools
+    if deps.memory_db:
+        extra_tools.extend(MEMORY_TOOLS)
     if rag_available:
         from forge.agent.tools import rag_search
-
-        agent = create_agent(
-            system=system + "\n\nUse rag_search for semantic code search (conceptual queries). "
-            "Use search_code for exact text/regex matches.",
-            cwd=cwd,
-            tools=ALL_TOOLS + [rag_search],
+        extra_tools.append(rag_search)
+        system = (
+            system + "\n\nUse rag_search for semantic code search (conceptual queries). "
+            "Use search_code for exact text/regex matches."
         )
+    if mcp_servers:
+        system += (
+            "\n\n## MCP tools\n"
+            "Some tools come from external MCP servers. They are prefixed with the server name "
+            "(e.g. \"filesystem_read_file\"). Use them like any other tool. "
+            "If an MCP tool fails, report the error to the user."
+        )
+    agent = create_agent(
+        system=system, cwd=cwd, tools=ALL_TOOLS + extra_tools, toolsets=mcp_servers or None,
+    )
+
+    # Inject dynamic task/memory context into system prompt
+    @agent.system_prompt
+    async def _inject_tasks(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps.task_store:
+            return ctx.deps.task_store.to_prompt()
+        return ""
+
+    @agent.system_prompt
+    async def _inject_memories(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps.memory_db and ctx.deps.memory_project:
+            try:
+                from forge.agent.memory import get_startup_memories
+                rows = await get_startup_memories(ctx.deps.memory_db, ctx.deps.memory_project, limit=10)
+                if rows:
+                    lines = ["## Remembered context\n"]
+                    for r in rows:
+                        lines.append(f"- [{r.category}] **{r.subject}**: {r.content}")
+                    return "\n".join(lines)
+            except Exception:
+                logger.debug("Memory injection failed", exc_info=True)
+        return ""
+
+    # Emit SessionStart
+    await hook_registry.emit(SessionStart(
+        session_id=session_id,
+        cwd=str(cwd),
+        permission=deps.permission.value,
+    ))
 
     # Show project context info
     from forge.core.project import INSTRUCTION_FILES, detect_project_type
@@ -369,8 +540,13 @@ async def agent_repl(
     instructions_loaded = any((cwd / f).is_file() for f in INSTRUCTION_FILES)
     instr_info = "[green]instructions loaded[/green]" if instructions_loaded else ""
     rag_info = " | [green]RAG indexed[/green]" if rag_available else ""
+    memory_info = f" | [green]{memory_count} memories[/green]" if memory_count else ""
+    mcp_info = f" | [green]{len(mcp_servers)} MCP server(s)[/green]" if mcp_servers else ""
 
     persist_info = f"\nSession: [dim]{session_id[:8]}…[/dim]" if db else ""
+    worktree_banner = ""
+    if deps.worktree:
+        worktree_banner = f"\nWorktree: [cyan]{deps.worktree.branch}[/cyan] at [dim]{deps.worktree.path}[/dim]"
 
     active_model = deps.model_override or settings.ollama.heavy_model
     console.print(
@@ -379,8 +555,9 @@ async def agent_repl(
             f"Model: [green]{active_model}[/green]\n"
             f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
             f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
-            f"{project_info}{instr_info}{rag_info}\n"
+            f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}\n"
             f"Working directory: [dim]{deps.cwd}[/dim]"
+            f"{worktree_banner}"
             f"{persist_info}\n"
             "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] status, [bold]Ctrl-R[/bold] tools, [bold]Ctrl-D[/bold] exit",
             title="forge agent" if system is AGENT_SYSTEM else "forge",
@@ -389,11 +566,13 @@ async def agent_repl(
     )
 
     # Handle initial prompt if provided
+    turn_counter = 0
     if initial_prompt:
+        turn_counter += 1
         console.print(f"\n[bold]> {initial_prompt}[/bold]")
         try:
             prompt = _maybe_prepend_think(initial_prompt, deps)
-            message_history = await _run_with_status(agent, prompt, deps, message_history)
+            message_history = await _run_with_status(agent, prompt, deps, message_history, turn_number=turn_counter)
             # Incremental save
             if db and message_history:
                 asyncio.create_task(_save_agent_session(db, session_id, message_history))
@@ -405,7 +584,7 @@ async def agent_repl(
                 try:
                     await db.update_session_title(session_id, title)
                 except Exception:
-                    pass
+                    logger.debug("Title update failed", exc_info=True)
         except Exception as e:
             _handle_agent_error(console, e)
 
@@ -414,7 +593,7 @@ async def agent_repl(
     try:
         while True:
             try:
-                user_input = await asyncio.get_event_loop().run_in_executor(
+                user_input = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: session.prompt("\n❯ ")
                 )
             except (EOFError, KeyboardInterrupt):
@@ -438,12 +617,16 @@ async def agent_repl(
                 elif cmd == "/compact":
                     if message_history:
                         before = len(message_history)
-                        console.print("[dim]Compacting with LLM summarization...[/dim]")
+                        _, before_tokens = count_messages_tokens(message_history)
+                        console.print(
+                            f"[dim]Compacting {before} messages (~{before_tokens:,} tokens)...[/dim]"
+                        )
                         message_history = await smart_compact_history(message_history)
                         after = len(message_history)
-                        _, tokens = count_messages_tokens(message_history)
+                        _, after_tokens = count_messages_tokens(message_history)
                         console.print(
-                            f"[dim]Compacted: {before} → {after} messages (~{tokens:,} tokens)[/dim]"
+                            f"[dim]Compacted: {before} → {after} messages "
+                            f"(~{before_tokens:,} → ~{after_tokens:,} tokens)[/dim]"
                         )
                     else:
                         console.print("[dim]No history to compact.[/dim]")
@@ -532,22 +715,112 @@ async def agent_repl(
                     else:
                         console.print("[dim]No active plan.[/dim]")
                     continue
+                elif cmd == "/tasks":
+                    if deps.task_store:
+                        tasks = deps.task_store.list_all()
+                        if tasks:
+                            from rich.table import Table
+                            table = Table(title="Tasks", border_style="dim")
+                            table.add_column("ID", style="cyan")
+                            table.add_column("Status")
+                            table.add_column("Subject")
+                            table.add_column("Blocked By", style="dim")
+                            for t in tasks:
+                                status_style = {
+                                    "pending": "dim",
+                                    "in_progress": "yellow",
+                                    "completed": "green",
+                                }.get(t.status.value, "dim")
+                                blocked = ", ".join(t.blocked_by) if t.blocked_by else ""
+                                table.add_row(t.id, f"[{status_style}]{t.status.value}[/{status_style}]", t.subject, blocked)
+                            console.print(table)
+                        else:
+                            console.print("[dim]No tasks.[/dim]")
+                    else:
+                        console.print("[dim]Task tracking unavailable.[/dim]")
+                    continue
+                elif cmd == "/memory":
+                    parts = user_input.split(maxsplit=2)
+                    if len(parts) >= 3 and parts[1].lower() == "search":
+                        query = parts[2]
+                        if deps.memory_db and deps.memory_project:
+                            try:
+                                from forge.agent.memory import recall_from_db
+                                rows = await recall_from_db(deps.memory_db, deps.memory_project, query)
+                                if rows:
+                                    for r in rows:
+                                        score = f"{r.score:.2f}" if r.score else ""
+                                        console.print(f"  [cyan]#{r.id}[/cyan] [{r.category}] [bold]{r.subject}[/bold]: {r.content} [dim]{score}[/dim]")
+                                else:
+                                    console.print("[dim]No matching memories.[/dim]")
+                            except Exception as e:
+                                console.print(f"[red]Memory search error:[/red] {e}")
+                        else:
+                            console.print("[dim]Memory unavailable (no database).[/dim]")
+                    else:
+                        # Show memory stats
+                        if deps.memory_db and deps.memory_project:
+                            try:
+                                count = await deps.memory_db.count_memories(deps.memory_project)
+                                console.print(f"[dim]{count} memories for project '{deps.memory_project}'[/dim]")
+                                console.print("[dim]Usage: /memory search <query>[/dim]")
+                            except Exception:
+                                console.print("[dim]Memory stats unavailable.[/dim]")
+                        else:
+                            console.print("[dim]Memory unavailable (no database).[/dim]")
+                    continue
+                elif cmd == "/forget":
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[dim]Usage: /forget <memory_id>[/dim]")
+                        continue
+                    try:
+                        mid = int(parts[1].strip())
+                        if deps.memory_db:
+                            deleted = await deps.memory_db.delete_memory(mid)
+                            if deleted:
+                                console.print(f"[dim]Deleted memory #{mid}.[/dim]")
+                            else:
+                                console.print(f"[dim]Memory #{mid} not found.[/dim]")
+                        else:
+                            console.print("[dim]Memory unavailable (no database).[/dim]")
+                    except ValueError:
+                        console.print("[dim]Usage: /forget <memory_id> (numeric ID)[/dim]")
+                    continue
+                elif cmd == "/mcp":
+                    if mcp_servers:
+                        for server in mcp_servers:
+                            sid = getattr(server, "id", None) or "unknown"
+                            stype = type(server).__name__
+                            is_up = getattr(server, "is_running", False)
+                            state = "running" if is_up else "stopped"
+                            console.print(
+                                f"  [cyan]{sid}[/cyan] — {stype} [{state}]"
+                            )
+                    else:
+                        console.print("[dim]No MCP servers configured.[/dim]")
+                    continue
                 elif cmd == "/help":
                     console.print(
                         Panel(
-                            "/clear    — clear conversation history\n"
-                            "/compact  — compact history to fit token budget\n"
-                            "/tokens   — show estimated token count\n"
-                            "/messages — list message history\n"
-                            "/model    — switch model (fast/heavy/<name>)\n"
-                            "/status   — toggle status line (or Ctrl-O)\n"
-                            "/tools    — toggle tool result display (or Ctrl-R)\n"
-                            "/think    — toggle extended thinking on/off\n"
-                            "/plan     — plan before executing (e.g. /plan refactor X)\n"
+                            "/clear       — clear conversation history\n"
+                            "/compact     — compact history to fit token budget\n"
+                            "/tokens      — show estimated token count\n"
+                            "/messages    — list message history\n"
+                            "/model       — switch model (fast/heavy/<name>)\n"
+                            "/status      — toggle status line (or Ctrl-O)\n"
+                            "/tools       — toggle tool result display (or Ctrl-R)\n"
+                            "/think       — toggle extended thinking on/off\n"
+                            "/plan        — plan before executing (e.g. /plan refactor X)\n"
                             "/plan-status — show active plan\n"
-                            "/cwd      — show working directory\n"
-                            "/cd <dir> — change working directory\n"
-                            "/quit     — exit",
+                            "/tasks       — show task list\n"
+                            "/mcp         — list connected MCP servers\n"
+                            "/memory      — show memory stats / search memories\n"
+                            "/forget <id> — delete a memory by ID\n"
+                            "/cwd         — show working directory\n"
+                            "/cd <dir>    — change working directory\n"
+                            "/worktree    — create isolated git worktree\n"
+                            "/quit        — exit",
                             title="commands",
                             border_style="dim",
                         )
@@ -567,9 +840,39 @@ async def agent_repl(
                     new_dir = new_dir.resolve()
                     if new_dir.is_dir():
                         deps.cwd = new_dir
-                        console.print(f"[dim]Working directory: {deps.cwd}[/dim]")
+                        agent = _rebuild_agent(
+                            deps, system, extra_tools,
+                            toolsets=mcp_servers or None,
+                        )
+                        console.print(f"[dim]Working directory: {deps.cwd} (agent reloaded)[/dim]")
                     else:
                         console.print(f"[red]Not a directory: {new_dir}[/red]")
+                    continue
+                elif cmd == "/worktree":
+                    if deps.worktree:
+                        console.print("[yellow]Already in a worktree.[/yellow]")
+                        continue
+                    from forge.agent.worktree import create_worktree, is_git_repo
+
+                    if not is_git_repo(deps.cwd):
+                        console.print("[red]Not a git repository — cannot create worktree.[/red]")
+                        continue
+                    wt_parts = user_input.split(maxsplit=1)
+                    wt_name = wt_parts[1].strip() if len(wt_parts) > 1 else None
+                    try:
+                        wt_info = create_worktree(deps.cwd, wt_name)
+                        deps.worktree = wt_info
+                        deps.cwd = wt_info.path
+                        agent = _rebuild_agent(
+                            deps, system, extra_tools,
+                            toolsets=mcp_servers or None,
+                        )
+                        console.print(
+                            f"[green]Worktree created:[/green] {wt_info.path}\n"
+                            f"[green]Branch:[/green] {wt_info.branch}"
+                        )
+                    except RuntimeError as e:
+                        console.print(f"[red]Worktree error:[/red] {e}")
                     continue
                 else:
                     console.print(f"[dim]Unknown command: {cmd}[/dim]")
@@ -577,7 +880,14 @@ async def agent_repl(
 
             # Auto-compact if history is getting large
             if message_history and len(message_history) > 40:
-                message_history = await smart_compact_history(message_history)
+                _, tokens = count_messages_tokens(message_history)
+                if tokens > DEFAULT_TOKEN_BUDGET * 0.8:
+                    before = len(message_history)
+                    message_history = await smart_compact_history(message_history)
+                    after = len(message_history)
+                    console.print(
+                        f"[dim]Auto-compacted: {before} → {after} messages[/dim]"
+                    )
 
             # Auto-title from first user message
             if db and not title_set:
@@ -587,28 +897,65 @@ async def agent_repl(
                 try:
                     await db.update_session_title(session_id, title)
                 except Exception:
-                    pass
+                    logger.debug("Title update failed", exc_info=True)
                 title_set = True
 
             # Run agent with status tracking
             try:
+                turn_counter += 1
                 prompt = _maybe_prepend_think(user_input, deps)
                 message_history = await _run_with_status(
-                    agent, prompt, deps, message_history
+                    agent, prompt, deps, message_history, turn_number=turn_counter,
                 )
                 # Incremental save after each successful turn
                 if db and message_history:
                     asyncio.create_task(_save_agent_session(db, session_id, message_history))
+                # Persist task store
+                if db and deps.task_store:
+                    try:
+                        await db.save_task_store(session_id, deps.task_store.to_json())
+                    except Exception:
+                        logger.debug("Task store save failed", exc_info=True)
             except KeyboardInterrupt:
                 console.print("\n[dim]Interrupted.[/dim]")
             except Exception as e:
                 _handle_agent_error(console, e)
     finally:
-        # Persist final message history
+        # Emit SessionEnd
+        msg_count = len(message_history) if message_history else 0
+        await hook_registry.emit(SessionEnd(session_id=session_id, message_count=msg_count))
+
+        # Shut down MCP servers
+        await mcp_stack.aclose()
+
+        # Persist final state
         if db and message_history:
             await _save_agent_session(db, session_id, message_history)
+        if db and deps.task_store:
+            try:
+                await db.save_task_store(session_id, deps.task_store.to_json())
+            except Exception:
+                logger.debug("Final task store save failed", exc_info=True)
         if db:
             await db.close()
+
+        # Worktree cleanup
+        if deps.worktree:
+            from forge.agent.worktree import prompt_worktree_cleanup, remove_worktree
+
+            try:
+                keep = await prompt_worktree_cleanup(deps.worktree)
+                if keep:
+                    deps.worktree.unregister_atexit()
+                    console.print(
+                        f"[dim]Keeping worktree at {deps.worktree.path} "
+                        f"(branch: {deps.worktree.branch})[/dim]"
+                    )
+                else:
+                    remove_worktree(deps.worktree)
+                    console.print("[dim]Worktree removed.[/dim]")
+            except Exception:
+                logger.debug("Worktree cleanup failed", exc_info=True)
 
 
 def _maybe_prepend_think(prompt: str, deps: AgentDeps) -> str:
@@ -629,6 +976,7 @@ async def _connect_db():
         await db.connect()
         return db
     except Exception:
+        logger.info("Database unavailable — persistence disabled", exc_info=True)
         return None
 
 

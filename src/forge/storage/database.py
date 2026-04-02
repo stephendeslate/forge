@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+
+
+@dataclass
+class MemoryRow:
+    id: int
+    project: str
+    category: str
+    subject: str
+    content: str
+    created_at: Any = None
+    accessed_at: Any = None
+    score: float = 0.0
 
 
 @dataclass
@@ -26,16 +39,32 @@ class ChunkRow:
 class Database:
     """Manages the asyncpg connection pool and chunk operations."""
 
-    def __init__(self, dsn: str = "postgresql://stephen@/forge?host=/var/run/postgresql&port=5433") -> None:
-        self._dsn = dsn
+    def __init__(self, dsn: str | None = None) -> None:
+        from forge.config import settings
+
+        cfg = settings.db
+        self._dsn = dsn or cfg.dsn
+        self._pool_min = cfg.pool_min
+        self._pool_max = cfg.pool_max
+        self._connect_timeout = cfg.connect_timeout
+        self._retry_attempts = cfg.retry_attempts
+        self._retry_delay = cfg.retry_delay
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
-        self._pool = await asyncpg.create_pool(
-            self._dsn,
-            min_size=2,
-            max_size=10,
-        )
+        for attempt in range(self._retry_attempts):
+            try:
+                self._pool = await asyncpg.create_pool(
+                    self._dsn,
+                    min_size=self._pool_min,
+                    max_size=self._pool_max,
+                    timeout=self._connect_timeout,
+                )
+                return
+            except (OSError, asyncpg.PostgresError) as exc:
+                if attempt == self._retry_attempts - 1:
+                    raise
+                await asyncio.sleep(self._retry_delay * (attempt + 1))
 
     async def close(self) -> None:
         if self._pool:
@@ -64,7 +93,10 @@ class Database:
             project,
             file_path,
         )
-        return int(result.split()[-1])  # "DELETE N"
+        try:
+            return int(result.split()[-1])  # "DELETE N"
+        except (ValueError, IndexError):
+            return 0
 
     async def insert_chunks(self, chunks: list[dict[str, Any]]) -> int:
         """Bulk insert chunks with embeddings."""
@@ -154,14 +186,16 @@ class Database:
         )
 
     async def save_message(self, session_id: str, role: str, content: str, model: str = "") -> None:
-        await self.pool.execute(
-            "INSERT INTO conversations (session_id, role, content, model) VALUES ($1, $2, $3, $4)",
-            session_id, role, content, model or None,
-        )
-        await self.pool.execute(
-            "UPDATE sessions SET updated_at = NOW() WHERE id = $1",
-            session_id,
-        )
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO conversations (session_id, role, content, model) VALUES ($1, $2, $3, $4)",
+                    session_id, role, content, model or None,
+                )
+                await conn.execute(
+                    "UPDATE sessions SET updated_at = NOW() WHERE id = $1",
+                    session_id,
+                )
 
     async def load_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = await self.pool.fetch(
@@ -230,5 +264,167 @@ class Database:
             project,
         )
         return dict(row) if row else {"chunk_count": 0, "file_count": 0, "last_indexed": None}
+
+    # --- Memory persistence ---
+
+    async def save_memory(
+        self,
+        project: str,
+        category: str,
+        subject: str,
+        content: str,
+        embedding: str,
+    ) -> int:
+        """Insert a memory and return its ID."""
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO memories (project, category, subject, content, embedding)
+            VALUES ($1, $2, $3, $4, $5::vector)
+            RETURNING id
+            """,
+            project, category, subject, content, embedding,
+        )
+        return row["id"]
+
+    async def search_memories(
+        self,
+        embedding: str,
+        project: str,
+        *,
+        category: str | None = None,
+        limit: int = 10,
+        min_score: float = 0.3,
+    ) -> list[MemoryRow]:
+        """Search memories by vector similarity."""
+        if category:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, project, category, subject, content, created_at, accessed_at,
+                       1 - (embedding <=> $1::vector) AS score
+                FROM memories
+                WHERE project = $2 AND category = $3
+                  AND 1 - (embedding <=> $1::vector) >= $5
+                ORDER BY embedding <=> $1::vector
+                LIMIT $4
+                """,
+                embedding, project, category, limit, min_score,
+            )
+        else:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, project, category, subject, content, created_at, accessed_at,
+                       1 - (embedding <=> $1::vector) AS score
+                FROM memories
+                WHERE project = $2
+                  AND 1 - (embedding <=> $1::vector) >= $4
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+                """,
+                embedding, project, limit, min_score,
+            )
+
+        # Touch accessed_at for returned memories
+        if rows:
+            ids = [r["id"] for r in rows]
+            await self.pool.execute(
+                "UPDATE memories SET accessed_at = NOW() WHERE id = ANY($1::bigint[])",
+                ids,
+            )
+
+        return [
+            MemoryRow(
+                id=r["id"],
+                project=r["project"],
+                category=r["category"],
+                subject=r["subject"],
+                content=r["content"],
+                created_at=r["created_at"],
+                accessed_at=r["accessed_at"],
+                score=r["score"],
+            )
+            for r in rows
+        ]
+
+    async def list_memories(
+        self,
+        project: str,
+        *,
+        category: str | None = None,
+        limit: int = 50,
+    ) -> list[MemoryRow]:
+        """List memories for a project, newest first."""
+        if category:
+            rows = await self.pool.fetch(
+                "SELECT id, project, category, subject, content, created_at, accessed_at "
+                "FROM memories WHERE project = $1 AND category = $2 "
+                "ORDER BY created_at DESC LIMIT $3",
+                project, category, limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT id, project, category, subject, content, created_at, accessed_at "
+                "FROM memories WHERE project = $1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                project, limit,
+            )
+        return [
+            MemoryRow(
+                id=r["id"], project=r["project"], category=r["category"],
+                subject=r["subject"], content=r["content"],
+                created_at=r["created_at"], accessed_at=r["accessed_at"],
+            )
+            for r in rows
+        ]
+
+    async def delete_memory(self, memory_id: int) -> bool:
+        """Delete a memory by ID. Returns True if deleted."""
+        result = await self.pool.execute(
+            "DELETE FROM memories WHERE id = $1", memory_id,
+        )
+        return result == "DELETE 1"
+
+    async def count_memories(self, project: str) -> int:
+        """Count memories for a project."""
+        row = await self.pool.fetchrow(
+            "SELECT count(*) FROM memories WHERE project = $1", project,
+        )
+        return row["count"]
+
+    async def prune_memories(self, project: str, *, keep: int = 50) -> int:
+        """Delete oldest memories beyond the keep limit. Returns count deleted."""
+        result = await self.pool.execute(
+            """
+            DELETE FROM memories WHERE id IN (
+                SELECT id FROM memories
+                WHERE project = $1
+                ORDER BY accessed_at DESC
+                OFFSET $2
+            )
+            """,
+            project, keep,
+        )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    # --- Task store persistence ---
+
+    async def save_task_store(self, session_id: str, task_json: str) -> None:
+        """Persist task store JSON to conversations table."""
+        await self.pool.execute(
+            "DELETE FROM conversations WHERE session_id = $1 AND role = 'task_store'",
+            session_id,
+        )
+        await self.save_message(session_id, "task_store", task_json, model="")
+
+    async def load_task_store(self, session_id: str) -> str | None:
+        """Load task store JSON. Returns None if not found."""
+        row = await self.pool.fetchrow(
+            "SELECT content FROM conversations WHERE session_id = $1 AND role = 'task_store' "
+            "ORDER BY created_at DESC LIMIT 1",
+            session_id,
+        )
+        return row["content"] if row else None
 
 

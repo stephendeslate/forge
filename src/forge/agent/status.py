@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import os
 import sys
-import termios
 import time
-import tty
+
+try:
+    import fcntl
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -74,8 +80,8 @@ class StatusTracker:
     _key_monitor: asyncio.Task[None] | None = field(default=None, init=False)
     _paused: bool = field(default=False, init=False)
     _active: bool = field(default=False, init=False)
-    _on_toggle: object | None = field(default=None, init=False)  # callback
-    _on_tools_toggle: object | None = field(default=None, init=False)  # callback
+    _on_toggle: Callable[[bool], None] | None = field(default=None, init=False)
+    _on_tools_toggle: Callable[[], None] | None = field(default=None, init=False)
 
     @property
     def tool_calls(self) -> int:
@@ -83,8 +89,8 @@ class StatusTracker:
 
     def start(
         self,
-        on_toggle: object | None = None,
-        on_tools_toggle: object | None = None,
+        on_toggle: Callable[[bool], None] | None = None,
+        on_tools_toggle: Callable[[], None] | None = None,
     ) -> None:
         """Start the status ticker and optional keypress monitor.
 
@@ -189,14 +195,16 @@ class StatusTracker:
 
     async def _key_loop(self) -> None:
         """Monitor stdin for Ctrl-O (0x0f) to toggle visibility."""
-        if not sys.stdin.isatty():
+        if not _HAS_TERMIOS or not sys.stdin.isatty():
             return
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old_settings = None
         try:
-            # Set cbreak mode — passes keys immediately, no echo
+            old_settings = termios.tcgetattr(fd)
             tty.setcbreak(fd)
-            # Make stdin non-blocking so we can poll without freezing
+        except (termios.error, OSError):
+            return  # Can't set up terminal — degrade to no key monitoring
+        try:
             old_flags = _set_nonblocking(fd)
             try:
                 while self._active:
@@ -206,14 +214,15 @@ class StatusTracker:
                         if not self.visible:
                             self._clear_line()
                         if self._on_toggle:
-                            self._on_toggle(self.visible)  # type: ignore[operator]
+                            self._on_toggle(self.visible)
                     elif ch == 0x12:  # Ctrl-R
                         if self._on_tools_toggle:
-                            self._on_tools_toggle()  # type: ignore[operator]
+                            self._on_tools_toggle()
                     await asyncio.sleep(0.05)
             finally:
                 _restore_flags(fd, old_flags)
         except asyncio.CancelledError:
             pass
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if old_settings is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

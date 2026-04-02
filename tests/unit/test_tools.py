@@ -222,30 +222,39 @@ class TestListFiles:
 
 
 class TestModelRetry:
-    """Verify retryable errors raise ModelRetry, non-retryable return strings."""
+    """Verify retryable errors raise ModelRetry."""
 
-    async def test_edit_permission_denied_returns_string(self, ctx, tmp_path):
-        """Permission denials return strings (not retryable)."""
-        from unittest.mock import AsyncMock, patch
+    async def test_edit_nonexistent_raises_retry(self, ctx):
+        """Editing a nonexistent file raises ModelRetry (retryable)."""
+        with pytest.raises(ModelRetry, match="File not found"):
+            await edit_file(ctx, "nonexistent.py", "a", "b")
 
-        with patch("forge.agent.tools.check_permission", new_callable=AsyncMock, return_value=False):
-            result = await edit_file(ctx, "whatever.py", "a", "b")
-        assert result == "Permission denied by user."
+    async def test_permission_blocked_via_hooks(self, ctx, tmp_path):
+        """Permission denial via hooks raises ModelRetry."""
+        from forge.agent.hooks import HookAction, HookRegistry, HookResult, PreToolUse, with_hooks
 
-    async def test_write_permission_denied_returns_string(self, ctx, tmp_path):
-        from unittest.mock import AsyncMock, patch
+        registry = HookRegistry()
 
-        with patch("forge.agent.tools.check_permission", new_callable=AsyncMock, return_value=False):
-            result = await write_file(ctx, "whatever.py", "content")
-        assert result == "Permission denied by user."
+        async def blocker(event):
+            if event.tool_name == "write_file":
+                return HookResult(action=HookAction.BLOCK, message="Permission denied by user.")
+            return HookResult()
+
+        registry.on(PreToolUse, blocker)
+        ctx.deps.hook_registry = registry
+
+        # Call the hooked write_file directly
+        hooked_write = with_hooks(write_file)
+        with pytest.raises(ModelRetry, match="Permission denied"):
+            await hooked_write(ctx, file_path="test.py", content="x")
 
 
 class TestParallelToolMarking:
     """Verify ALL_TOOLS has correct sequential/parallel marking."""
 
-    def test_read_only_tools_are_plain_functions(self):
-        plain = [t for t in ALL_TOOLS if not isinstance(t, Tool)]
-        names = {t.__name__ for t in plain}
+    def test_read_only_tools_are_not_sequential(self):
+        non_seq = [t for t in ALL_TOOLS if isinstance(t, Tool) and not t.sequential]
+        names = {t.name for t in non_seq}
         assert "read_file" in names
         assert "search_code" in names
         assert "list_files" in names

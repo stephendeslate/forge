@@ -35,6 +35,7 @@ class OllamaBackend:
         self._label = label
         self._model_id = f"ollama:{model_name}"
         self._agent = Agent(model=self._model_id)
+        self._agents: dict[str, Agent] = {"": self._agent}
 
     @property
     def name(self) -> str:
@@ -44,21 +45,36 @@ class OllamaBackend:
     def model_id(self) -> str:
         return self._model_name
 
+    def _get_agent(self, system: str) -> Agent:
+        if system not in self._agents:
+            self._agents[system] = Agent(model=self._model_id, instructions=system)
+        return self._agents[system]
+
     async def generate(self, prompt: str, *, system: str = "") -> str:
-        agent = self._agent if not system else Agent(model=self._model_id, instructions=system)
+        agent = self._get_agent(system)
         result = await agent.run(prompt, model_settings=_OLLAMA_TIMEOUT)
         return result.output
 
     async def stream(self, prompt: str, *, system: str = "") -> AsyncIterator[str]:
-        agent = self._agent if not system else Agent(model=self._model_id, instructions=system)
+        agent = self._get_agent(system)
         async with agent.run_stream(prompt, model_settings=_OLLAMA_TIMEOUT) as stream:
             async for chunk in stream.stream_text(delta=True):
                 yield chunk
 
 
+_heavy_backend: OllamaBackend | None = None
+_fast_backend: OllamaBackend | None = None
+
+
 def get_heavy_backend() -> OllamaBackend:
-    return OllamaBackend(settings.ollama.heavy_model, label="gpu-heavy")
+    global _heavy_backend
+    if _heavy_backend is None:
+        _heavy_backend = OllamaBackend(settings.ollama.heavy_model, label="gpu-heavy")
+    return _heavy_backend
 
 
 def get_fast_backend() -> OllamaBackend:
-    return OllamaBackend(settings.ollama.fast_model, label="gpu-fast")
+    global _fast_backend
+    if _fast_backend is None:
+        _fast_backend = OllamaBackend(settings.ollama.fast_model, label="gpu-fast")
+    return _fast_backend

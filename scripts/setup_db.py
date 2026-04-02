@@ -69,6 +69,22 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS idx_conversations_session
     ON conversations (session_id, created_at);
 
+-- Memories table: cross-session persistent context
+CREATE TABLE IF NOT EXISTS memories (
+    id          BIGSERIAL PRIMARY KEY,
+    project     TEXT NOT NULL,
+    category    TEXT NOT NULL CHECK (category IN ('feedback','project','user','reference')),
+    subject     TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    embedding   vector(768),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_project ON memories (project);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
+    ON memories USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
 -- Session metadata (Phase 4)
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,

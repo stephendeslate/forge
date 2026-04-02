@@ -262,8 +262,6 @@ def _chunk_by_lines(content: str, file_path: str) -> list[Chunk]:
         return []
 
     chunks: list[Chunk] = []
-    target_lines = _TARGET_CHUNK_TOKENS  # ~1 token per line is rough, adjust
-    # More accurate: chunk by character count
     target_chars = _TARGET_CHUNK_TOKENS * _CHARS_PER_TOKEN
 
     current_lines: list[str] = []

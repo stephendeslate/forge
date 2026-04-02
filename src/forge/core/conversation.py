@@ -7,8 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from forge.log import get_logger
+
 if TYPE_CHECKING:
     from forge.storage.database import Database
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -46,7 +50,7 @@ class Conversation:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._persist(role, content, model))
             except RuntimeError:
-                pass  # No running loop — skip persistence
+                logger.debug("No event loop for persistence")
 
     async def _persist(self, role: str, content: str, model: str) -> None:
         """Persist message to DB and auto-title on first user message."""
@@ -61,7 +65,7 @@ class Conversation:
                 await self._db.update_session_title(self.session_id, title)
                 self._title_set = True
         except Exception:
-            pass  # DB writes are best-effort
+            logger.debug("DB write failed", exc_info=True)
 
     @classmethod
     async def load_from_db(

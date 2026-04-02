@@ -44,11 +44,18 @@ class TestEstimateTokens:
         assert estimate_tokens("") == 0
 
     def test_short_string(self):
+        # 12 chars / 3.8 chars-per-token (prose) = 3
         assert estimate_tokens("hello world!") == 3
 
-    def test_longer_string(self):
+    def test_longer_prose(self):
         text = "a" * 400
-        assert estimate_tokens(text) == 100
+        # 400 / 3.8 = 105 (prose detection, no newlines/braces)
+        assert estimate_tokens(text) == 105
+
+    def test_longer_code(self):
+        # Code-heavy text: lots of newlines and braces → 3.2 chars/token
+        text = "def foo():\n    x = {}\n" * 20  # 420 chars, code-heavy
+        assert estimate_tokens(text) == int(len(text) / 3.2)
 
 
 class TestMessageText:

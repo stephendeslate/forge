@@ -5,9 +5,9 @@ Fast model drafts and critiques; heavy model refines.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncIterator
 
 from forge.models.base import ModelBackend
 from forge.prompts.refine import CRITIQUE_SYSTEM, DRAFT_SYSTEM, REFINE_SYSTEM
@@ -28,6 +28,9 @@ class PipelineResult:
     stage: PipelineStage = PipelineStage.DONE
 
 
+OnStageCallback = Callable[[PipelineStage, str], Awaitable[None]]
+
+
 class Pipeline:
     """Orchestrates draft → critique → refine across two models."""
 
@@ -44,7 +47,7 @@ class Pipeline:
         prompt: str,
         *,
         context: str = "",
-        on_stage: object = None,
+        on_stage: OnStageCallback | None = None,
     ) -> PipelineResult:
         """Run the full pipeline and return all stages.
 
@@ -62,15 +65,14 @@ class Pipeline:
         # Stage 1: Draft (fast model)
         result.stage = PipelineStage.DRAFT
         if on_stage:
-            await on_stage(PipelineStage.DRAFT, "")  # type: ignore[operator]
+            await on_stage(PipelineStage.DRAFT, "")
         result.draft = await self._drafter.generate(prompt, system=draft_system)
         if on_stage:
-            await on_stage(PipelineStage.DRAFT, result.draft)  # type: ignore[operator]
-
+            await on_stage(PipelineStage.DRAFT, result.draft)
         # Stage 2: Critique (fast model — cheap, evaluates the draft)
         result.stage = PipelineStage.CRITIQUE
         if on_stage:
-            await on_stage(PipelineStage.CRITIQUE, "")  # type: ignore[operator]
+            await on_stage(PipelineStage.CRITIQUE, "")
         critique_prompt = (
             f"## Original Request\n{prompt}\n\n"
             f"## Draft Response\n{result.draft}"
@@ -79,12 +81,11 @@ class Pipeline:
             critique_prompt, system=CRITIQUE_SYSTEM
         )
         if on_stage:
-            await on_stage(PipelineStage.CRITIQUE, result.critique)  # type: ignore[operator]
-
+            await on_stage(PipelineStage.CRITIQUE, result.critique)
         # Stage 3: Refine (heavy model — produces final output)
         result.stage = PipelineStage.REFINE
         if on_stage:
-            await on_stage(PipelineStage.REFINE, "")  # type: ignore[operator]
+            await on_stage(PipelineStage.REFINE, "")
         refine_prompt = (
             f"## Original Request\n{prompt}\n\n"
             f"## Draft Response\n{result.draft}\n\n"
@@ -97,8 +98,7 @@ class Pipeline:
             refine_prompt, system=refine_system
         )
         if on_stage:
-            await on_stage(PipelineStage.REFINE, result.refined)  # type: ignore[operator]
-
+            await on_stage(PipelineStage.REFINE, result.refined)
         result.stage = PipelineStage.DONE
         return result
 

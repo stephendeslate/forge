@@ -1,4 +1,4 @@
-"""Sandboxed code execution with retry loop and self-correction.
+"""Code execution with retry loop and self-correction.
 
 Extracts code from model output, runs it in a subprocess, and feeds errors
 back to the model for correction.
@@ -7,6 +7,7 @@ back to the model for correction.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -44,13 +45,18 @@ async def execute_code(
     timeout: float = 30.0,
     cwd: str | None = None,
 ) -> ExecutionResult:
-    """Execute Python code in a sandboxed subprocess.
+    """Execute Python code in a subprocess.
+
+    WARNING: This runs with full host privileges — no sandboxing is applied.
 
     The code is written to a temp file and run with `python`, capturing
     stdout and stderr. Enforces a timeout.
     """
+    if os.environ.get("FORGE_EXECUTOR_DISABLED"):
+        raise RuntimeError("Code execution is disabled (FORGE_EXECUTOR_DISABLED is set)")
+
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, dir=cwd
+        mode="w", suffix=".py", delete=False,
     ) as f:
         f.write(code)
         script_path = f.name

@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import signal
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from pydantic_ai import ModelRetry, RunContext, Tool
 
 from forge.agent.deps import AgentDeps
-from forge.agent.permissions import check_permission
+from forge.agent.hooks import with_hooks
+from forge.log import get_logger
+
+logger = get_logger(__name__)
 
 
 def _resolve_path(ctx: RunContext[AgentDeps], file_path: str) -> Path:
@@ -70,12 +77,6 @@ async def write_file(
         file_path: Path to the file (relative to cwd or absolute).
         content: The full content to write to the file.
     """
-    if not await check_permission(
-        ctx.deps.console, ctx.deps.permission, "write_file",
-        {"file_path": file_path, "content": content},
-    ):
-        return "Permission denied by user."
-
     path = _resolve_path(ctx, file_path)
 
     try:
@@ -101,12 +102,6 @@ async def edit_file(
         old_text: The exact text to find and replace (must be unique in the file).
         new_text: The replacement text.
     """
-    if not await check_permission(
-        ctx.deps.console, ctx.deps.permission, "edit_file",
-        {"file_path": file_path, "old_text": old_text, "new_text": new_text},
-    ):
-        return "Permission denied by user."
-
     path = _resolve_path(ctx, file_path)
     if not path.exists():
         raise ModelRetry(f"File not found: {path} — check the path and try again")
@@ -147,23 +142,22 @@ async def run_command(
         command: The shell command to run.
         timeout: Maximum seconds to wait (default 30).
     """
-    if not await check_permission(
-        ctx.deps.console, ctx.deps.permission, "run_command",
-        {"command": command},
-    ):
-        return "Permission denied by user."
-
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=ctx.deps.cwd,
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            # Kill entire process group, not just the shell
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
             await proc.communicate()
             return f"Error: Command timed out after {timeout}s"
     except Exception as e:
@@ -302,12 +296,7 @@ async def web_search(
     """
     max_results = min(max_results, 10)
 
-    # SearXNG — local, no API key needed
-    # Falls back to common public instances if local isn't running
-    searxng_urls = [
-        "http://localhost:8888",  # common local SearXNG
-        "http://localhost:8080",  # alternative local port
-    ]
+    from forge.config import settings as _settings
 
     params = {
         "q": query,
@@ -318,7 +307,7 @@ async def web_search(
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        for base_url in searxng_urls:
+        for base_url in _settings.search.searxng_urls:
             try:
                 resp = await client.get(f"{base_url}/search", params=params)
                 if resp.status_code == 200:
@@ -327,25 +316,15 @@ async def web_search(
                     if not results:
                         return f"No results found for: {query}"
 
-                    parts = [f"Search results for: {query}\n"]
-                    for i, r in enumerate(results, 1):
-                        title = r.get("title", "Untitled")
-                        url = r.get("url", "")
-                        snippet = r.get("content", "No description")
-                        # Truncate long snippets
-                        if len(snippet) > 500:
-                            snippet = snippet[:500] + "..."
-                        parts.append(f"{i}. {title}\n   {url}\n   {snippet}\n")
-
-                    parts.append(
-                        "---\n"
-                        "Tip: These snippets may already answer the question. "
-                        "Only fetch a URL if you need details not shown above."
-                    )
-
-                    return "\n".join(parts)
+                    return _format_search_results(query, results)
             except (httpx.ConnectError, httpx.TimeoutException):
                 continue
+
+        # Fallback to DuckDuckGo
+        if _settings.search.ddg_enabled:
+            ddg_result = await _ddg_search(query, max_results)
+            if ddg_result:
+                return ddg_result
 
         return (
             "Error: No search backend available. "
@@ -353,6 +332,101 @@ async def web_search(
             "or configure a search endpoint. "
             "Do NOT retry — inform the user that web search is unavailable."
         )
+
+
+def _format_search_results(query: str, results: list[dict]) -> str:
+    """Format search results into a readable string."""
+    parts = [f"Search results for: {query}\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "Untitled")
+        url = r.get("url", "")
+        snippet = r.get("content", "No description")
+        if len(snippet) > 500:
+            snippet = snippet[:500] + "..."
+        parts.append(f"{i}. {title}\n   {url}\n   {snippet}\n")
+    parts.append(
+        "---\n"
+        "Tip: These snippets may already answer the question. "
+        "Only fetch a URL if you need details not shown above."
+    )
+    return "\n".join(parts)
+
+
+def _parse_ddg_html(html: str) -> list[tuple[str, str, str]]:
+    """Parse DuckDuckGo HTML results into (title, url, snippet) tuples."""
+    results: list[tuple[str, str, str]] = []
+    # Match result links
+    links = re.findall(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]*)"[^>]*>(.*?)</a>',
+        html, re.DOTALL,
+    )
+    snippets = re.findall(
+        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+        html, re.DOTALL,
+    )
+    for i, (raw_url, raw_title) in enumerate(links):
+        # DDG wraps URLs in redirects: /l/?uddg=<actual_url>&...
+        if "uddg=" in raw_url:
+            parsed = parse_qs(urlparse(raw_url).query)
+            actual_urls = parsed.get("uddg", [])
+            url = actual_urls[0] if actual_urls else raw_url
+        else:
+            url = raw_url
+        title = re.sub(r"<[^>]+>", "", raw_title).strip()
+        snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
+        if title and url:
+            results.append((title, url, snippet))
+    return results
+
+
+async def _ddg_search(query: str, max_results: int) -> str | None:
+    """Search DuckDuckGo using the duckduckgo-search library, with HTML fallback."""
+    try:
+        from duckduckgo_search import AsyncDDGS
+
+        async with AsyncDDGS() as ddgs:
+            raw = await ddgs.atext(query, max_results=max_results)
+        if not raw:
+            return None
+        results = [
+            {"title": r.get("title", ""), "url": r.get("href", ""), "content": r.get("body", "")}
+            for r in raw
+        ]
+        return _format_search_results(query, results)
+    except ImportError:
+        pass  # Fall through to HTML scraping
+    except Exception:
+        logger.debug("DDG library search failed", exc_info=True)
+
+    # Fallback: HTML scraping
+    return await _ddg_search_html(query, max_results)
+
+
+async def _ddg_search_html(query: str, max_results: int) -> str | None:
+    """Fallback: scrape DuckDuckGo HTML results."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; Forge/0.1)",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            parsed = _parse_ddg_html(resp.text)
+            if not parsed:
+                return None
+            results = [
+                {"title": t, "url": u, "content": s}
+                for t, u, s in parsed[:max_results]
+            ]
+            return _format_search_results(query, results)
+    except Exception:
+        logger.debug("DDG HTML search failed", exc_info=True)
+        return None
 
 
 def _assess_content_quality(text: str) -> str:
@@ -494,7 +568,7 @@ def _strip_html(html: str, url: str | None = None) -> str:
         if text and len(text) > 50:
             return text
     except Exception:
-        pass
+        logger.debug("trafilatura failed, using fallback", exc_info=True)
 
     # Fallback: aggressive regex stripping
     return _strip_html_fallback(html)
@@ -556,15 +630,211 @@ async def rag_search(
         return f"RAG search error: {e}. Use search_code as fallback."
 
 
-ALL_TOOLS: list[Tool | object] = [
+async def save_memory(
+    ctx: RunContext[AgentDeps],
+    category: str,
+    subject: str,
+    content: str,
+) -> str:
+    """Save a memory for cross-session recall. Use to remember user preferences,
+    project decisions, corrections, or pointers to external resources.
+
+    Args:
+        category: One of 'feedback', 'project', 'user', 'reference'.
+        subject: Brief title for the memory (e.g. "user prefers terse responses").
+        content: Full memory content — be specific so future sessions can use it.
+    """
+    if ctx.deps.memory_db is None or ctx.deps.memory_project is None:
+        return "Memory unavailable — database not connected."
+
+    valid = {"feedback", "project", "user", "reference"}
+    if category not in valid:
+        return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(valid))}"
+
+    try:
+        from forge.agent.memory import save_memory_to_db
+
+        mid = await save_memory_to_db(
+            ctx.deps.memory_db, ctx.deps.memory_project, category, subject, content,
+        )
+        return f"Memory saved (id={mid}, category={category}): {subject}"
+    except Exception as e:
+        return f"Error saving memory: {e}"
+
+
+async def recall_memories(
+    ctx: RunContext[AgentDeps],
+    query: str,
+    category: str = "",
+    limit: int = 5,
+) -> str:
+    """Search saved memories by semantic similarity. Use to recall prior context,
+    user preferences, decisions, or corrections from past sessions.
+
+    Args:
+        query: Natural language query describing what you're looking for.
+        category: Optional filter — 'feedback', 'project', 'user', or 'reference'.
+        limit: Maximum memories to return (default 5).
+    """
+    if ctx.deps.memory_db is None or ctx.deps.memory_project is None:
+        return "Memory unavailable — database not connected."
+
+    try:
+        from forge.agent.memory import recall_from_db
+
+        rows = await recall_from_db(
+            ctx.deps.memory_db,
+            ctx.deps.memory_project,
+            query,
+            category=category or None,
+            limit=limit,
+        )
+        if not rows:
+            return f"No memories found for: {query}"
+
+        parts = [f"Found {len(rows)} memories:\n"]
+        for r in rows:
+            parts.append(
+                f"- [{r.category}] **{r.subject}** (id={r.id}, score={r.score:.2f})\n"
+                f"  {r.content}"
+            )
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Error recalling memories: {e}"
+
+
+async def task_create(
+    ctx: RunContext[AgentDeps],
+    subject: str,
+    description: str,
+    active_form: str = "",
+) -> str:
+    """Create a task to track work progress. Use when work involves 3+ steps.
+
+    Args:
+        subject: Brief imperative title (e.g. "Fix auth bug in login flow").
+        description: Detailed description of what needs to be done.
+        active_form: Present continuous form for status display (e.g. "Fixing auth bug").
+    """
+    store = ctx.deps.task_store
+    if store is None:
+        return "Task tracking unavailable."
+
+    task = store.create(subject, description, active_form=active_form or None)
+    return f"Created task {task.id}: {task.subject}"
+
+
+async def task_update(
+    ctx: RunContext[AgentDeps],
+    task_id: str,
+    status: str = "",
+    subject: str = "",
+    description: str = "",
+    add_blocked_by: str = "",
+) -> str:
+    """Update a task's status or details.
+
+    Args:
+        task_id: The task ID (e.g. "t1").
+        status: New status — 'pending', 'in_progress', 'completed', or 'deleted'.
+        subject: New subject (optional).
+        description: New description (optional).
+        add_blocked_by: Comma-separated task IDs that block this task (e.g. "t1,t2").
+    """
+    store = ctx.deps.task_store
+    if store is None:
+        return "Task tracking unavailable."
+
+    kwargs: dict = {}
+    if status:
+        from forge.agent.task_store import TaskStatus
+        try:
+            kwargs["status"] = TaskStatus(status)
+        except ValueError:
+            return f"Invalid status '{status}'. Use: pending, in_progress, completed, deleted"
+    if subject:
+        kwargs["subject"] = subject
+    if description:
+        kwargs["description"] = description
+    if add_blocked_by:
+        kwargs["add_blocked_by"] = [s.strip() for s in add_blocked_by.split(",")]
+
+    task = store.update(task_id, **kwargs)
+    if task is None:
+        return f"Task {task_id} not found."
+    return f"Updated task {task.id}: status={task.status.value}, subject={task.subject}"
+
+
+async def task_list(ctx: RunContext[AgentDeps]) -> str:
+    """List all tasks with their current status."""
+    store = ctx.deps.task_store
+    if store is None:
+        return "Task tracking unavailable."
+
+    tasks = store.list_all()
+    if not tasks:
+        return "No tasks."
+
+    lines = ["Tasks:\n"]
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "◉", "completed": "✓", "deleted": "✗"}
+        marker = icon.get(t.status.value, "?")
+        blocked = f" [blocked by {','.join(t.blocked_by)}]" if t.blocked_by else ""
+        lines.append(f"  {marker} {t.id}: {t.subject} ({t.status.value}){blocked}")
+    return "\n".join(lines)
+
+
+async def task_get(ctx: RunContext[AgentDeps], task_id: str) -> str:
+    """Get full details of a task.
+
+    Args:
+        task_id: The task ID (e.g. "t1").
+    """
+    store = ctx.deps.task_store
+    if store is None:
+        return "Task tracking unavailable."
+
+    task = store.get(task_id)
+    if task is None:
+        return f"Task {task_id} not found."
+
+    parts = [
+        f"Task {task.id}: {task.subject}",
+        f"Status: {task.status.value}",
+        f"Description: {task.description}",
+    ]
+    if task.active_form:
+        parts.append(f"Active form: {task.active_form}")
+    if task.blocked_by:
+        parts.append(f"Blocked by: {', '.join(task.blocked_by)}")
+    if task.blocks:
+        parts.append(f"Blocks: {', '.join(task.blocks)}")
+    return "\n".join(parts)
+
+
+ALL_TOOLS: list[Tool] = [
     # Read-only tools — safe for parallel execution
-    read_file,
-    search_code,
-    list_files,
-    web_search,
-    web_fetch,
+    Tool(with_hooks(read_file)),
+    Tool(with_hooks(search_code)),
+    Tool(with_hooks(list_files)),
+    Tool(with_hooks(web_search)),
+    Tool(with_hooks(web_fetch)),
     # Write/execute tools — sequential to prevent races
-    Tool(write_file, sequential=True),
-    Tool(edit_file, sequential=True),
-    Tool(run_command, sequential=True),
+    Tool(with_hooks(write_file), sequential=True),
+    Tool(with_hooks(edit_file), sequential=True),
+    Tool(with_hooks(run_command), sequential=True),
+]
+
+# Memory tools — added conditionally when DB is available
+MEMORY_TOOLS: list[Tool] = [
+    Tool(with_hooks(save_memory), sequential=True),
+    Tool(with_hooks(recall_memories)),
+]
+
+# Task tools — always available
+TASK_TOOLS: list[Tool] = [
+    Tool(with_hooks(task_create), sequential=True),
+    Tool(with_hooks(task_update), sequential=True),
+    Tool(with_hooks(task_list)),
+    Tool(with_hooks(task_get)),
 ]

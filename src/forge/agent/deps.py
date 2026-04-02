@@ -11,8 +11,12 @@ from rich.console import Console
 from forge.agent.permissions import PermissionPolicy
 
 if TYPE_CHECKING:
+    from forge.agent.hooks import HookRegistry
     from forge.agent.status import StatusTracker
+    from forge.agent.task_store import TaskStore
     from forge.agent.turn_buffer import TurnBuffer
+    from forge.agent.worktree import WorktreeInfo
+    from forge.storage.database import Database
 
 
 @dataclass
@@ -31,7 +35,16 @@ class AgentDeps:
     # Model switching
     model_override: str | None = None
     # RAG integration
-    rag_db: object | None = None  # Database instance when RAG is available
+    rag_db: Database | None = None
     rag_project: str | None = None
     # Plan tracking
     active_plan: str | None = None
+    # Worktree isolation
+    worktree: WorktreeInfo | None = None
+    # Hooks
+    hook_registry: HookRegistry | None = None
+    # Memory
+    memory_db: Database | None = None
+    memory_project: str | None = None
+    # Task tracking
+    task_store: TaskStore | None = None

@@ -44,7 +44,7 @@ async def _prompt_user(console: Console, tool_name: str, summary: str) -> bool:
     style = "yellow" if tool_name in {"write_file", "edit_file"} else "red"
     console.print(f"\n[{style}]Allow {tool_name}?[/{style}] {summary}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(
             None, lambda: input("[y]es / [n]o > ").strip().lower()
