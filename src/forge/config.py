@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 _DEFAULT_USER = getpass.getuser()
 
@@ -31,7 +31,7 @@ class NPUSettings(BaseSettings):
 
     enabled: bool = False
     base_url: str = "http://127.0.0.1:52625/v1"
-    model: str = "llama-3.2-3b"
+    model: str = "llama3.2:3b"
     timeout: int = 60
 
 
@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):
+        toml_source = TomlConfigSettingsSource(settings_cls, toml_file=str(_CONFIG_FILE) if _CONFIG_FILE.exists() else None)
+        return (init_settings, env_settings, toml_source, file_secret_settings)
 
     @classmethod
     def ensure_config_dir(cls) -> Path:
