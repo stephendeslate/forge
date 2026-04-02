@@ -51,6 +51,10 @@ forge serve --cwd /path         # MCP server rooted at specific directory
 /memory       — show memory stats or search memories
 /forget <id>  — delete a memory by numeric ID
 /mcp          — list connected MCP servers
+/checkpoint   — save conversation checkpoint [name]
+/restore <n>  — restore to named checkpoint
+/checkpoints  — list saved checkpoints
+/index        — index/reindex project for RAG search
 /worktree [n] — create isolated git worktree (optional name)
 /cd <dir>     — change working directory (reloads agent context)
 /cwd          — show current working directory
@@ -140,3 +144,4 @@ uv run forge agent --worktree                  # Agent in isolated worktree
 - [x] Phase 7A: Hooks, task tracking, cross-session memory — event system, in-memory tasks with dependencies, pgvector semantic memory
 - [x] Phase 7B: Worktrees + improved compaction — git worktree isolation, 3-tier context compaction with domain-aware summarization
 - [x] Phase 7C: MCP integration — discover and connect external MCP tool servers via pydantic-ai
+- [x] Phase 8: Conversation checkpoints + RAG auto-index — named save/restore within sessions, staleness detection, post-write reindex hooks, /index command

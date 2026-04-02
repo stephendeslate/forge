@@ -25,6 +25,7 @@ from forge.agent.context import (
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import (
     HookRegistry,
+    PostToolUse,
     PreToolUse,
     SessionEnd,
     SessionStart,
@@ -471,6 +472,17 @@ async def agent_repl(
         except Exception:
             logger.debug("RAG stats check failed", exc_info=True)
 
+    # Auto-reindex stale files in background
+    if rag_available and db:
+        try:
+            from forge.rag.indexer import find_stale_files, reindex_files
+            stale = await find_stale_files(cwd, db, rag_project_name)
+            if stale:
+                console.print(f"[dim]Auto-reindexing {len(stale)} changed file(s)...[/dim]")
+                asyncio.create_task(reindex_files(stale, cwd, db, rag_project_name))
+        except Exception:
+            logger.debug("Auto-reindex check failed", exc_info=True)
+
     # MCP server integration
     from contextlib import AsyncExitStack
 
@@ -532,6 +544,31 @@ async def agent_repl(
             except Exception:
                 logger.debug("Memory injection failed", exc_info=True)
         return ""
+
+    # Post-write reindex hooks — collect written files, batch reindex at turn end
+    _pending_reindex: set[Path] = set()
+
+    if rag_available and db:
+        async def _reindex_on_write(event: PostToolUse) -> None:
+            if event.tool_name in ("write_file", "edit_file"):
+                file_path = event.args.get("file_path")
+                if file_path:
+                    p = Path(file_path)
+                    if not p.is_absolute():
+                        p = (deps.cwd / p).resolve()
+                    else:
+                        p = p.resolve()
+                    _pending_reindex.add(p)
+
+        async def _flush_reindex(event: TurnEnd) -> None:
+            if _pending_reindex and db:
+                from forge.rag.indexer import reindex_files
+                files = list(_pending_reindex)
+                _pending_reindex.clear()
+                asyncio.create_task(reindex_files(files, deps.cwd, db, rag_project_name))
+
+        hook_registry.on(PostToolUse, _reindex_on_write)
+        hook_registry.on(TurnEnd, _flush_reindex)
 
     # Emit SessionStart
     await hook_registry.emit(SessionStart(
@@ -811,24 +848,28 @@ async def agent_repl(
                 elif cmd == "/help":
                     console.print(
                         Panel(
-                            "/clear       — clear conversation history\n"
-                            "/compact     — compact history to fit token budget\n"
-                            "/tokens      — show estimated token count\n"
-                            "/messages    — list message history\n"
-                            "/model       — switch model (fast/heavy/<name>)\n"
-                            "/status      — toggle status line (or Ctrl-O)\n"
-                            "/tools       — toggle tool result display (or Ctrl-R)\n"
-                            "/think       — toggle extended thinking on/off\n"
-                            "/plan        — plan before executing (e.g. /plan refactor X)\n"
-                            "/plan-status — show active plan\n"
-                            "/tasks       — show task list\n"
-                            "/mcp         — list connected MCP servers\n"
-                            "/memory      — show memory stats / search memories\n"
-                            "/forget <id> — delete a memory by ID\n"
-                            "/cwd         — show working directory\n"
-                            "/cd <dir>    — change working directory\n"
-                            "/worktree    — create isolated git worktree\n"
-                            "/quit        — exit",
+                            "/clear         — clear conversation history\n"
+                            "/compact       — compact history to fit token budget\n"
+                            "/tokens        — show estimated token count\n"
+                            "/messages      — list message history\n"
+                            "/model         — switch model (fast/heavy/<name>)\n"
+                            "/status        — toggle status line (or Ctrl-O)\n"
+                            "/tools         — toggle tool result display (or Ctrl-R)\n"
+                            "/think         — toggle extended thinking on/off\n"
+                            "/plan          — plan before executing (e.g. /plan refactor X)\n"
+                            "/plan-status   — show active plan\n"
+                            "/tasks         — show task list\n"
+                            "/mcp           — list connected MCP servers\n"
+                            "/memory        — show memory stats / search memories\n"
+                            "/forget <id>   — delete a memory by ID\n"
+                            "/checkpoint    — save conversation checkpoint [name]\n"
+                            "/restore <n>   — restore to named checkpoint\n"
+                            "/checkpoints   — list saved checkpoints\n"
+                            "/index         — index/reindex project for RAG\n"
+                            "/cwd           — show working directory\n"
+                            "/cd <dir>      — change working directory\n"
+                            "/worktree      — create isolated git worktree\n"
+                            "/quit          — exit",
                             title="commands",
                             border_style="dim",
                         )
@@ -881,6 +922,100 @@ async def agent_repl(
                         )
                     except RuntimeError as e:
                         console.print(f"[red]Worktree error:[/red] {e}")
+                    continue
+                elif cmd == "/checkpoint":
+                    if not db:
+                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
+                        continue
+                    parts = user_input.split(maxsplit=1)
+                    cp_name = parts[1].strip() if len(parts) > 1 else f"cp-{turn_counter}"
+                    if not message_history:
+                        console.print("[dim]No history to checkpoint.[/dim]")
+                        continue
+                    try:
+                        history_json = _message_list_adapter.dump_json(message_history).decode()
+                        task_json = deps.task_store.to_json() if deps.task_store else None
+                        await db.save_checkpoint(
+                            session_id, cp_name, history_json, task_json, len(message_history),
+                        )
+                        console.print(
+                            f"[green]Checkpoint '{cp_name}' saved ({len(message_history)} messages).[/green]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]Checkpoint save failed:[/red] {e}")
+                    continue
+                elif cmd == "/restore":
+                    if not db:
+                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
+                        continue
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[dim]Usage: /restore <name>[/dim]")
+                        continue
+                    cp_name = parts[1].strip()
+                    try:
+                        cp = await db.load_checkpoint(session_id, cp_name)
+                        if not cp:
+                            console.print(f"[yellow]Checkpoint '{cp_name}' not found.[/yellow]")
+                            continue
+                        message_history = _message_list_adapter.validate_json(cp["agent_history"])
+                        if cp.get("task_store"):
+                            deps.task_store = TaskStore.from_json(cp["task_store"])
+                        console.print(
+                            f"[green]Restored to checkpoint '{cp_name}' ({cp['message_count']} messages).[/green]"
+                        )
+                    except Exception as e:
+                        console.print(f"[red]Restore failed:[/red] {e}")
+                    continue
+                elif cmd == "/checkpoints":
+                    if not db:
+                        console.print("[yellow]Checkpoints require persistence (database).[/yellow]")
+                        continue
+                    try:
+                        cps = await db.list_checkpoints(session_id)
+                        if cps:
+                            from rich.table import Table
+                            table = Table(title="Checkpoints", border_style="dim")
+                            table.add_column("Name", style="cyan")
+                            table.add_column("Messages", justify="right")
+                            table.add_column("Created", style="dim")
+                            for cp in cps:
+                                table.add_row(
+                                    cp["name"],
+                                    str(cp["message_count"]),
+                                    str(cp["created_at"].strftime("%Y-%m-%d %H:%M")),
+                                )
+                            console.print(table)
+                        else:
+                            console.print("[dim]No checkpoints. Use /checkpoint [name] to save one.[/dim]")
+                    except Exception as e:
+                        console.print(f"[red]Checkpoint list failed:[/red] {e}")
+                    continue
+                elif cmd == "/index":
+                    if not db:
+                        console.print("[yellow]Indexing requires a database.[/yellow]")
+                        continue
+                    try:
+                        from forge.rag.indexer import index_directory
+                        stats = await index_directory(deps.cwd, db, project=rag_project_name)
+                        console.print(
+                            f"[green]Indexed:[/green] {stats['files_indexed']} files, "
+                            f"{stats['chunks_stored']} chunks "
+                            f"({stats['files_skipped']} skipped)"
+                        )
+                        if not rag_available:
+                            from forge.agent.tools import rag_search
+                            deps.rag_db = db
+                            deps.rag_project = rag_project_name
+                            rag_available = True
+                            extra_tools.append(rag_search)
+                            agent = _rebuild_agent(
+                                deps, system, extra_tools,
+                                toolsets=mcp_servers or None,
+                            )
+                            console.print("[green]RAG search enabled.[/green]")
+                    except Exception as e:
+                        console.print(f"[red]Indexing failed:[/red] {e}")
                     continue
                 else:
                     console.print(f"[dim]Unknown command: {cmd}[/dim]")

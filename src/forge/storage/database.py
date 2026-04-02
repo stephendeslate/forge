@@ -427,4 +427,54 @@ class Database:
         )
         return row["content"] if row else None
 
+    # --- Checkpoint persistence ---
+
+    async def save_checkpoint(
+        self,
+        session_id: str,
+        name: str,
+        agent_history: str,
+        task_store: str | None,
+        message_count: int,
+    ) -> None:
+        """UPSERT a named checkpoint for a session."""
+        await self.pool.execute(
+            """
+            INSERT INTO checkpoints (session_id, name, agent_history, task_store, message_count)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (session_id, name) DO UPDATE
+            SET agent_history = EXCLUDED.agent_history,
+                task_store = EXCLUDED.task_store,
+                message_count = EXCLUDED.message_count,
+                created_at = NOW()
+            """,
+            session_id, name, agent_history, task_store, message_count,
+        )
+
+    async def load_checkpoint(self, session_id: str, name: str) -> dict[str, Any] | None:
+        """Load a named checkpoint. Returns dict with agent_history, task_store, message_count."""
+        row = await self.pool.fetchrow(
+            "SELECT agent_history, task_store, message_count, created_at "
+            "FROM checkpoints WHERE session_id = $1 AND name = $2",
+            session_id, name,
+        )
+        return dict(row) if row else None
+
+    async def list_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
+        """List checkpoints for a session, newest first."""
+        rows = await self.pool.fetch(
+            "SELECT name, message_count, created_at "
+            "FROM checkpoints WHERE session_id = $1 ORDER BY created_at DESC",
+            session_id,
+        )
+        return [dict(r) for r in rows]
+
+    async def delete_checkpoint(self, session_id: str, name: str) -> bool:
+        """Delete a checkpoint by name. Returns True if deleted."""
+        result = await self.pool.execute(
+            "DELETE FROM checkpoints WHERE session_id = $1 AND name = $2",
+            session_id, name,
+        )
+        return result == "DELETE 1"
+
 

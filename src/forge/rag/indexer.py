@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 from rich.console import Console
@@ -13,6 +14,7 @@ from forge.rag.chunker import Chunk, chunk_file, supported_extensions
 from forge.storage.database import Database
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 # File patterns to skip
 _SKIP_DIRS = {
@@ -172,3 +174,89 @@ async def _flush_chunks(
         })
 
     return await db.insert_chunks(records)
+
+
+async def find_stale_files(
+    root: Path,
+    db: Database,
+    project: str,
+) -> list[Path]:
+    """Find files modified since the last index run.
+
+    Returns empty list if the project has never been indexed (no auto-index for first run).
+    """
+    root = Path(root).resolve()
+    stats = await db.get_project_stats(project)
+    last_indexed = stats.get("last_indexed")
+    if last_indexed is None:
+        return []
+
+    threshold = last_indexed.timestamp()
+    stale: list[Path] = []
+    for f in _walk_files(root):
+        try:
+            if f.stat().st_mtime > threshold:
+                stale.append(f)
+        except OSError:
+            continue
+    return stale
+
+
+async def reindex_files(
+    files: list[Path],
+    root: Path,
+    db: Database,
+    project: str,
+) -> dict[str, int]:
+    """Reindex specific files silently (no progress bars). For background use."""
+    root = Path(root).resolve()
+    stats = {"files_indexed": 0, "files_skipped": 0, "chunks_stored": 0}
+
+    pending_chunks: list[tuple[Chunk, str, str]] = []
+
+    for file_path in files:
+        rel_path = str(file_path.relative_to(root))
+
+        try:
+            content = file_path.read_text(errors="replace")
+        except (OSError, UnicodeDecodeError):
+            stats["files_skipped"] += 1
+            continue
+
+        fhash = _file_hash(content)
+
+        # Skip unchanged files
+        try:
+            stored_hash = await db.get_file_hash(project, rel_path)
+            if stored_hash == fhash:
+                stats["files_skipped"] += 1
+                continue
+        except Exception:
+            pass
+
+        # Delete old chunks for this file
+        await db.delete_file_chunks(project, rel_path)
+
+        chunks = chunk_file(str(file_path), content)
+        if not chunks:
+            stats["files_skipped"] += 1
+            continue
+
+        for chunk in chunks:
+            pending_chunks.append((chunk, fhash, rel_path))
+
+        stats["files_indexed"] += 1
+
+        # Flush batch when large enough
+        if len(pending_chunks) >= 50:
+            stored = await _flush_chunks(pending_chunks, project, db)
+            stats["chunks_stored"] += stored
+            pending_chunks = []
+
+    # Flush remaining
+    if pending_chunks:
+        stored = await _flush_chunks(pending_chunks, project, db)
+        stats["chunks_stored"] += stored
+
+    logger.debug("Reindexed %d files (%d chunks)", stats["files_indexed"], stats["chunks_stored"])
+    return stats

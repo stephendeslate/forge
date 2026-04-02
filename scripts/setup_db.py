@@ -94,6 +94,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Conversation checkpoints (Phase 8)
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id              BIGSERIAL PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    agent_history   TEXT NOT NULL,
+    task_store      TEXT,
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(session_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+    ON checkpoints (session_id, created_at);
 """
 
 DROP_SQL = """
