@@ -38,9 +38,11 @@ class Pipeline:
         self,
         drafter: ModelBackend,
         refiner: ModelBackend,
+        critic: ModelBackend | None = None,
     ) -> None:
         self._drafter = drafter  # fast model
         self._refiner = refiner  # heavy model
+        self._critic = critic or drafter  # critique model (defaults to drafter for backward compat)
 
     async def run(
         self,
@@ -69,7 +71,7 @@ class Pipeline:
         result.draft = await self._drafter.generate(prompt, system=draft_system)
         if on_stage:
             await on_stage(PipelineStage.DRAFT, result.draft)
-        # Stage 2: Critique (fast model — cheap, evaluates the draft)
+        # Stage 2: Critique (configurable — defaults to drafter, can use heavy/Gemini)
         result.stage = PipelineStage.CRITIQUE
         if on_stage:
             await on_stage(PipelineStage.CRITIQUE, "")
@@ -77,7 +79,7 @@ class Pipeline:
             f"## Original Request\n{prompt}\n\n"
             f"## Draft Response\n{result.draft}"
         )
-        result.critique = await self._drafter.generate(
+        result.critique = await self._critic.generate(
             critique_prompt, system=CRITIQUE_SYSTEM
         )
         if on_stage:
@@ -122,12 +124,12 @@ class Pipeline:
         # Draft (fast)
         draft = await self._drafter.generate(prompt, system=draft_system)
 
-        # Critique (fast)
+        # Critique (configurable)
         critique_prompt = (
             f"## Original Request\n{prompt}\n\n"
             f"## Draft Response\n{draft}"
         )
-        critique = await self._drafter.generate(
+        critique = await self._critic.generate(
             critique_prompt, system=CRITIQUE_SYSTEM
         )
 

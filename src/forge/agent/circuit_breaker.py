@@ -35,6 +35,7 @@ class _State:
     tripped: bool = False
     trip_reason: str = ""
     post_warning_count: int = 0
+    loop_start_index: int | None = None  # message index when looping was first detected
 
 
 class CircuitBreakerTripped(Exception):
@@ -66,7 +67,7 @@ class ToolCallTracker:
         identical_threshold: int = 3,
         failure_threshold: int = 3,
         oscillation_window: int = 3,
-        post_warning_grace: int = 2,
+        post_warning_grace: int = 1,
         history_size: int = 20,
     ) -> None:
         self._history: deque[ToolCallRecord] = deque(maxlen=history_size)
@@ -75,6 +76,7 @@ class ToolCallTracker:
         self._failure_threshold = failure_threshold
         self._oscillation_window = oscillation_window
         self._post_warning_grace = post_warning_grace
+        self._current_message_count: int = 0
 
     def record(self, tool_name: str, args: dict, succeeded: bool) -> None:
         """Record a tool call."""
@@ -106,6 +108,8 @@ class ToolCallTracker:
             self._state.warning_issued = True
             self._state.trip_reason = reason
             self._state.post_warning_count = 0
+            # Record where in the message history looping started
+            self._state.loop_start_index = self._current_message_count
 
         return reason
 
@@ -124,6 +128,15 @@ class ToolCallTracker:
     @property
     def trip_reason(self) -> str:
         return self._state.trip_reason
+
+    @property
+    def loop_start_index(self) -> int | None:
+        """Message index when the loop pattern was first detected."""
+        return self._state.loop_start_index
+
+    def set_message_count(self, count: int) -> None:
+        """Update the current message count (called from agent loop before each turn)."""
+        self._current_message_count = count
 
     def _check_identical_repeat(self) -> str | None:
         """Same (name, args_hash) N times in a row."""
@@ -203,33 +216,42 @@ class ToolCallTracker:
 
 
 def _build_diagnostic(reason: str, deps: AgentDeps) -> str:
-    """Build a context-aware diagnostic message for circuit breaker warnings."""
-    parts = [f"You appear stuck in a loop ({reason})."]
+    """Build a context-aware diagnostic message for circuit breaker warnings.
+
+    Includes concrete action suggestions and the specific tool/args to help the model
+    understand exactly what it's repeating. This is the last message before trip.
+    """
+    parts = [f"⚠ LOOP DETECTED: {reason}. This tool call was BLOCKED (not executed)."]
 
     # Check if test failures exist — that's likely the root cause
     if deps.test_results:
         parts.append(
-            "Tests are failing. Read the error output in the system prompt and fix the root cause "
-            "instead of retrying the same approach."
+            "ACTION: Tests are failing — read the test error output in the system prompt "
+            "and fix the ROOT CAUSE instead of retrying the same approach."
         )
     elif "identical" in reason:
-        # Extract tool name from reason like "called X with identical arguments"
         parts.append(
-            "You're repeating the same tool call. The approach isn't working — "
-            "try reading the file first to understand the current state, or use a different strategy."
+            "ACTION: Stop repeating this call. Instead: "
+            "(1) Read the target file to check its current state, "
+            "(2) use search_code to find related patterns, or "
+            "(3) try a completely different strategy."
         )
     elif "oscillating" in reason:
         parts.append(
-            "You're alternating between two approaches. Step back and reason about "
-            "what's actually wrong before trying again."
+            "ACTION: You're going back and forth between two tools. Stop and reason: "
+            "use <analysis> tags to think about what's actually wrong, "
+            "then take ONE decisive action."
         )
     elif "failed" in reason:
         parts.append(
-            "The same tool keeps failing. Read the error messages carefully and "
-            "try a fundamentally different approach."
+            "ACTION: This tool keeps failing. Read the error messages carefully. "
+            "Common fixes: check file paths exist, verify command syntax, "
+            "or try a fundamentally different approach."
         )
     else:
-        parts.append("Try a completely different approach, or ask the user for guidance.")
+        parts.append("ACTION: Try a completely different approach, or ask the user for guidance.")
+
+    parts.append("NEXT ATTEMPT WILL TRIP THE CIRCUIT BREAKER AND END THIS TURN.")
 
     return " ".join(parts)
 

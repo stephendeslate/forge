@@ -37,6 +37,7 @@ from forge.log import get_logger
 from forge.models.ollama import _ensure_ollama_env, _model_settings
 
 if TYPE_CHECKING:
+    from forge.agent.circuit_breaker import ToolCallTracker
     from forge.storage.database import Database
 
 logger = get_logger(__name__)
@@ -668,6 +669,10 @@ async def agent_repl(
                 turn_counter += 1
                 turn_counter_ref[0] = turn_counter
 
+                # Update circuit breaker with current message count for fork tracking
+                if deps.circuit_breaker and message_history:
+                    deps.circuit_breaker.set_message_count(len(message_history))
+
                 # Parse multimodal input (@image.png references)
                 from forge.agent.multimodal import parse_multimodal_input
                 parsed = parse_multimodal_input(user_input, deps.cwd)
@@ -705,10 +710,15 @@ async def agent_repl(
                         user_input, deps, console, turn_counter,
                     )
                     if recovery_result is not None:
-                        # Append recovery exchange to main history
                         if message_history is None:
                             message_history = recovery_result
                         else:
+                            # Fork: remove toxic loop tail, then append recovery
+                            message_history = _fork_history(
+                                message_history,
+                                deps.circuit_breaker,
+                                settings.agent.cb_identical,
+                            )
                             message_history.extend(recovery_result)
     finally:
         await cleanup(
@@ -745,6 +755,58 @@ async def _connect_db():
     except Exception:
         logger.info("Database unavailable — persistence disabled", exc_info=True)
         return None
+
+
+def _fork_history(
+    message_history: list[ModelMessage],
+    circuit_breaker: ToolCallTracker | None,
+    identical_threshold: int = 3,
+) -> list[ModelMessage]:
+    """Truncate toxic loop tail from history before appending recovery.
+
+    Removes the failed turns that led to the circuit breaker trip, preserving
+    all successful earlier turns. Appends a synthetic bridge message so the
+    local model understands the discontinuity.
+    """
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    if not message_history:
+        return []
+
+    # Determine truncation point
+    loop_start = None
+    if circuit_breaker and circuit_breaker.loop_start_index is not None:
+        loop_start = circuit_breaker.loop_start_index
+
+    if loop_start is not None and 0 < loop_start < len(message_history):
+        truncated = message_history[:loop_start]
+    else:
+        # Fallback: remove last 2 * identical_threshold messages (conservative)
+        remove_count = 2 * identical_threshold
+        if remove_count < len(message_history):
+            truncated = message_history[:-remove_count]
+        else:
+            # History too short to truncate meaningfully — keep first message
+            truncated = message_history[:1] if message_history else []
+
+    # Append synthetic bridge message
+    bridge = ModelRequest(parts=[
+        UserPromptPart(
+            content=(
+                "[System note: The previous approach got stuck in a loop and was interrupted. "
+                "A cloud model was consulted to resolve the issue. "
+                "The following messages contain the cloud model's solution.]"
+            ),
+        ),
+    ])
+    truncated.append(bridge)
+
+    logger.info(
+        "Forked history: %d → %d messages (removed %d toxic tail messages)",
+        len(message_history), len(truncated),
+        len(message_history) - len(truncated) + 1,  # +1 for bridge
+    )
+    return truncated
 
 
 async def _cloud_recovery(

@@ -432,6 +432,20 @@ async def _detect_test_command(deps: AgentDeps) -> str | None:
     deps._test_command_searched = True
     cwd = deps.cwd
 
+    # Check for .forge/test-config.json (same schema as .claude/test-config.json)
+    for config_name in (".forge/test-config.json", ".claude/test-config.json"):
+        config_path = cwd / config_name
+        if config_path.is_file():
+            try:
+                import json
+
+                data = json.loads(config_path.read_text())
+                if data.get("testCommand"):
+                    deps.test_command = data["testCommand"]
+                    return deps.test_command
+            except (json.JSONDecodeError, OSError):
+                logger.debug("Failed to read %s", config_name, exc_info=True)
+
     # Check for common test runners
     if (cwd / "pyproject.toml").exists() or (cwd / "pytest.ini").exists() or (cwd / "setup.cfg").exists():
         # Prefer uv if uv.lock exists (uv-managed project)
@@ -555,28 +569,50 @@ def wire_critique_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
 
 
 async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
-    """Send diff to the fast model with CRITIQUE_SYSTEM prompt."""
+    """Send diff to the critique model with CRITIQUE_SYSTEM prompt.
+
+    Uses heavy model by default (configurable via ollama.critique_model).
+    If gemini.critique_model is set and Gemini is available, routes to Gemini.
+    """
     import httpx
 
     from forge.prompts.refine import CRITIQUE_SYSTEM
 
-    fast_model = settings.ollama.fast_model
-    base_url = settings.ollama.base_url
-
     prompt = f"Review this code diff:\n\n```diff\n{diff_text}\n```"
 
+    # Try Gemini critique if configured
+    if settings.gemini.critique_model and deps.cloud_reasoning_enabled:
+        try:
+            from forge.agent.gemini import _ensure_api_key
+
+            if _ensure_api_key():
+                from pydantic_ai import Agent as _Agent
+
+                gemini_model = f"google-gla:{settings.gemini.critique_model}"
+                critique_agent = _Agent(model=gemini_model, instructions=CRITIQUE_SYSTEM)
+                result = await critique_agent.run(
+                    prompt, model_settings={"timeout": settings.gemini.timeout},
+                )
+                return result.output
+        except Exception:
+            logger.debug("Gemini critique failed, falling back to local", exc_info=True)
+
+    # Local critique: use configured critique_model or heavy_model
+    critique_model = settings.ollama.critique_model or settings.ollama.heavy_model
+    base_url = settings.ollama.base_url
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{base_url}/api/chat",
                 json={
-                    "model": fast_model,
+                    "model": critique_model,
                     "messages": [
                         {"role": "system", "content": CRITIQUE_SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
                     "stream": False,
-                    "options": {"num_ctx": 8192},
+                    "options": {"num_ctx": 16384},
                 },
             )
             if resp.status_code == 200:

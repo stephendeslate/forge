@@ -134,6 +134,7 @@ class OllamaMonitor:
 
 _heavy_backend: OllamaBackend | None = None
 _fast_backend: OllamaBackend | None = None
+_critique_backend: OllamaBackend | None = None
 
 
 def get_heavy_backend() -> OllamaBackend:
@@ -148,3 +149,13 @@ def get_fast_backend() -> OllamaBackend:
     if _fast_backend is None:
         _fast_backend = OllamaBackend(settings.ollama.fast_model, label="gpu-fast")
     return _fast_backend
+
+
+def get_critique_backend() -> OllamaBackend:
+    """Return backend for critique. Defaults to heavy model if not configured."""
+    global _critique_backend
+    if _critique_backend is None:
+        model = settings.ollama.critique_model or settings.ollama.heavy_model
+        label = "critique" if settings.ollama.critique_model else "gpu-heavy"
+        _critique_backend = OllamaBackend(model, label=label)
+    return _critique_backend

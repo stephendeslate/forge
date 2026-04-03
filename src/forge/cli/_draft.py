@@ -6,7 +6,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
 
-from forge.models.ollama import get_fast_backend, get_heavy_backend
+from forge.models.ollama import get_critique_backend, get_fast_backend, get_heavy_backend
 from forge.storage.database import Database
 
 from ._helpers import augment_system_with_rag, console, handle_model_error
@@ -19,7 +19,8 @@ async def draft_command(prompt: str, project: str | None, show_stages: bool) -> 
 
     fast = get_fast_backend()
     heavy = get_heavy_backend()
-    pipeline = Pipeline(drafter=fast, refiner=heavy)
+    critic = get_critique_backend()
+    pipeline = Pipeline(drafter=fast, refiner=heavy, critic=critic)
 
     # Optional RAG context
     context = ""
@@ -50,10 +51,10 @@ async def draft_command(prompt: str, project: str | None, show_stages: bool) -> 
             console.print(Markdown(draft_text))
 
         # Stage 2: Critique
-        with console.status(f"[bold yellow]Critiquing[/bold yellow] ({fast.name})..."):
+        with console.status(f"[bold yellow]Critiquing[/bold yellow] ({critic.name})..."):
             from forge.prompts.refine import CRITIQUE_SYSTEM
             critique_prompt = f"## Original Request\n{prompt}\n\n## Draft Response\n{draft_text}"
-            critique_text = await fast.generate(critique_prompt, system=CRITIQUE_SYSTEM)
+            critique_text = await critic.generate(critique_prompt, system=CRITIQUE_SYSTEM)
 
         if show_stages:
             console.print(Rule("[bold yellow]Critique[/bold yellow]"))

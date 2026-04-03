@@ -24,6 +24,7 @@ class OllamaSettings(BaseSettings):
     fast_model: str = "qwen3.5:4b"
     embed_model: str = "nomic-embed-text-v2-moe"
     vision_model: str = ""
+    critique_model: str = Field(default="", description="Model for critique (empty = use heavy_model)")
     max_retries: int = Field(default=3, description="Max retries on transient connection errors")
     retry_backoff_base: float = Field(default=1.0, description="Base delay for exponential backoff (seconds)")
 
@@ -36,6 +37,7 @@ class GeminiSettings(BaseSettings):
     fallback_model: str = Field(default="gemini-2.0-flash", description="Fallback model if primary fails")
     api_key: str = Field(default="", description="Google AI Studio API key (or set GOOGLE_API_KEY env var)")
     timeout: int = Field(default=120, description="Request timeout in seconds")
+    critique_model: str = Field(default="", description="Gemini model for critique (empty = don't use Gemini for critique)")
 
 
 class NPUSettings(BaseSettings):
@@ -96,7 +98,7 @@ class AgentSettings(BaseSettings):
     cb_identical: int = Field(default=3, description="Identical call threshold before warning")
     cb_failures: int = Field(default=3, description="Consecutive failure threshold")
     cb_oscillation_window: int = Field(default=3, description="A-B oscillation cycle count")
-    cb_post_warning_grace: int = Field(default=2, description="Extra calls allowed after warning before trip")
+    cb_post_warning_grace: int = Field(default=1, description="Extra calls allowed after warning before trip")
     cb_history_size: int = Field(default=20, description="Tool call history buffer size")
 
     # Output limits
