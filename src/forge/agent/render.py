@@ -72,10 +72,10 @@ def _format_tool_args(args: str | dict | None) -> str:
 
 
 def _truncate(text: str, max_len: int = 500) -> str:
-    """Truncate text for display."""
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + f"\n... ({len(text)} chars, truncated)"
+    """Truncate text for display using head+tail strategy."""
+    from forge.agent.utils import head_tail_truncate
+
+    return head_tail_truncate(text, max_len)
 
 
 def _split_thinking(raw: str) -> tuple[str, str]:
@@ -304,7 +304,9 @@ async def render_events(
 
             elif event.event_kind == "final_result":
                 _stop_thinking_spinner()
-                _finalize_live()
+                # Do NOT call _finalize_live() here — pydantic-ai may emit
+                # text deltas AFTER final_result. The finally block handles
+                # finalization after all events have been consumed.
 
     finally:
         _stop_thinking_spinner()

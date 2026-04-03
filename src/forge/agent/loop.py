@@ -30,7 +30,7 @@ from forge.agent.permissions import PermissionPolicy
 from forge.agent.render import render_events
 from forge.agent.status import StatusTracker
 from forge.agent.task_store import TaskStore
-from forge.agent.tools import ALL_TOOLS
+from forge.agent.tools import ALL_TOOLS, READ_ONLY_TOOLS
 from forge.agent.turn_buffer import TurnBuffer
 from forge.config import settings
 from forge.log import get_logger
@@ -53,6 +53,10 @@ You have access to tools for reading files, writing files, editing files, runnin
 4. Never re-fetch a URL that returned an error.
 5. Never fetch more than 3 URLs total in one turn.
 6. For well-known facts, history, math, and science fundamentals, answer from your knowledge without searching.
+
+## Internal reasoning
+You may use <analysis>...</analysis> tags for chain-of-thought reasoning on complex problems.
+These tags are automatically stripped during context compaction, so use them freely without worrying about context waste.
 
 ## General guidelines
 - Read files before editing them to understand existing code.
@@ -82,18 +86,32 @@ The sub-agent runs a fast local model in an isolated git worktree.
 Good for: "write tests for X", "add docstrings to Y", "implement function Z per this spec".
 Bad for: multi-file refactors, architectural decisions, tasks requiring your conversation context.
 After delegation, verify the sub-agent's work before reporting success.
+
+Use delegate_parallel for parallelizable tasks: "write tests for modules A, B, C", "add docstrings to these 4 files".
+Each subtask must be self-contained and independent — no cross-subtask dependencies. Max 4 concurrent.
 """
 
+# Marker for prompt cache optimization — everything above is static and cacheable,
+# dynamic content (tasks, memories, lint) is injected below via @agent.system_prompt
+SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "---DYNAMIC-BOUNDARY---"
+
 PLAN_OVERLAY = """\
-You are in PLANNING mode. Your task is to analyze the request and produce a structured plan.
+You are in PLANNING mode. You have read-only tools to explore the codebase BEFORE planning.
 
-Do NOT execute any actions or use any tools. Instead, output a clear plan with:
+## Process
+1. First, use your tools to explore: read relevant files, search for patterns, list directory structures.
+2. Understand the existing code, conventions, and dependencies.
+3. THEN produce a structured plan based on what you actually found.
+
+## Plan format
 1. **Goal**: What needs to be accomplished
-2. **Steps**: Numbered steps to achieve the goal
-3. **Files**: Which files will be read/modified/created
-4. **Risks**: Any potential issues or edge cases
+2. **Context**: Key files and patterns you discovered (reference specific files, functions, line numbers)
+3. **Steps**: Numbered steps to achieve the goal, each referencing specific files/functions to modify
+4. **Dependencies**: What existing code depends on the files you'll change
+5. **Risks**: Potential issues or edge cases based on the actual codebase
 
-Be specific and actionable. The plan will be reviewed before execution.
+Do NOT plan from imagination. Every claim about the codebase must come from tool results.
+Do NOT use write_file, edit_file, or run_command — you are in read-only mode.
 """
 
 
@@ -180,8 +198,20 @@ async def _run_with_status(
         # Capture real token counts from Ollama API response
         try:
             usage = result.usage()
-            deps.tokens_in += usage.input_tokens or 0
+            prompt_eval = usage.input_tokens or 0
+            deps.tokens_in += prompt_eval
             deps.tokens_out += usage.output_tokens or 0
+            # Prompt cache monitoring — detect KV cache invalidation
+            if (
+                deps._last_prompt_eval_count > 0
+                and prompt_eval > deps._last_prompt_eval_count * 1.5
+            ):
+                logger.info(
+                    "Prompt cache likely invalidated: prompt_eval %d → %d (%.0f%% increase)",
+                    deps._last_prompt_eval_count, prompt_eval,
+                    (prompt_eval / deps._last_prompt_eval_count - 1) * 100,
+                )
+            deps._last_prompt_eval_count = prompt_eval
         except Exception:
             pass  # usage() may not be available for all backends
         # Pause tracker before printing to prevent status line garbling output
@@ -232,22 +262,29 @@ async def _plan_and_execute(
     """
     console = deps.console
 
-    # Phase 1: Planning — create a no-tools agent with plan overlay
+    # Phase 1: Planning — agent with read-only tools to explore before planning
     _ensure_ollama_env()
+    from forge.core.project import build_project_context
+
+    plan_system = PLAN_OVERLAY
+    if deps.cwd:
+        plan_system += "\n\n" + build_project_context(deps.cwd)
+
     plan_agent: Agent[AgentDeps, str] = Agent(
         model=f"ollama:{settings.ollama.heavy_model}",
-        instructions=PLAN_OVERLAY,
-        tools=[],  # No tools in planning mode
+        instructions=plan_system,
+        tools=READ_ONLY_TOOLS,
         deps_type=AgentDeps,
-        model_settings=_model_settings(),
+        model_settings=_model_settings(num_ctx=65536),
     )
 
-    console.print("[dim]Planning...[/dim]")
+    console.print("[dim]Exploring codebase and planning...[/dim]")
     try:
         plan_result = await plan_agent.run(
             prompt,
             deps=deps,
             message_history=None,  # Fresh context for planning
+            usage_limits=UsageLimits(request_limit=10),  # Cap exploration
         )
         plan_text = plan_result.output
     except Exception as e:
@@ -390,9 +427,14 @@ async def agent_repl(
 
     # Sandbox hooks run first (priority 50) — before permission hook (default 0)
     # Lower priority number = runs first, so sandbox at -50 runs before permission at 0
-    from forge.agent.sandbox import make_command_blocklist_handler, make_path_boundary_handler
+    from forge.agent.sandbox import (
+        make_command_blocklist_handler,
+        make_path_boundary_handler,
+        make_write_command_detector,
+    )
     hook_registry.on(PreToolUse, make_command_blocklist_handler(), priority=-50)
     hook_registry.on(PreToolUse, make_path_boundary_handler(cwd), priority=-50)
+    hook_registry.on(PreToolUse, make_write_command_detector(deps), priority=-25)
 
     hook_registry.on(PreToolUse, make_permission_handler(deps))
     deps.hook_registry = hook_registry

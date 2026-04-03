@@ -65,3 +65,7 @@ class AgentDeps:
     # Syntax/lint feedback injection
     _post_tool_feedback: str | None = None
     lint_results: str | None = None
+    # Write escalation flag (set by sandbox write detector for sed -i, etc.)
+    _write_escalated: bool = False
+    # Prompt cache monitoring
+    _last_prompt_eval_count: int = 0

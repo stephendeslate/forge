@@ -7,7 +7,9 @@ import pytest
 from rich.console import Console
 
 from forge.agent.deps import AgentDeps
+from forge.agent.hooks import HookRegistry, make_permission_handler
 from forge.agent.permissions import PermissionPolicy
+from forge.agent.sandbox import make_command_blocklist_handler, make_path_boundary_handler
 
 
 @pytest.fixture
@@ -51,3 +53,67 @@ def sample_files(tmp_cwd):
     (sub / "__init__.py").write_text("")
 
     return tmp_cwd
+
+
+# ---------------------------------------------------------------------------
+# Hooked fixtures (permission hook via HookRegistry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def hook_registry():
+    """Fresh HookRegistry for testing."""
+    return HookRegistry()
+
+
+@pytest.fixture
+def hooked_deps(tmp_cwd, console, hook_registry):
+    """AgentDeps with AUTO permissions + permission hook on a real HookRegistry."""
+    deps = AgentDeps(
+        cwd=tmp_cwd,
+        console=console,
+        permission=PermissionPolicy.AUTO,
+        hook_registry=hook_registry,
+    )
+    hook_registry.on(
+        __import__("forge.agent.hooks", fromlist=["PreToolUse"]).PreToolUse,
+        make_permission_handler(deps),
+    )
+    return deps
+
+
+@pytest.fixture
+def hooked_ctx(hooked_deps):
+    """Mock RunContext with hooked deps (AUTO + permission hook)."""
+    ctx = MagicMock()
+    ctx.deps = hooked_deps
+    return ctx
+
+
+@pytest.fixture
+def sandboxed_deps(tmp_cwd, console):
+    """AgentDeps with YOLO + sandbox blocklist + path boundary + permission hooks.
+
+    Mirrors production wiring: sandbox at priority -50, permission at 0.
+    """
+    from forge.agent.hooks import PreToolUse
+
+    registry = HookRegistry()
+    deps = AgentDeps(
+        cwd=tmp_cwd,
+        console=console,
+        permission=PermissionPolicy.YOLO,
+        hook_registry=registry,
+    )
+    registry.on(PreToolUse, make_command_blocklist_handler(), priority=-50)
+    registry.on(PreToolUse, make_path_boundary_handler(tmp_cwd), priority=-50)
+    registry.on(PreToolUse, make_permission_handler(deps), priority=0)
+    return deps
+
+
+@pytest.fixture
+def sandboxed_ctx(sandboxed_deps):
+    """Mock RunContext with sandboxed deps."""
+    ctx = MagicMock()
+    ctx.deps = sandboxed_deps
+    return ctx

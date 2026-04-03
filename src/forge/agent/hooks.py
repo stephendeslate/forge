@@ -116,6 +116,7 @@ class HookResult:
     action: HookAction = HookAction.ALLOW
     message: str = ""
     modified_args: dict[str, Any] | None = None
+    feedback: str | None = None  # Merged into tool result string
 
 
 # Type alias for hook handlers
@@ -157,6 +158,23 @@ class HookRegistry:
                 logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
 
         await asyncio.gather(*[_run(h) for _, h in handlers])
+
+    async def emit_and_collect_feedback(self, event: object) -> list[str]:
+        """Fire a notification event, collecting feedback strings from handlers."""
+        feedbacks: list[str] = []
+        handlers = self._handlers.get(type(event), [])
+        for _, handler in handlers:
+            try:
+                result = handler(event)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if isinstance(result, HookResult) and result.feedback:
+                    feedbacks.append(result.feedback)
+            except HookEscalation:
+                raise
+            except Exception:
+                logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
+        return feedbacks
 
     def get_handlers(self, event_type: type) -> list[tuple[int, HookHandler]]:
         """Return a copy of handlers for the given event type."""
@@ -230,19 +248,23 @@ def with_hooks(fn: Callable) -> Callable:
             result = await fn(*bound.args, **bound.kwargs)
             elapsed = time.monotonic() - start
 
-            # PostToolUse (non-blocking)
-            await registry.emit(PostToolUse(
+            # PostToolUse — collect feedback from handlers
+            feedbacks = await registry.emit_and_collect_feedback(PostToolUse(
                 tool_name=tool_name,
                 args=tool_args,
                 result=result,
                 elapsed=elapsed,
             ))
 
-            # Check for post-tool feedback injected by hooks (e.g. syntax errors)
-            feedback = getattr(deps, "_post_tool_feedback", None)
-            if feedback and isinstance(result, str):
-                result = f"{result}\n\n{feedback}"
+            # Merge all feedback sources into tool result
+            all_feedback: list[str] = list(feedbacks)
+            manual_feedback = getattr(deps, "_post_tool_feedback", None)
+            if manual_feedback:
+                all_feedback.append(manual_feedback)
                 deps._post_tool_feedback = None
+
+            if all_feedback and isinstance(result, str):
+                result = result + "\n\n" + "\n".join(all_feedback)
 
             return result
         except Exception as exc:
@@ -271,27 +293,33 @@ def with_hooks(fn: Callable) -> Callable:
 async def permission_hook(event: PreToolUse, deps: AgentDeps) -> HookResult:
     """Built-in PreToolUse handler that enforces permission policy.
 
-    Replaces inline check_permission() calls in write_file/edit_file/run_command.
+    Uses a 5-stage waterfall: deny rules → ask rules → allow rules → mode fallback.
     """
     from forge.agent.permissions import (
-        SAFE_TOOLS,
-        PermissionPolicy,
+        PermissionRuleSet,
         _prompt_user,
         _summarize_call,
+        authorize,
+        parse_permission_rule,
+    )
+    from forge.config import settings
+
+    rules = PermissionRuleSet(
+        allow=[parse_permission_rule(r) for r in settings.sandbox.allow_rules],
+        deny=[parse_permission_rule(r) for r in settings.sandbox.deny_rules],
+        ask=[parse_permission_rule(r) for r in settings.sandbox.ask_rules],
     )
 
-    policy = deps.permission
+    action = authorize(event.tool_name, event.args, deps.permission, rules)
 
-    if policy == PermissionPolicy.YOLO:
+    if action == "allow":
         return HookResult()
+    if action == "block":
+        return HookResult(action=HookAction.BLOCK, message="Denied by permission rule.")
 
-    if policy == PermissionPolicy.AUTO and event.tool_name in SAFE_TOOLS:
-        return HookResult()
-
-    # ASK policy, or dangerous tool under AUTO — prompt user
+    # action == "ask" — prompt user
     summary = _summarize_call(event.tool_name, event.args)
     allowed = await _prompt_user(deps.console, event.tool_name, summary)
-
     if allowed:
         return HookResult()
     return HookResult(action=HookAction.BLOCK, message="Permission denied by user.")

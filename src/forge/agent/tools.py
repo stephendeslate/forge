@@ -14,9 +14,125 @@ from pydantic_ai import ModelRetry, RunContext, Tool
 
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import with_hooks
+from forge.agent.utils import head_tail_truncate
 from forge.log import get_logger
 
 logger = get_logger(__name__)
+
+
+# --- Semantic exit code interpretation ---
+
+_SEMANTIC_EXIT_CODES: dict[str, dict[int, str]] = {
+    "grep": {1: "No matches found"},
+    "rg": {1: "No matches found"},
+    "diff": {1: "Files differ"},
+    "cmp": {1: "Files differ"},
+    "test": {1: "Condition is false"},
+}
+
+
+def _interpret_exit_code(command: str, returncode: int) -> str:
+    """Return a human-readable exit code line."""
+    if returncode == 0:
+        return "Exit code: 0"
+
+    # Extract base command name
+    base = command.strip().split()[0] if command.strip() else ""
+    base = base.rsplit("/", 1)[-1]  # strip path prefix
+
+    meanings = _SEMANTIC_EXIT_CODES.get(base, {})
+    if returncode in meanings:
+        return f"Exit code: {returncode} ({meanings[returncode]})"
+
+    if returncode < 0:
+        import signal as _sig
+
+        try:
+            sig_name = _sig.Signals(-returncode).name
+            return f"Exit code: {returncode} (killed by {sig_name})"
+        except (ValueError, AttributeError):
+            pass
+
+    return f"Exit code: {returncode}"
+
+
+# --- Silent command classification ---
+
+_SILENT_COMMANDS = {
+    "mkdir", "touch", "cp", "mv", "ln", "chmod", "chown",
+    "git add", "git checkout", "git switch", "git branch",
+    "git stash", "git tag", "git rm", "git mv",
+    "cd", "pushd", "popd", "export",
+}
+
+
+def _silent_command_label(command: str) -> str:
+    """Return a label for commands that produce no output."""
+    cmd = command.strip()
+    for silent in _SILENT_COMMANDS:
+        if cmd == silent or cmd.startswith(silent + " "):
+            return "(completed successfully, no output expected)"
+    return "(no output)"
+
+
+# --- Incremental output reader ---
+
+
+async def _read_output_incremental(
+    proc: asyncio.subprocess.Process,
+    *,
+    max_bytes: int,
+    status_tracker: object | None = None,
+    status_interval: float = 2.0,
+) -> tuple[bytes, bytes, bool]:
+    """Read stdout/stderr incrementally with size guard and optional streaming.
+
+    Returns (stdout_bytes, stderr_bytes, was_killed_for_size).
+    """
+    from forge.agent.status import Phase
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    total_bytes = 0
+    killed = False
+    last_status_update = 0.0
+
+    async def _read_stream(stream: asyncio.StreamReader | None, chunks: list[bytes]) -> None:
+        nonlocal total_bytes, killed, last_status_update
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total_bytes += len(chunk)
+
+            # Output size kill guard
+            if total_bytes > max_bytes:
+                killed = True
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                return
+
+            # Streaming status updates
+            if status_tracker and hasattr(status_tracker, "set_phase"):
+                now = asyncio.get_event_loop().time()
+                if (now - last_status_update) >= status_interval:
+                    last_line = chunk.decode("utf-8", errors="replace").rstrip().rsplit("\n", 1)[-1]
+                    if last_line.strip():
+                        status_tracker.set_phase(Phase.TOOL_EXEC, f"run_command: {last_line[:60]}")
+                    last_status_update = now
+
+    # Read both streams concurrently
+    await asyncio.gather(
+        _read_stream(proc.stdout, stdout_chunks),
+        _read_stream(proc.stderr, stderr_chunks),
+    )
+
+    return b"".join(stdout_chunks), b"".join(stderr_chunks), killed
 
 
 def _resolve_path(ctx: RunContext[AgentDeps], file_path: str) -> Path:
@@ -153,8 +269,10 @@ async def run_command(
         timeout: Maximum seconds to wait (0 = use default from config).
     """
     from forge.config import settings as _settings
+
     if timeout <= 0:
         timeout = _settings.agent.run_command_timeout
+
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -163,39 +281,60 @@ async def run_command(
             cwd=ctx.deps.cwd,
             start_new_session=True,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # Kill entire process group, not just the shell
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                proc.kill()
-            await proc.communicate()
-            return f"Error: Command timed out after {timeout}s"
     except Exception as e:
         return f"Error running command: {e}"
 
-    parts: list[str] = []
-    parts.append(f"Exit code: {proc.returncode}")
+    try:
+        stdout, stderr, was_killed = await asyncio.wait_for(
+            _read_output_incremental(
+                proc,
+                max_bytes=_settings.agent.run_command_max_output_bytes,
+                status_tracker=ctx.deps.status_tracker,
+                status_interval=_settings.agent.run_command_status_interval,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        # Kill entire process group, not just the shell
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            proc.kill()
+        await proc.communicate()
+        return f"Error: Command timed out after {timeout}s"
 
+    await proc.wait()
+
+    # Decode
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
+    # Build result
+    parts: list[str] = []
+
+    # Semantic exit code
+    parts.append(_interpret_exit_code(command, proc.returncode))
+
+    # Truncate with head+tail
     if stdout_text:
-        stdout_limit = _settings.agent.run_command_stdout_limit
-        if len(stdout_text) > stdout_limit:
-            stdout_text = stdout_text[:stdout_limit] + "\n... (truncated)"
-        parts.append(f"stdout:\n{stdout_text}")
+        parts.append(
+            f"stdout:\n{head_tail_truncate(stdout_text, _settings.agent.run_command_stdout_limit)}"
+        )
 
     if stderr_text:
-        stderr_limit = _settings.agent.run_command_stderr_limit
-        if len(stderr_text) > stderr_limit:
-            stderr_text = stderr_text[:stderr_limit] + "\n... (truncated)"
-        parts.append(f"stderr:\n{stderr_text}")
+        parts.append(
+            f"stderr:\n{head_tail_truncate(stderr_text, _settings.agent.run_command_stderr_limit)}"
+        )
 
-    if not stdout_text and not stderr_text:
-        parts.append("(no output)")
+    if was_killed:
+        mb = _settings.agent.run_command_max_output_bytes / 1_000_000
+        parts.append(
+            f"Process killed: output exceeded {mb:.0f} MB limit. "
+            "Redirect to file: command > output.txt"
+        )
+    elif not stdout_text and not stderr_text:
+        # Silent command detection
+        parts.append(_silent_command_label(command))
 
     return "\n\n".join(parts)
 
@@ -853,6 +992,13 @@ ALL_TOOLS: list[Tool] = [
     Tool(with_hooks(run_command), sequential=True),
 ]
 
+# Read-only tools for planning mode — explore codebase before planning
+READ_ONLY_TOOLS: list[Tool] = [
+    Tool(with_hooks(read_file)),
+    Tool(with_hooks(search_code)),
+    Tool(with_hooks(list_files)),
+]
+
 # Memory tools — added conditionally when DB is available
 MEMORY_TOOLS: list[Tool] = [
     Tool(with_hooks(save_memory), sequential=True),
@@ -922,8 +1068,8 @@ async def delegate_parallel(
     """
     if len(tasks) < 2:
         raise ModelRetry("Use 'delegate' for single tasks. delegate_parallel requires 2+ tasks.")
-    if len(tasks) > 4:
-        raise ModelRetry("Max 4 parallel tasks. Split into batches if needed.")
+    if len(tasks) > 6:
+        raise ModelRetry("Max 6 parallel tasks. Split into batches if needed.")
 
     from forge.agent.subagent import run_subagents_parallel
 

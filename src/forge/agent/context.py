@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from pydantic_ai.messages import (
     BinaryContent,
@@ -292,7 +293,8 @@ def _message_to_readable(msg: ModelMessage) -> str:
                 if len(args_str) > 200:
                     args_str = args_str[:200] + "..."
                 lines.append(f"Tool call: {part.tool_name}({args_str})")
-    return "\n".join(lines) if lines else str(msg)[:200]
+    text = "\n".join(lines) if lines else str(msg)[:200]
+    return _strip_tag_blocks(text, "analysis")
 
 
 def _group_task_sequences(
@@ -325,9 +327,102 @@ def _group_task_sequences(
     return groups
 
 
+def _strip_tag_blocks(text: str, tag: str) -> str:
+    """Remove <tag>...</tag> blocks (including multiline) from text."""
+    return re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL).strip()
+
+
+# Known source file extensions for key-file extraction
+_FILE_EXT_PATTERN = re.compile(
+    r"(?:^|\s)([\w./\-]+\.(?:py|toml|json|md|rs|ts|js|yaml|yml|sh|sql|html|css|jsx|tsx))\b"
+)
+
+# Keywords indicating pending work
+_PENDING_KEYWORDS = re.compile(
+    r"\b(?:todo|next|pending|remaining|fixme|still need|not yet|blocked)\b", re.IGNORECASE
+)
+
+
+def _collect_key_files(messages: list[ModelMessage]) -> list[str]:
+    """Extract file paths mentioned in messages."""
+    files: set[str] = set()
+    for msg in messages:
+        text = _message_text(msg)
+        for m in _FILE_EXT_PATTERN.finditer(text):
+            files.add(m.group(1))
+    return sorted(files)
+
+
+def _infer_pending_work(messages: list[ModelMessage]) -> list[str]:
+    """Scan recent messages for pending work indicators."""
+    pending: list[str] = []
+    seen: set[str] = set()
+    for msg in messages[-5:]:
+        text = _message_text(msg)
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if stripped and _PENDING_KEYWORDS.search(stripped):
+                if stripped not in seen:
+                    seen.add(stripped)
+                    pending.append(stripped)
+                    if len(pending) >= 10:
+                        return pending
+    return pending
+
+
+def _collect_tools_used(messages: list[ModelMessage]) -> list[str]:
+    """Collect unique tool names from tool call parts."""
+    tools: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    tools.add(part.tool_name)
+    return sorted(tools)
+
+
+def _collect_recent_requests(messages: list[ModelMessage]) -> list[str]:
+    """Collect up to 3 recent user prompt texts."""
+    requests: list[str] = []
+    for msg in reversed(messages):
+        if isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart):
+                    content = str(part.content)[:100]
+                    requests.append(content)
+                    if len(requests) >= 3:
+                        return requests
+    return requests
+
+
 def _extract_preservable_refs(messages: list[ModelMessage]) -> str:
-    """Stub: extract memory/task refs that must survive compaction."""
-    return ""
+    """Extract structured metadata that must survive compaction.
+
+    Deterministically extracts file paths, pending work, tool names,
+    and recent user requests — no LLM needed.
+    """
+    sections: list[str] = []
+
+    files = _collect_key_files(messages)
+    if files:
+        sections.append("### Files touched\n" + "\n".join(f"- `{f}`" for f in files[:30]))
+
+    tools = _collect_tools_used(messages)
+    if tools:
+        sections.append("### Tools used\n" + ", ".join(tools))
+
+    requests = _collect_recent_requests(messages)
+    if requests:
+        lines = [f'{i+1}. "{r}"' for i, r in enumerate(requests)]
+        sections.append("### Recent requests\n" + "\n".join(lines))
+
+    pending = _infer_pending_work(messages)
+    if pending:
+        sections.append("### Pending work\n" + "\n".join(f"- {p}" for p in pending))
+
+    if not sections:
+        return ""
+    return "## Preserved References\n" + "\n\n".join(sections)
 
 
 async def _summarize_with_prompt(
@@ -402,6 +497,38 @@ async def summarize_for_compaction(messages: list[ModelMessage]) -> str | None:
     return await _summarize_with_prompt(messages)
 
 
+def _extract_prior_summary(
+    messages: list[ModelMessage],
+) -> tuple[str | None, list[ModelMessage]]:
+    """Separate prior compacted summaries from fresh messages.
+
+    Returns (prior_summary_text, remaining_messages). If no prior summary
+    is found, returns (None, original_messages).
+    """
+    prior_parts: list[str] = []
+    remaining: list[ModelMessage] = []
+
+    for msg in messages:
+        if isinstance(msg, ModelRequest):
+            is_compacted = False
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart):
+                    content = str(part.content)
+                    if content.startswith("[Context compacted") or content.startswith("[Compacted task:"):
+                        prior_parts.append(content)
+                        is_compacted = True
+                        break
+            if not is_compacted:
+                remaining.append(msg)
+        else:
+            remaining.append(msg)
+
+    if not prior_parts:
+        return None, messages
+
+    return "\n\n".join(prior_parts), remaining
+
+
 async def smart_compact_history(
     messages: list[ModelMessage],
     token_budget: int = DEFAULT_TOKEN_BUDGET,
@@ -469,11 +596,23 @@ async def smart_compact_history(
         truncated_older = compacted_groups
 
     # Tier 3: Full summarization with domain-aware prompt
-    summary = await _summarize_with_prompt(truncated_older, COMPACTION_PROMPT)
+    # Separate prior compacted summaries from fresh messages
+    prior_summary, non_summary_older = _extract_prior_summary(truncated_older)
+    to_summarize = non_summary_older if non_summary_older else truncated_older
+    summary = await _summarize_with_prompt(to_summarize, COMPACTION_PROMPT)
 
     if summary:
+        # Strip any analysis tags the summarizer emitted
+        summary = _strip_tag_blocks(summary, "analysis")
         preservable = _extract_preservable_refs(older)
-        content = f"[Context compacted — {len(older)} messages summarized, tier 3]\n\n{summary}"
+        if prior_summary:
+            content = (
+                f"[Context compacted — {len(older)} messages summarized, tier 3]\n\n"
+                f"## Previously compacted context\n{prior_summary}\n\n"
+                f"## Newly compacted context\n{summary}"
+            )
+        else:
+            content = f"[Context compacted — {len(older)} messages summarized, tier 3]\n\n{summary}"
         if preservable:
             content += f"\n\n{preservable}"
         summary_msg = ModelRequest(parts=[UserPromptPart(content=content)])

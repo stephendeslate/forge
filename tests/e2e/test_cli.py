@@ -44,6 +44,19 @@ class TestCLIBasics:
         result = runner.invoke(app, ["history", "--help"])
         assert result.exit_code == 0
 
+    def test_history_command(self):
+        result = runner.invoke(app, ["history"])
+        # May fail connecting to DB, but shouldn't crash with unhandled exception
+        assert result.exit_code in (0, 1)
+
+    def test_serve_help(self):
+        result = runner.invoke(app, ["serve", "--help"])
+        assert result.exit_code == 0
+
+    def test_run_help(self):
+        result = runner.invoke(app, ["run", "--help"])
+        assert result.exit_code == 0
+
 
 class TestCLIModuleImports:
     """Verify all new modules import correctly through the CLI entry point."""
@@ -80,3 +93,33 @@ class TestCLIModuleImports:
         from forge.agent.loop import _maybe_prepend_think
 
         assert callable(_maybe_prepend_think)
+
+    def test_multimodal_imports(self):
+        from forge.agent.multimodal import IMAGE_EXTENSIONS, parse_multimodal_input
+
+        assert ".png" in IMAGE_EXTENSIONS
+        assert callable(parse_multimodal_input)
+
+    def test_sandbox_imports(self):
+        from forge.agent.sandbox import make_command_blocklist_handler, make_path_boundary_handler
+
+        assert callable(make_command_blocklist_handler)
+        assert callable(make_path_boundary_handler)
+
+    def test_circuit_breaker_imports(self):
+        from forge.agent.circuit_breaker import CircuitBreakerTripped, ToolCallTracker
+
+        assert ToolCallTracker is not None
+        assert issubclass(CircuitBreakerTripped, Exception)
+
+    def test_mcp_config_imports(self):
+        from forge.agent.mcp_config import find_mcp_configs, load_all_mcp_servers
+
+        assert callable(find_mcp_configs)
+        assert callable(load_all_mcp_servers)
+
+    def test_context_imports(self):
+        from forge.agent.context import compact_history, smart_compact_history
+
+        assert callable(compact_history)
+        assert callable(smart_compact_history)

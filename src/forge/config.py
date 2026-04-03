@@ -87,6 +87,11 @@ class AgentSettings(BaseSettings):
     cb_post_warning_grace: int = Field(default=2, description="Extra calls allowed after warning before trip")
     cb_history_size: int = Field(default=20, description="Tool call history buffer size")
 
+    # Output limits
+    run_command_max_output_bytes: int = Field(default=5_000_000, description="Kill process if output exceeds this (bytes)")
+    run_command_status_interval: float = Field(default=2.0, description="Seconds between status line updates during command execution")
+    run_command_background_threshold: float = Field(default=0.0, description="Auto-background after N seconds (0=disabled)")
+
     # Model escalation
     auto_escalation: bool = Field(default=True, description="Auto-escalate from fast to heavy on trouble")
     escalation_threshold: float = Field(default=5.0, description="Cumulative signal weight to trigger escalation")
@@ -121,6 +126,9 @@ class SandboxSettings(BaseSettings):
     warn_patterns: list[str] = Field(default_factory=lambda: list(DEFAULT_WARN_PATTERNS))
     restrict_paths: bool = True
     allowed_paths: list[str] = Field(default_factory=list, description="Extra allowed paths beyond cwd + /tmp")
+    allow_rules: list[str] = Field(default_factory=list, description="Permission allow rules, e.g. 'run_command(git:*)'")
+    deny_rules: list[str] = Field(default_factory=list, description="Permission deny rules")
+    ask_rules: list[str] = Field(default_factory=list, description="Permission ask rules")
 
 
 class MemorySettings(BaseSettings):
