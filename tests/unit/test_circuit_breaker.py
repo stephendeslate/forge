@@ -224,6 +224,78 @@ class TestLoopStartIndex:
         assert tracker.loop_start_index is None
 
 
+class TestSelfCorrectionDetection:
+    """Verify that pattern checks work for speculative recheck (used by hook)."""
+
+    def test_different_args_breaks_identical_pattern(self):
+        """After identical loop detected, a call with different args breaks the pattern."""
+        tracker = ToolCallTracker(identical_threshold=3, post_warning_grace=2)
+        args_a = {"file_path": "/a.py"}
+        args_b = {"file_path": "/b.py"}
+
+        for _ in range(3):
+            tracker.record("read_file", args_a, True)
+        tracker.check()
+        assert tracker.warning_issued
+
+        # Speculative check: would a different call continue the loop?
+        from forge.agent.circuit_breaker import ToolCallRecord, _hash_args
+        import time
+
+        speculative = ToolCallRecord("read_file", _hash_args(args_b), True, time.monotonic())
+        tracker._history.append(speculative)
+        still_looping = tracker._check_identical_repeat()
+        tracker._history.pop()
+
+        assert still_looping is None, "Different args should break identical pattern"
+
+    def test_same_args_continues_identical_pattern(self):
+        """After identical loop detected, same call continues the pattern."""
+        tracker = ToolCallTracker(identical_threshold=3, post_warning_grace=2)
+        args = {"file_path": "/a.py"}
+
+        for _ in range(3):
+            tracker.record("read_file", args, True)
+        tracker.check()
+        assert tracker.warning_issued
+
+        from forge.agent.circuit_breaker import ToolCallRecord, _hash_args
+        import time
+
+        speculative = ToolCallRecord("read_file", _hash_args(args), True, time.monotonic())
+        tracker._history.append(speculative)
+        still_looping = tracker._check_identical_repeat()
+        tracker._history.pop()
+
+        assert still_looping is not None, "Same args should continue identical pattern"
+
+    def test_different_tool_breaks_failure_pattern(self):
+        """After repeated failures, calling a different tool breaks the pattern."""
+        tracker = ToolCallTracker(failure_threshold=3, post_warning_grace=2)
+
+        for _ in range(3):
+            tracker.record("run_command", {"cmd": "pytest"}, False)
+        tracker.check()
+        assert tracker.warning_issued
+
+        from forge.agent.circuit_breaker import ToolCallRecord, _hash_args
+        import time
+
+        speculative = ToolCallRecord("read_file", _hash_args({"file_path": "/err.log"}), True, time.monotonic())
+        tracker._history.append(speculative)
+        still_looping = tracker._check_repeated_failures()
+        tracker._history.pop()
+
+        assert still_looping is None, "Different tool should break failure pattern"
+
+
+class TestDefaultGrace:
+    def test_default_grace_is_2(self):
+        """Default grace=2 ensures the diagnostic BLOCK is reachable."""
+        tracker = ToolCallTracker(identical_threshold=3)
+        assert tracker._post_warning_grace == 2
+
+
 class TestMixedVariedCalls:
     def test_no_false_positive(self):
         tracker = ToolCallTracker()

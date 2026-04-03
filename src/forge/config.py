@@ -98,7 +98,7 @@ class AgentSettings(BaseSettings):
     cb_identical: int = Field(default=3, description="Identical call threshold before warning")
     cb_failures: int = Field(default=3, description="Consecutive failure threshold")
     cb_oscillation_window: int = Field(default=3, description="A-B oscillation cycle count")
-    cb_post_warning_grace: int = Field(default=1, description="Extra calls allowed after warning before trip")
+    cb_post_warning_grace: int = Field(default=2, description="Extra calls allowed after warning before trip")
     cb_history_size: int = Field(default=20, description="Tool call history buffer size")
 
     # Output limits

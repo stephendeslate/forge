@@ -69,7 +69,7 @@ class TestCircuitBreakerWired:
         await _read(cb_ctx, "a.txt")
         await _read(cb_ctx, "a.txt")
         # 4th call: tracker has warned, PreToolUse should BLOCK
-        with pytest.raises(ModelRetry, match="loop"):
+        with pytest.raises(ModelRetry, match="LOOP DETECTED"):
             await _read(cb_ctx, "a.txt")
 
     async def test_trip_after_grace(self, cb_ctx, tmp_cwd):
@@ -116,3 +116,58 @@ class TestCircuitBreakerWired:
         assert "aaa" in r1
         assert "bbb" in r2
         assert "ccc" in r3
+
+    async def test_self_correction_clears_warning(self, cb_deps, cb_ctx, tmp_cwd):
+        """After warning, calling a different file clears warning state."""
+        _, tracker = cb_deps
+        (tmp_cwd / "a.txt").write_text("aaa")
+        (tmp_cwd / "b.txt").write_text("bbb")
+
+        # 3 identical calls → warning issued
+        await _read(cb_ctx, "a.txt")
+        await _read(cb_ctx, "a.txt")
+        await _read(cb_ctx, "a.txt")
+        assert tracker.warning_issued
+
+        # Self-correct: read a DIFFERENT file → warning should clear
+        result = await _read(cb_ctx, "b.txt")
+        assert "bbb" in result
+        assert not tracker.warning_issued, "Warning should clear after self-correction"
+        assert not tracker.tripped
+
+    async def test_self_correction_then_new_loop_detected(self, cb_deps, cb_ctx, tmp_cwd):
+        """Self-correction resets state; a new loop can be detected fresh."""
+        _, tracker = cb_deps
+        (tmp_cwd / "a.txt").write_text("aaa")
+        (tmp_cwd / "b.txt").write_text("bbb")
+
+        # Trigger warning on a.txt
+        for _ in range(3):
+            await _read(cb_ctx, "a.txt")
+        assert tracker.warning_issued
+
+        # Self-correct with b.txt
+        await _read(cb_ctx, "b.txt")
+        assert not tracker.warning_issued
+
+        # Now loop on b.txt — should get a fresh warning
+        await _read(cb_ctx, "b.txt")
+        await _read(cb_ctx, "b.txt")  # 3rd b.txt read (counting the self-correction one)
+        assert tracker.warning_issued, "New loop on b.txt should trigger fresh warning"
+
+    async def test_no_self_correction_same_args_still_trips(self, cb_ctx, tmp_cwd):
+        """Continuing the same loop after warning still leads to trip."""
+        (tmp_cwd / "a.txt").write_text("aaa")
+
+        # 3 identical → warning
+        await _read(cb_ctx, "a.txt")
+        await _read(cb_ctx, "a.txt")
+        await _read(cb_ctx, "a.txt")
+
+        # 4th: still looping → BLOCK with diagnostic (grace 1 of 2)
+        with pytest.raises(ModelRetry, match="LOOP DETECTED"):
+            await _read(cb_ctx, "a.txt")
+
+        # 5th: grace exhausted → trip
+        with pytest.raises((CircuitBreakerTripped, HookEscalation)):
+            await _read(cb_ctx, "a.txt")

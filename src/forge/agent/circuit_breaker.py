@@ -67,7 +67,7 @@ class ToolCallTracker:
         identical_threshold: int = 3,
         failure_threshold: int = 3,
         oscillation_window: int = 3,
-        post_warning_grace: int = 1,
+        post_warning_grace: int = 2,
         history_size: int = 20,
     ) -> None:
         self._history: deque[ToolCallRecord] = deque(maxlen=history_size)
@@ -305,8 +305,29 @@ def wire_circuit_breaker(
                 f"Circuit breaker tripped: {tracker.trip_reason}"
             )
         if tracker.warning_issued:
-            # Track continued attempts — PreToolUse fires even when BLOCK
-            # prevents tool execution (so PostToolUse never fires).
+            # Check if the agent self-corrected by trying a different approach.
+            # Speculatively add this call to history, run pattern checks, then remove.
+            speculative = ToolCallRecord(
+                tool_name=event.tool_name,
+                args_hash=_hash_args(event.args),
+                succeeded=True,
+                timestamp=time.monotonic(),
+            )
+            tracker._history.append(speculative)
+            still_looping = (
+                tracker._check_identical_repeat()
+                or tracker._check_oscillation()
+                or tracker._check_repeated_failures()
+            )
+            tracker._history.pop()
+
+            if not still_looping:
+                # Agent broke the pattern — clear warning and allow
+                logger.debug("Circuit breaker: agent self-corrected, clearing warning")
+                tracker.reset_state()
+                return HookResult()
+
+            # Still looping — count toward trip
             tracker._state.post_warning_count += 1
             if tracker._state.post_warning_count >= tracker._post_warning_grace:
                 tracker._state.tripped = True
