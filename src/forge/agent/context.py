@@ -475,7 +475,7 @@ async def _summarize_with_prompt(
 
     try:
         from forge.models.ollama import _model_settings
-        model_name = settings.agent.compaction_model or settings.ollama.fast_model
+        model_name = settings.agent.compaction_model or settings.ollama.heavy_model
         summarizer: Agent[None, str] = Agent(
             model=f"ollama:{model_name}",
             instructions="You are a concise conversation summarizer for an AI coding assistant.",

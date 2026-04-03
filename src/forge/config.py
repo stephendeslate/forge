@@ -91,7 +91,7 @@ class AgentSettings(BaseSettings):
     list_files_limit: int = Field(default=500, description="Max files returned by list_files")
     rag_max_tokens: int = Field(default=12000, description="Max tokens of RAG context injected into prompts")
     delegate_model: str = Field(default="", description="Model for sub-agent delegation (empty = use heavy model)")
-    compaction_model: str = Field(default="", description="Model for compaction summarization (empty = use fast model)")
+    compaction_model: str = Field(default="", description="Model for compaction summarization (empty = use heavy model)")
     preload_model: bool = Field(default=True, description="Preload the heavy model on agent startup")
 
     # Circuit breaker
