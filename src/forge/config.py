@@ -79,6 +79,7 @@ class AgentSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_AGENT_")
 
     num_ctx: int = Field(default=131072, description="Ollama num_ctx — context window size in tokens")
+    fast_num_ctx: int = Field(default=8192, description="Context window for fast model (smaller = less VRAM, enables coexistence)")
     token_budget: int = Field(default=120000, description="Max tokens before auto-compaction triggers")
     compaction_threshold: float = Field(default=0.85, description="Fraction of token_budget that triggers auto-compaction")
     compaction_input_limit: int = Field(default=32000, description="Max chars of conversation text fed to the summarizer")

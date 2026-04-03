@@ -480,7 +480,7 @@ async def _summarize_with_prompt(
             model=f"ollama:{model_name}",
             instructions="You are a concise conversation summarizer for an AI coding assistant.",
             tools=[],
-            model_settings=_model_settings(timeout=60, num_ctx=8192),
+            model_settings=_model_settings(timeout=60, num_ctx=settings.agent.fast_num_ctx),
         )
         result = await summarizer.run(prompt)
         summary = result.output

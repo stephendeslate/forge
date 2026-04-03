@@ -5,7 +5,7 @@
 - **Language:** Python 3.12, managed with `uv`
 - **Entry point:** `forge.cli:app` (typer)
 - **Config:** `~/.config/forge/config.toml` + env vars (`FORGE_*`)
-- **Models:** Ollama (GPU) — heavy: `qwen3-coder-next:q8_0`, fast: `qwen3.5:4b`; NPU (FastFlowLM) — `llama-3.2-3b`
+- **Models:** Ollama (GPU, ROCm) — heavy: `qwen3-coder-next:q8_0` (131K ctx), fast: `qwen3.5:4b` (8K ctx via `fast_num_ctx`); NPU (FastFlowLM) — `llama-3.2-3b`
 
 ## Commands
 

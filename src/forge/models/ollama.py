@@ -20,9 +20,6 @@ def _model_settings(timeout: int = 300, num_ctx: int | None = None) -> ModelSett
     )
 
 
-# Legacy alias — callers that just need the default timeout + num_ctx
-_OLLAMA_TIMEOUT = _model_settings()
-
 
 def _ensure_ollama_env() -> None:
     """Set OLLAMA_BASE_URL env var so pydantic-ai's OllamaProvider picks it up.
@@ -39,11 +36,12 @@ def _ensure_ollama_env() -> None:
 class OllamaBackend:
     """Wraps a Pydantic AI Agent with an Ollama model for generation and streaming."""
 
-    def __init__(self, model_name: str, label: str = "ollama") -> None:
+    def __init__(self, model_name: str, label: str = "ollama", model_settings: ModelSettings | None = None) -> None:
         _ensure_ollama_env()
         self._model_name = model_name
         self._label = label
         self._model_id = f"ollama:{model_name}"
+        self._default_settings = model_settings or _model_settings()
         self._agent = Agent(model=self._model_id)
         self._agents: dict[str, Agent] = {"": self._agent}
 
@@ -62,12 +60,12 @@ class OllamaBackend:
 
     async def generate(self, prompt: str, *, system: str = "") -> str:
         agent = self._get_agent(system)
-        result = await agent.run(prompt, model_settings=_OLLAMA_TIMEOUT)
+        result = await agent.run(prompt, model_settings=self._default_settings)
         return result.output
 
     async def stream(self, prompt: str, *, system: str = "") -> AsyncIterator[str]:
         agent = self._get_agent(system)
-        async with agent.run_stream(prompt, model_settings=_OLLAMA_TIMEOUT) as stream:
+        async with agent.run_stream(prompt, model_settings=self._default_settings) as stream:
             async for chunk in stream.stream_text(delta=True):
                 yield chunk
 
@@ -147,7 +145,11 @@ def get_heavy_backend() -> OllamaBackend:
 def get_fast_backend() -> OllamaBackend:
     global _fast_backend
     if _fast_backend is None:
-        _fast_backend = OllamaBackend(settings.ollama.fast_model, label="gpu-fast")
+        _fast_backend = OllamaBackend(
+            settings.ollama.fast_model,
+            label="gpu-fast",
+            model_settings=_model_settings(num_ctx=settings.agent.fast_num_ctx),
+        )
     return _fast_backend
 
 
