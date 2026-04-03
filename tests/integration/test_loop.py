@@ -99,14 +99,12 @@ class TestAgentSystemPrompt:
         assert "never re-fetch" in AGENT_SYSTEM.lower()
         assert "never fetch more than 3" in AGENT_SYSTEM.lower()
 
-    def test_request_limit_is_15(self):
-        """Request limit should be 15 to catch runaway loops faster."""
-        from forge.agent.loop import UsageLimits
-        # Verify the limit by checking that the constant is used correctly
-        # (The actual limit is set in _run_with_status, tested via source inspection)
+    def test_request_limit_is_configured(self):
+        """Request limit should be set from settings to catch runaway loops."""
         import inspect
         source = inspect.getsource(_run_with_status)
-        assert "request_limit=15" in source
+        assert "request_limit=" in source
+        assert "settings.agent.request_limit" in source
 
 
 class TestEnsureOllamaEnv:

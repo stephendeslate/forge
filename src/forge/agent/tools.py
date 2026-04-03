@@ -20,6 +20,24 @@ from forge.log import get_logger
 logger = get_logger(__name__)
 
 
+# --- Edit diff formatting ---
+
+def _format_edit_diff(old: str, new: str, filename: str, max_lines: int = 50) -> str:
+    """Generate a truncated unified diff between old and new file content."""
+    import difflib
+
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=filename, tofile=filename, lineterm=""))
+    if not diff:
+        return ""
+    if len(diff) > max_lines:
+        remaining = len(diff) - max_lines
+        diff = diff[:max_lines]
+        diff.append(f"... ({remaining} more lines)")
+    return "```diff\n" + "\n".join(diff) + "\n```"
+
+
 # --- Semantic exit code interpretation ---
 
 _SEMANTIC_EXIT_CODES: dict[str, dict[int, str]] = {
@@ -254,6 +272,12 @@ async def edit_file(
         msg += f" (matched via {method})"
     if warning:
         msg += f"\nNote: {warning}"
+
+    # Append unified diff for visibility
+    diff_str = _format_edit_diff(text, new_content, str(path))
+    if diff_str:
+        msg += f"\n\n{diff_str}"
+
     return msg
 
 
@@ -284,24 +308,51 @@ async def run_command(
     except Exception as e:
         return f"Error running command: {e}"
 
-    try:
-        stdout, stderr, was_killed = await asyncio.wait_for(
-            _read_output_incremental(
-                proc,
-                max_bytes=_settings.agent.run_command_max_output_bytes,
-                status_tracker=ctx.deps.status_tracker,
-                status_interval=_settings.agent.run_command_status_interval,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        # Kill entire process group, not just the shell
+    # Auto-background: if threshold is set, wait that long then background it
+    bg_threshold = _settings.agent.run_command_background_threshold
+    if bg_threshold > 0:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            proc.kill()
-        await proc.communicate()
-        return f"Error: Command timed out after {timeout}s"
+            stdout, stderr, was_killed = await asyncio.wait_for(
+                _read_output_incremental(
+                    proc,
+                    max_bytes=_settings.agent.run_command_max_output_bytes,
+                    status_tracker=ctx.deps.status_tracker,
+                    status_interval=_settings.agent.run_command_status_interval,
+                ),
+                timeout=bg_threshold,
+            )
+        except asyncio.TimeoutError:
+            # Background the process instead of killing it
+            bg_task = asyncio.create_task(
+                _read_output_incremental(
+                    proc,
+                    max_bytes=_settings.agent.run_command_max_output_bytes,
+                )
+            )
+            ctx.deps._background_procs[proc.pid] = (bg_task, proc)
+            return (
+                f"Command still running after {bg_threshold:.0f}s — moved to background (PID: {proc.pid}).\n"
+                f"Use check_background(pid={proc.pid}) to check status."
+            )
+    else:
+        try:
+            stdout, stderr, was_killed = await asyncio.wait_for(
+                _read_output_incremental(
+                    proc,
+                    max_bytes=_settings.agent.run_command_max_output_bytes,
+                    status_tracker=ctx.deps.status_tracker,
+                    status_interval=_settings.agent.run_command_status_interval,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # Kill entire process group, not just the shell
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
+            await proc.communicate()
+            return f"Error: Command timed out after {timeout}s"
 
     await proc.wait()
 
@@ -763,6 +814,22 @@ def _strip_html_fallback(html: str) -> str:
     return text.strip()
 
 
+async def analyze_impact(
+    ctx: RunContext[AgentDeps],
+    file_path: str,
+) -> str:
+    """Analyze what depends on a file. Use before modifying shared code to understand
+    downstream impact. Shows symbols defined in the file and which other files import them.
+
+    Args:
+        file_path: Path to the file to analyze (relative to cwd or absolute).
+    """
+    from forge.agent.impact import build_impact_report
+
+    report = await build_impact_report(file_path, ctx.deps.cwd)
+    return report.format()
+
+
 async def rag_search(
     ctx: RunContext[AgentDeps],
     query: str,
@@ -979,6 +1046,50 @@ async def task_get(ctx: RunContext[AgentDeps], task_id: str) -> str:
     return "\n".join(parts)
 
 
+async def check_background(
+    ctx: RunContext[AgentDeps],
+    pid: int,
+) -> str:
+    """Check on a background command started by run_command auto-backgrounding.
+
+    Args:
+        pid: The process ID returned when the command was backgrounded.
+    """
+    entry = ctx.deps._background_procs.get(pid)
+    if entry is None:
+        return f"No background process with PID {pid} found."
+
+    bg_task, proc = entry
+
+    if bg_task.done():
+        # Collect results and clean up
+        try:
+            stdout, stderr, was_killed = bg_task.result()
+        except Exception as e:
+            del ctx.deps._background_procs[pid]
+            return f"Background process {pid} errored: {e}"
+
+        del ctx.deps._background_procs[pid]
+        await proc.wait()
+
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        parts = [f"Background process {pid} finished."]
+        parts.append(_interpret_exit_code("", proc.returncode))
+        if stdout_text:
+            from forge.agent.utils import head_tail_truncate as _htt
+            parts.append(f"stdout:\n{_htt(stdout_text, 50000)}")
+        if stderr_text:
+            from forge.agent.utils import head_tail_truncate as _htt2
+            parts.append(f"stderr:\n{_htt2(stderr_text, 20000)}")
+        if was_killed:
+            parts.append("(output was truncated due to size limit)")
+        return "\n\n".join(parts)
+    else:
+        return f"Background process {pid} is still running."
+
+
 ALL_TOOLS: list[Tool] = [
     # Read-only tools — safe for parallel execution
     Tool(with_hooks(read_file)),
@@ -986,6 +1097,8 @@ ALL_TOOLS: list[Tool] = [
     Tool(with_hooks(list_files)),
     Tool(with_hooks(web_search)),
     Tool(with_hooks(web_fetch)),
+    Tool(with_hooks(analyze_impact)),
+    Tool(with_hooks(check_background)),
     # Write/execute tools — sequential to prevent races
     Tool(with_hooks(write_file), sequential=True),
     Tool(with_hooks(edit_file), sequential=True),
@@ -997,6 +1110,7 @@ READ_ONLY_TOOLS: list[Tool] = [
     Tool(with_hooks(read_file)),
     Tool(with_hooks(search_code)),
     Tool(with_hooks(list_files)),
+    Tool(with_hooks(analyze_impact)),
 ]
 
 # Memory tools — added conditionally when DB is available
@@ -1018,6 +1132,7 @@ async def delegate(
     ctx: RunContext[AgentDeps],
     task: str,
     model: str | None = None,
+    agent_type: str = "coder",
 ) -> str:
     """Delegate a contained task to a sub-agent.
 
@@ -1030,6 +1145,7 @@ async def delegate(
         ctx: The run context.
         task: Clear description of what the sub-agent should do.
         model: Optional model override (defaults to heavy model via config).
+        agent_type: Sub-agent type — 'coder' (read+write+run), 'research' (read-only), or 'reviewer' (read+run).
 
     Returns:
         Sub-agent's output summary, including branch name if changes were made.
@@ -1042,6 +1158,7 @@ async def delegate(
         model=model,
         parent_hooks=ctx.deps.hook_registry,
         mcp_servers=ctx.deps.mcp_servers,
+        agent_type=agent_type,
     )
     if not result.success:
         raise ModelRetry(f"Sub-agent failed: {result.output}")

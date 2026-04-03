@@ -21,13 +21,13 @@ from forge.agent.permissions import PermissionPolicy
 class TestPlanOverlay:
     """Test the planning system prompt."""
 
-    def test_plan_overlay_disables_tools(self):
-        assert "Do NOT execute any actions" in PLAN_OVERLAY
+    def test_plan_overlay_restricts_writes(self):
+        assert "read-only" in PLAN_OVERLAY.lower() or "Do NOT use write_file" in PLAN_OVERLAY
         assert "Do NOT" in PLAN_OVERLAY or "do NOT" in PLAN_OVERLAY
 
     def test_plan_overlay_requests_structure(self):
         assert "Steps" in PLAN_OVERLAY
-        assert "Files" in PLAN_OVERLAY
+        assert "Context" in PLAN_OVERLAY
         assert "Goal" in PLAN_OVERLAY
 
 
@@ -88,6 +88,10 @@ class TestRunWithStatus:
             captured_tracker = kwargs["deps"].status_tracker
             result = MagicMock()
             result.all_messages.return_value = []
+            usage = MagicMock()
+            usage.input_tokens = 0
+            usage.output_tokens = 0
+            result.usage.return_value = usage
             return result
 
         agent = MagicMock()
@@ -111,6 +115,10 @@ class TestRunWithStatus:
         async def mock_run(prompt, **kwargs):
             result = MagicMock()
             result.all_messages.return_value = expected_messages
+            usage = MagicMock()
+            usage.input_tokens = 0
+            usage.output_tokens = 0
+            result.usage.return_value = usage
             return result
 
         agent = MagicMock()
@@ -146,6 +154,10 @@ class TestRunWithStatus:
         async def mock_run(prompt, **kwargs):
             result = MagicMock()
             result.all_messages.return_value = []
+            usage = MagicMock()
+            usage.input_tokens = 100
+            usage.output_tokens = 50
+            result.usage.return_value = usage
             return result
 
         agent = MagicMock()

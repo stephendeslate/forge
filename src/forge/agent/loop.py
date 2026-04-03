@@ -150,6 +150,7 @@ async def _run_with_status(
     deps: AgentDeps,
     message_history: list[ModelMessage] | None,
     turn_number: int = 0,
+    model_override: str | None = None,
 ) -> list[ModelMessage]:
     """Run agent with status tracker lifecycle management.
 
@@ -191,10 +192,18 @@ async def _run_with_status(
             event_stream_handler=render_events,
             usage_limits=UsageLimits(request_limit=settings.agent.request_limit),
         )
-        if deps.model_override:
+        if model_override:
+            run_kwargs["model"] = model_override  # Already fully qualified (e.g., "google-gla:gemini-2.5-pro")
+        elif deps.model_override:
             run_kwargs["model"] = f"ollama:{deps.model_override}"
 
-        result = await agent.run(prompt, **run_kwargs)
+        from forge.models.retry import with_retry
+
+        result = await with_retry(
+            lambda: agent.run(prompt, **run_kwargs),
+            max_retries=settings.ollama.max_retries,
+            backoff_base=settings.ollama.retry_backoff_base,
+        )
         # Capture real token counts from Ollama API response
         try:
             usage = result.usage()
@@ -270,12 +279,28 @@ async def _plan_and_execute(
     if deps.cwd:
         plan_system += "\n\n" + build_project_context(deps.cwd)
 
+    from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string, is_gemini_available
+
+    if is_gemini_available(deps):
+        gemini_model = get_gemini_model_string()
+        if gemini_model:
+            plan_model = gemini_model
+            plan_model_settings = get_gemini_model_settings()
+            console.print("[yellow dim]Using cloud reasoning for planning (Gemini)...[/yellow dim]")
+        else:
+            plan_model = f"ollama:{settings.ollama.heavy_model}"
+            plan_model_settings = _model_settings(num_ctx=65536)
+            console.print("[dim]Gemini unavailable, falling back to local model...[/dim]")
+    else:
+        plan_model = f"ollama:{settings.ollama.heavy_model}"
+        plan_model_settings = _model_settings(num_ctx=65536)
+
     plan_agent: Agent[AgentDeps, str] = Agent(
-        model=f"ollama:{settings.ollama.heavy_model}",
+        model=plan_model,
         instructions=plan_system,
         tools=READ_ONLY_TOOLS,
         deps_type=AgentDeps,
-        model_settings=_model_settings(num_ctx=65536),
+        model_settings=plan_model_settings,
     )
 
     console.print("[dim]Exploring codebase and planning...[/dim]")
@@ -400,10 +425,12 @@ async def agent_repl(
         setup_persistence,
         setup_rag,
         setup_worktree,
+        wire_critique_hooks,
         wire_dynamic_prompts,
         wire_lint_hooks,
         wire_rag_hooks,
         wire_syntax_hooks,
+        wire_test_hooks,
     )
 
     console = Console()
@@ -420,6 +447,7 @@ async def agent_repl(
         console=console,
         permission=permission or PermissionPolicy.AUTO,
         worktree=worktree_info,
+        cloud_reasoning_enabled=settings.gemini.enabled,
     )
 
     hook_registry = HookRegistry()
@@ -469,6 +497,8 @@ async def agent_repl(
     wire_dynamic_prompts(agent, deps)
     wire_syntax_hooks(hook_registry, deps)
     wire_lint_hooks(hook_registry, deps)
+    wire_test_hooks(hook_registry, deps)
+    wire_critique_hooks(hook_registry, deps)
 
     if rag_available and db:
         wire_rag_hooks(hook_registry, deps, db, rag_project_name)
@@ -558,7 +588,7 @@ async def agent_repl(
                 except Exception:
                     logger.debug("Title update failed", exc_info=True)
         except Exception as e:
-            _handle_agent_error(console, e)
+            _handle_agent_error(console, e, deps=deps)
 
     # --- REPL loop ---
     title_set = initial_prompt is not None
@@ -609,7 +639,11 @@ async def agent_repl(
             # Auto-compact if history is getting large
             budget = settings.agent.token_budget
             if message_history and len(message_history) > 40:
-                _, tokens = count_messages_tokens(message_history)
+                # Prefer real token count from last Ollama response over estimation
+                if deps._last_prompt_eval_count > 0:
+                    tokens = deps._last_prompt_eval_count
+                else:
+                    _, tokens = count_messages_tokens(message_history)
                 if tokens > budget * settings.agent.compaction_threshold:
                     before = len(message_history)
                     message_history = await smart_compact_history(message_history, budget)
@@ -662,7 +696,20 @@ async def agent_repl(
             except KeyboardInterrupt:
                 console.print("\n[dim]Interrupted.[/dim]")
             except Exception as e:
-                _handle_agent_error(console, e)
+                _handle_agent_error(console, e, deps=deps)
+
+                # Gemini recovery: retry with fresh cloud agent (no history leak)
+                if deps._gemini_recovery_pending:
+                    deps._gemini_recovery_pending = False
+                    recovery_result = await _cloud_recovery(
+                        user_input, deps, console, turn_counter,
+                    )
+                    if recovery_result is not None:
+                        # Append recovery exchange to main history
+                        if message_history is None:
+                            message_history = recovery_result
+                        else:
+                            message_history.extend(recovery_result)
     finally:
         await cleanup(
             deps, hook_registry, mcp_stack, db, session_id, message_history, console,
@@ -700,13 +747,94 @@ async def _connect_db():
         return None
 
 
-def _handle_agent_error(console: Console, e: Exception) -> None:
+async def _cloud_recovery(
+    user_input: str,
+    deps: AgentDeps,
+    console: Console,
+    turn_number: int,
+) -> list[ModelMessage] | None:
+    """Attempt cloud recovery after circuit breaker trip.
+
+    Uses a fresh agent (no conversation history, no dynamic prompts) to avoid
+    leaking session context to the cloud API. Tries primary model first,
+    falls back to fallback model on failure.
+
+    Returns recovery messages to append to history, or None on failure.
+    """
+    from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string
+
+    # Reset circuit breaker for the retry
+    if deps.circuit_breaker:
+        deps.circuit_breaker.reset_state()
+
+    recovery_prompt = (
+        f"The previous attempt with a local model got stuck in a loop. "
+        f"Here's what was requested: {user_input}\n\n"
+        f"Take a fresh approach. Think carefully and solve this step by step."
+    )
+
+    # Build a fresh agent — no history, no dynamic prompt injections
+    from forge.core.project import build_project_context
+
+    recovery_system = AGENT_SYSTEM
+    if deps.cwd:
+        recovery_system += "\n\n" + build_project_context(deps.cwd)
+
+    models_to_try = [
+        (get_gemini_model_string(fallback=False), "primary"),
+        (get_gemini_model_string(fallback=True), "fallback"),
+    ]
+    # Deduplicate if primary == fallback
+    seen = set()
+    unique_models = []
+    for m, label in models_to_try:
+        if m and m not in seen:
+            seen.add(m)
+            unique_models.append((m, label))
+
+    for model_str, label in unique_models:
+        try:
+            recovery_agent: Agent[AgentDeps, str] = Agent(
+                model=model_str,
+                instructions=recovery_system,
+                tools=ALL_TOOLS,
+                deps_type=AgentDeps,
+                model_settings=get_gemini_model_settings(),
+                retries=3,
+            )
+            result = await _run_with_status(
+                recovery_agent, recovery_prompt, deps, None,
+                turn_number=turn_number,
+            )
+            return result
+        except Exception as exc:
+            if label == "primary" and len(unique_models) > 1:
+                console.print(
+                    f"[yellow]Cloud recovery ({label}) failed: {exc}[/yellow]\n"
+                    f"[yellow]Trying fallback model...[/yellow]"
+                )
+            else:
+                console.print(f"[red]Cloud recovery failed:[/red] {exc}")
+
+    return None
+
+
+def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None = None) -> None:
     """Print a user-friendly agent error message."""
     from pydantic_ai.exceptions import UsageLimitExceeded
 
     from forge.agent.circuit_breaker import CircuitBreakerTripped
 
     if isinstance(e, CircuitBreakerTripped):
+        if deps:
+            from forge.agent.gemini import is_gemini_available
+            if is_gemini_available(deps):
+                console.print(
+                    f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
+                    "[yellow]Escalating to cloud reasoning (Gemini) for recovery...[/yellow]"
+                )
+                deps._gemini_recovery_pending = True
+                return
         console.print(
             f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
             "The model was stuck in a loop. Try rephrasing your request "

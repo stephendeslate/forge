@@ -11,6 +11,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
+from rich.syntax import Syntax
 from rich.text import Text
 
 from pydantic_ai import RunContext
@@ -33,9 +34,40 @@ _SAFE_TOOLS = {"read_file", "search_code", "list_files"}
 _WRITE_TOOLS = {"write_file", "edit_file"}
 _EXEC_TOOLS = {"run_command"}
 
+# Read-only tools get compact result display
+_READ_TOOLS = {"read_file", "search_code", "list_files"}
+
+# Diff-producing tools get syntax-highlighted results
+_DIFF_TOOLS = {"edit_file"}
+
 # Regex to strip <think>...</think> blocks (possibly incomplete at stream end)
 _THINK_OPEN = re.compile(r"<think>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+
+
+def _find_safe_boundary(text: str) -> int:
+    """Find a safe markdown boundary to render up to, avoiding mid-block splits.
+
+    Returns the index up to which it's safe to render, or 0 to wait for more data.
+    """
+    if text.endswith("\n"):
+        return len(text)
+
+    # Prefer paragraph boundary
+    pp = text.rfind("\n\n")
+    if pp >= 0:
+        return pp + 2
+
+    # Fall back to line boundary
+    nl = text.rfind("\n")
+    if nl >= 0:
+        return nl + 1
+
+    # If no newlines but very long, flush anyway to prevent stalls
+    if len(text) > 200:
+        return len(text)
+
+    return 0
 
 
 def _tool_style(tool_name: str) -> str:
@@ -76,6 +108,60 @@ def _truncate(text: str, max_len: int = 500) -> str:
     from forge.agent.utils import head_tail_truncate
 
     return head_tail_truncate(text, max_len)
+
+
+def _extract_diff_block(text: str) -> str | None:
+    """Extract unified diff content from markdown fenced diff blocks."""
+    # Match ```diff\n...\n``` blocks produced by edit_file
+    m = re.search(r"```diff\n(.*?)\n```", text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _format_result_renderable(
+    content_str: str, tool_name: str, result_style: str
+) -> Panel:
+    """Build a result panel with tool-aware formatting.
+
+    - edit_file results: extract diff and render with syntax highlighting
+    - read-only tool results: compact display with dimmer border
+    """
+    from rich.console import Group
+
+    # For diff-producing tools, render the diff with syntax highlighting
+    if tool_name in _DIFF_TOOLS:
+        diff_text = _extract_diff_block(content_str)
+        if diff_text:
+            parts = []
+            # Show any text before the diff block
+            before = content_str.split("```diff\n", 1)[0].strip()
+            if before:
+                parts.append(Text(before, style="dim"))
+            parts.append(
+                Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+            )
+            return Panel(
+                Group(*parts) if len(parts) > 1 else parts[0],
+                title="[dim]result[/dim]",
+                border_style=result_style,
+                padding=(0, 1),
+            )
+
+    # For read-only tools, use a dimmer compact style
+    if tool_name in _READ_TOOLS:
+        return Panel(
+            Text(content_str, style="dim"),
+            title=f"[dim]{tool_name} result[/dim]",
+            border_style="dim green",
+            padding=(0, 1),
+        )
+
+    # Default: plain text result
+    return Panel(
+        Text(content_str, style="dim"),
+        title="[dim]result[/dim]",
+        border_style=result_style,
+        padding=(0, 1),
+    )
 
 
 def _split_thinking(raw: str) -> tuple[str, str]:
@@ -124,6 +210,7 @@ async def render_events(
     thinking_live: Live | None = None
     tool_call_count = 0
     has_thinking = False
+    last_tool_name: str = ""
 
     def _stop_thinking_spinner() -> None:
         nonlocal thinking_live
@@ -207,9 +294,17 @@ async def render_events(
                         has_thinking = True
 
                     if live is not None:
-                        visible = _render_text_with_thinking(
-                            raw, console, has_thinking
-                        )
+                        # Use safe boundary to avoid mid-markdown rendering artifacts
+                        if has_thinking:
+                            visible = _render_text_with_thinking(
+                                raw, console, has_thinking
+                            )
+                        else:
+                            safe_end = _find_safe_boundary(raw)
+                            if safe_end > 0:
+                                visible = Markdown(raw[:safe_end])
+                            else:
+                                visible = Markdown(raw)
                         live.update(visible)
 
             elif event.event_kind == "function_tool_call":
@@ -222,6 +317,7 @@ async def render_events(
                 _finalize_live()
 
                 tool_name = event.part.tool_name
+                last_tool_name = tool_name
                 style = _tool_style(tool_name)
                 args_str = _format_tool_args(event.part.args)
 
@@ -262,15 +358,18 @@ async def render_events(
                 assert isinstance(event, FunctionToolResultEvent)
                 content = event.result.content if hasattr(event.result, "content") else str(event.result)
                 content_str = str(content) if content else "(no output)"
-                content_str = _truncate(content_str)
                 outcome = getattr(event.result, "outcome", "success")
                 result_style = "dim green" if outcome == "success" else "dim red"
 
-                result_panel = Panel(
-                    Text(content_str, style="dim"),
-                    title="[dim]result[/dim]",
-                    border_style=result_style,
-                    padding=(0, 1),
+                # Get tool name from the result part or fall back to tracked name
+                result_tool_name = getattr(event.result, "tool_name", last_tool_name)
+
+                # For diff tools, use higher truncation limit to preserve diff fences
+                trunc_limit = 2000 if result_tool_name in _DIFF_TOOLS else 500
+                content_str = _truncate(content_str, trunc_limit)
+
+                result_panel = _format_result_renderable(
+                    content_str, result_tool_name, result_style
                 )
 
                 printed = False

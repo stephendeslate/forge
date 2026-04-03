@@ -126,6 +126,12 @@ class TaskStore:
         if active and active.active_form:
             lines.append(f"\nCurrently: {active.active_form}")
 
+        # Nudge verification when all tasks are done
+        if not self.list_open() and any(t.status == TaskStatus.COMPLETED for t in tasks):
+            lines.append(
+                "\n> All tasks marked complete. Consider verifying the changes work end-to-end before finishing."
+            )
+
         return "\n".join(lines)
 
     def to_json(self) -> str:

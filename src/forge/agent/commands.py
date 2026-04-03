@@ -23,6 +23,17 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
+def _suggest_commands(cmd_name: str, commands: dict[str, CommandHandler]) -> str:
+    """Suggest similar commands using fuzzy matching."""
+    import difflib
+
+    matches = difflib.get_close_matches(cmd_name, commands.keys(), n=3, cutoff=0.6)
+    if matches:
+        suggestions = ", ".join(matches)
+        return f"Did you mean: {suggestions}?"
+    return "Type /help for available commands."
+
 _UNCHANGED = object()  # sentinel — None is valid for message_history
 
 
@@ -140,6 +151,32 @@ async def cmd_think(ctx: CommandContext, args: str) -> CommandResult:
     ctx.deps.thinking_enabled = not ctx.deps.thinking_enabled
     state = "on" if ctx.deps.thinking_enabled else "off"
     ctx.console.print(f"[dim]Extended thinking: {state}[/dim]")
+    return CommandResult()
+
+
+async def cmd_cloud(ctx: CommandContext, args: str) -> CommandResult:
+    """Toggle cloud-based reasoning (Gemini 2.5 Pro)."""
+    import os
+
+    api_key = settings.gemini.api_key or os.environ.get("GOOGLE_API_KEY", "")
+    if not api_key and not ctx.deps.cloud_reasoning_enabled:
+        ctx.console.print(
+            "[red]No API key configured.[/red] Set GOOGLE_API_KEY env var "
+            "or add api_key to [gemini] in config.toml"
+        )
+        return CommandResult()
+
+    ctx.deps.cloud_reasoning_enabled = not ctx.deps.cloud_reasoning_enabled
+    state = "on" if ctx.deps.cloud_reasoning_enabled else "off"
+    if ctx.deps.cloud_reasoning_enabled:
+        ctx.console.print(
+            f"[yellow]Cloud reasoning: {state}[/yellow]\n"
+            f"[dim]Model: {settings.gemini.model} (fallback: {settings.gemini.fallback_model}) | "
+            f"Used for: /plan, circuit-breaker escalation\n"
+            f"Warning: Prompts and code context will be sent to Google's API[/dim]"
+        )
+    else:
+        ctx.console.print(f"[dim]Cloud reasoning: {state} — all processing is local[/dim]")
     return CommandResult()
 
 
@@ -318,6 +355,7 @@ async def cmd_help(ctx: CommandContext, args: str) -> CommandResult:
             "/status        — toggle status line (or Ctrl-O)\n"
             "/tools         — toggle tool result display (or Ctrl-R)\n"
             "/think         — toggle extended thinking on/off\n"
+            "/cloud         — toggle cloud reasoning (Gemini 2.5 Pro)\n"
             "/plan          — plan before executing (e.g. /plan refactor X)\n"
             "/plan-status   — show active plan\n"
             "/tasks         — show task list\n"
@@ -535,6 +573,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "/messages": cmd_messages,
     "/status": cmd_status,
     "/think": cmd_think,
+    "/cloud": cmd_cloud,
     "/plan": cmd_plan,
     "/tools": cmd_tools,
     "/model": cmd_model,
@@ -565,7 +604,8 @@ async def dispatch(cmd_ctx: CommandContext, user_input: str) -> CommandResult | 
 
     handler = COMMANDS.get(cmd_name)
     if handler is None:
-        cmd_ctx.console.print(f"[dim]Unknown command: {cmd_name}[/dim]")
+        hint = _suggest_commands(cmd_name, COMMANDS)
+        cmd_ctx.console.print(f"[dim]Unknown command: {cmd_name}. {hint}[/dim]")
         return CommandResult()  # handled (as unknown), but no state change
 
     return await handler(cmd_ctx, args)

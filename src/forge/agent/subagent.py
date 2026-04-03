@@ -42,6 +42,22 @@ SUBAGENT_TOOLS: list[Tool] = [
     Tool(run_command, sequential=True),
 ]
 
+# Per-type tool profiles for sub-agents
+SUBAGENT_TOOL_PROFILES: dict[str, list[Tool]] = {
+    "coder": SUBAGENT_TOOLS,
+    "research": [
+        Tool(read_file),
+        Tool(search_code),
+        Tool(list_files),
+    ],
+    "reviewer": [
+        Tool(read_file),
+        Tool(search_code),
+        Tool(list_files),
+        Tool(run_command, sequential=True),
+    ],
+}
+
 SUBAGENT_SYSTEM = """\
 You are a focused coding sub-agent. You have been delegated a specific task.
 
@@ -211,6 +227,7 @@ async def run_subagent(
     system: str = SUBAGENT_SYSTEM,
     parent_hooks: HookRegistry | None = None,
     mcp_servers: list | None = None,
+    agent_type: str = "coder",
 ) -> SubagentResult:
     """Spawn a sub-agent to handle a contained task.
 
@@ -258,10 +275,11 @@ async def run_subagent(
 
     # Create sub-agent with limited tools and permissive policy
     from forge.models.ollama import _model_settings
+    tools = SUBAGENT_TOOL_PROFILES.get(agent_type, SUBAGENT_TOOLS)
     agent: Agent[AgentDeps, str] = Agent(
         model=f"ollama:{model_name}",
         instructions=full_system,
-        tools=SUBAGENT_TOOLS,
+        tools=tools,
         toolsets=mcp_servers or [],
         deps_type=AgentDeps,
         model_settings=_model_settings(timeout=int(timeout), num_ctx=min(settings.agent.num_ctx, 32768)),
@@ -285,8 +303,14 @@ async def run_subagent(
     )
 
     try:
+        from forge.models.retry import with_retry
+
         result = await asyncio.wait_for(
-            agent.run(task, deps=deps),
+            with_retry(
+                lambda: agent.run(task, deps=deps),
+                max_retries=settings.ollama.max_retries,
+                backoff_base=settings.ollama.retry_backoff_base,
+            ),
             timeout=timeout,
         )
         return SubagentResult(
@@ -320,6 +344,7 @@ async def run_subagent_and_merge(
     parent_hooks: HookRegistry | None = None,
     auto_merge: bool = True,
     mcp_servers: list | None = None,
+    agent_type: str = "coder",
 ) -> SubagentResult:
     """Run a sub-agent in a worktree, validate output, and optionally merge.
 
@@ -338,6 +363,7 @@ async def run_subagent_and_merge(
     result = await run_subagent(
         task, cwd, model=model, isolate=True, timeout=timeout,
         parent_hooks=parent_hooks, mcp_servers=mcp_servers,
+        agent_type=agent_type,
     )
 
     # Validate output for error indicators
@@ -412,6 +438,7 @@ async def run_subagents_parallel(
     parent_hooks: HookRegistry | None = None,
     mcp_servers: list | None = None,
     max_concurrent: int = 4,
+    agent_type: str = "coder",
 ) -> list[SubagentResult]:
     """Run multiple sub-agents concurrently, respecting max_concurrent.
 
@@ -429,6 +456,7 @@ async def run_subagents_parallel(
                 timeout=timeout,
                 parent_hooks=parent_hooks,
                 mcp_servers=mcp_servers,
+                agent_type=agent_type,
             )
 
     return list(await asyncio.gather(*[_run_one(t) for t in tasks]))

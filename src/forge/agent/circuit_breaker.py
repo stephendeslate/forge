@@ -202,6 +202,38 @@ class ToolCallTracker:
         return False
 
 
+def _build_diagnostic(reason: str, deps: AgentDeps) -> str:
+    """Build a context-aware diagnostic message for circuit breaker warnings."""
+    parts = [f"You appear stuck in a loop ({reason})."]
+
+    # Check if test failures exist — that's likely the root cause
+    if deps.test_results:
+        parts.append(
+            "Tests are failing. Read the error output in the system prompt and fix the root cause "
+            "instead of retrying the same approach."
+        )
+    elif "identical" in reason:
+        # Extract tool name from reason like "called X with identical arguments"
+        parts.append(
+            "You're repeating the same tool call. The approach isn't working — "
+            "try reading the file first to understand the current state, or use a different strategy."
+        )
+    elif "oscillating" in reason:
+        parts.append(
+            "You're alternating between two approaches. Step back and reason about "
+            "what's actually wrong before trying again."
+        )
+    elif "failed" in reason:
+        parts.append(
+            "The same tool keeps failing. Read the error messages carefully and "
+            "try a fundamentally different approach."
+        )
+    else:
+        parts.append("Try a completely different approach, or ask the user for guidance.")
+
+    return " ".join(parts)
+
+
 def wire_circuit_breaker(
     tracker: ToolCallTracker,
     deps: AgentDeps,
@@ -262,12 +294,12 @@ def wire_circuit_breaker(
                 raise _TripEscalation(
                     f"Circuit breaker tripped: {tracker.trip_reason}"
                 )
+            # Build diagnostic message based on loop type
+            reason = tracker.trip_reason or "repeated pattern detected"
+            diagnostic = _build_diagnostic(reason, deps)
             return HookResult(
                 action=HookAction.BLOCK,
-                message=(
-                    f"You appear stuck in a loop ({tracker.trip_reason or 'repeated pattern detected'}). "
-                    "Try a completely different approach, or ask the user for guidance."
-                ),
+                message=diagnostic,
             )
         return HookResult()
 

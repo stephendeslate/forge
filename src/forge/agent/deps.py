@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -65,7 +66,19 @@ class AgentDeps:
     # Syntax/lint feedback injection
     _post_tool_feedback: str | None = None
     lint_results: str | None = None
+    # Test-driven self-correction
+    test_results: str | None = None
+    test_command: str | None = None
+    _test_command_searched: bool = False
+    _files_modified_this_turn: list[str] = field(default_factory=list)
+    # Critique-before-commit
+    critique_results: str | None = None
+    # Cloud reasoning (Gemini)
+    cloud_reasoning_enabled: bool = False
+    _gemini_recovery_pending: bool = False
     # Write escalation flag (set by sandbox write detector for sed -i, etc.)
     _write_escalated: bool = False
     # Prompt cache monitoring
     _last_prompt_eval_count: int = 0
+    # Background processes (auto-backgrounded long commands)
+    _background_procs: dict[int, tuple[asyncio.Task, asyncio.subprocess.Process]] = field(default_factory=dict)

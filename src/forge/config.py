@@ -24,6 +24,18 @@ class OllamaSettings(BaseSettings):
     fast_model: str = "qwen3.5:4b"
     embed_model: str = "nomic-embed-text-v2-moe"
     vision_model: str = ""
+    max_retries: int = Field(default=3, description="Max retries on transient connection errors")
+    retry_backoff_base: float = Field(default=1.0, description="Base delay for exponential backoff (seconds)")
+
+
+class GeminiSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FORGE_GEMINI_")
+
+    enabled: bool = Field(default=False, description="Enable cloud reasoning via Gemini 2.5 Pro (uses internet)")
+    model: str = Field(default="gemini-2.5-pro", description="Gemini model name")
+    fallback_model: str = Field(default="gemini-2.0-flash", description="Fallback model if primary fails")
+    api_key: str = Field(default="", description="Google AI Studio API key (or set GOOGLE_API_KEY env var)")
+    timeout: int = Field(default=120, description="Request timeout in seconds")
 
 
 class NPUSettings(BaseSettings):
@@ -96,6 +108,19 @@ class AgentSettings(BaseSettings):
     auto_escalation: bool = Field(default=True, description="Auto-escalate from fast to heavy on trouble")
     escalation_threshold: float = Field(default=5.0, description="Cumulative signal weight to trigger escalation")
 
+    # Test-driven self-correction
+    test_enabled: bool = Field(default=True, description="Auto-run tests after file writes")
+    test_timeout: float = Field(default=30.0, description="Test runner timeout (seconds)")
+    test_min_writes: int = Field(default=1, description="Min file writes before triggering tests")
+
+    # Critique-before-commit
+    critique_enabled: bool = Field(default=True, description="Auto-critique after multi-file changes")
+    critique_min_writes: int = Field(default=2, description="Min file writes to trigger critique")
+    critique_max_diff_chars: int = Field(default=8000, description="Max diff size fed to critique model")
+
+    # Post-session memory summary
+    session_memory_threshold: int = Field(default=10, description="Min messages before showing session memory summary")
+
 
 DEFAULT_BLOCKED_PATTERNS = [
     r"\brm\s+(-[rfv]*\s+)?/",          # rm -rf /
@@ -152,6 +177,7 @@ class Settings(BaseSettings):
     persist_history: bool = Field(default=True, description="Persist conversations to PostgreSQL")
 
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
+    gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     npu: NPUSettings = Field(default_factory=NPUSettings)
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)

@@ -18,6 +18,7 @@ from forge.agent.hooks import (
     HookRegistry,
     PostToolUse,
     TurnEnd,
+    TurnStart,
 )
 from forge.agent.permissions import PermissionPolicy
 from forge.agent.task_store import TaskStore
@@ -246,7 +247,7 @@ def build_agent_with_tools(
 
 
 def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
-    """Register dynamic system prompt injectors for tasks and memory."""
+    """Register dynamic system prompt injectors for tasks, memory, tests, and critique."""
 
     @agent.system_prompt
     async def _inject_tasks(ctx: RunContext[AgentDeps]) -> str:
@@ -260,6 +261,25 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
             results = ctx.deps.lint_results
             ctx.deps.lint_results = None  # Clear after injection
             return f"## Lint issues from previous turn\n```\n{results}\n```\nFix these before proceeding."
+        return ""
+
+    @agent.system_prompt
+    async def _inject_test_results(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps.test_results:
+            results = ctx.deps.test_results
+            ctx.deps.test_results = None  # Clear after injection
+            return (
+                f"\n\n⚠️ TEST FAILURES from your recent changes:\n```\n{results}\n```\n"
+                "Fix these failures before making more changes."
+            )
+        return ""
+
+    @agent.system_prompt
+    async def _inject_critique(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps.critique_results:
+            results = ctx.deps.critique_results
+            ctx.deps.critique_results = None  # One-shot injection
+            return f"\n\n🔍 AUTO-REVIEW of your recent changes:\n{results}\nAddress these issues."
         return ""
 
     @agent.system_prompt
@@ -324,6 +344,248 @@ def wire_lint_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
 
     hook_registry.on(PostToolUse, _track_writes, priority=15)
     hook_registry.on(TurnEnd, _run_lint, priority=20)
+
+
+def wire_test_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
+    """Register test-driven self-correction hooks.
+
+    Tracks files modified during a turn via PostToolUse. At TurnEnd, auto-detects
+    and runs the test command. Failures are stored on deps for injection into the
+    next turn's system prompt.
+    """
+
+    async def _track_modified_files(event: PostToolUse) -> None:
+        if event.tool_name in ("write_file", "edit_file"):
+            file_path = event.args.get("file_path", "")
+            if file_path:
+                p = Path(file_path)
+                if not p.is_absolute():
+                    p = (deps.cwd / p).resolve()
+                deps._files_modified_this_turn.append(str(p))
+        elif event.tool_name == "run_command":
+            # Detect commands that write files (redirects, tee, etc.)
+            cmd = event.args.get("command", "")
+            if any(ind in cmd for ind in (">", "tee ", "mv ", "cp ", "sed -i")):
+                deps._files_modified_this_turn.append(f"__cmd_write:{cmd[:80]}")
+
+    async def _run_tests(event: TurnEnd) -> None:
+        if not settings.agent.test_enabled:
+            return
+        if len(deps._files_modified_this_turn) < settings.agent.test_min_writes:
+            return
+
+        test_cmd = await _detect_test_command(deps)
+        if not test_cmd:
+            return
+
+        # Scope tests to modified files where possible
+        real_files = [
+            f for f in deps._files_modified_this_turn
+            if not f.startswith("__cmd_write:")
+        ]
+        scoped_cmd = _scope_test_command(test_cmd, real_files)
+
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                scoped_cmd,
+                capture_output=True,
+                text=True,
+                timeout=settings.agent.test_timeout,
+                cwd=str(deps.cwd),
+                shell=True,
+            )
+            if result.returncode != 0:
+                output = (result.stdout + "\n" + result.stderr).strip()
+                # Truncate to avoid bloating context
+                if len(output) > 3000:
+                    output = output[:1500] + "\n...(truncated)...\n" + output[-1500:]
+                deps.test_results = output
+                logger.info("Test failures detected after file modifications")
+        except subprocess.TimeoutExpired:
+            deps.test_results = f"Tests timed out after {settings.agent.test_timeout}s"
+        except FileNotFoundError:
+            pass  # test runner not installed
+
+    async def _clear_modified_files_turn_end(event: TurnEnd) -> None:
+        """Clear modified files list at end of turn, after all hooks have read it."""
+        deps._files_modified_this_turn.clear()
+
+    async def _clear_modified_files_turn_start(event: TurnStart) -> None:
+        deps._files_modified_this_turn.clear()
+
+    hook_registry.on(PostToolUse, _track_modified_files, priority=25)
+    hook_registry.on(TurnEnd, _run_tests, priority=25)
+    # Clear at priority 50 — after test (25) and critique (30) have both read the list
+    hook_registry.on(TurnEnd, _clear_modified_files_turn_end, priority=50)
+    hook_registry.on(TurnStart, _clear_modified_files_turn_start, priority=0)
+
+
+async def _detect_test_command(deps: AgentDeps) -> str | None:
+    """Auto-detect the test command for the project. Caches result."""
+    if deps.test_command is not None:
+        return deps.test_command
+    if deps._test_command_searched:
+        return None
+
+    deps._test_command_searched = True
+    cwd = deps.cwd
+
+    # Check for common test runners
+    if (cwd / "pyproject.toml").exists() or (cwd / "pytest.ini").exists() or (cwd / "setup.cfg").exists():
+        # Prefer uv if uv.lock exists (uv-managed project)
+        if (cwd / "uv.lock").exists():
+            deps.test_command = "uv run pytest -x -q --tb=short --no-header"
+        else:
+            deps.test_command = "python -m pytest -x -q --tb=short --no-header"
+        return deps.test_command
+    if (cwd / "package.json").exists():
+        deps.test_command = "npm test"
+        return deps.test_command
+    if (cwd / "Cargo.toml").exists():
+        deps.test_command = "cargo test"
+        return deps.test_command
+    if (cwd / "go.mod").exists():
+        deps.test_command = "go test ./..."
+        return deps.test_command
+
+    return None
+
+
+def _scope_test_command(base_cmd: str, modified_files: list[str]) -> str:
+    """Scope test command to modified files where possible."""
+    if not modified_files:
+        return base_cmd
+
+    # For pytest, pass test files or related test files
+    if "pytest" in base_cmd:
+        test_files = []
+        for f in modified_files:
+            p = Path(f)
+            if p.name.startswith("test_") or p.name.endswith("_test.py"):
+                test_files.append(f)
+            elif p.suffix == ".py":
+                test_name = f"test_{p.name}"
+                # Check sibling
+                sibling = p.parent / test_name
+                if sibling.exists():
+                    test_files.append(str(sibling))
+                # Walk upward to find project-level tests/ directories
+                for ancestor in p.parents:
+                    for tests_dir in ("tests", "test", "tests/unit", "tests/integration"):
+                        candidate = ancestor / tests_dir / test_name
+                        if candidate.exists():
+                            test_files.append(str(candidate))
+                    # Stop at project root indicators
+                    if any((ancestor / marker).exists() for marker in ("pyproject.toml", "setup.py", ".git")):
+                        break
+        if test_files:
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            unique = []
+            for tf in test_files:
+                if tf not in seen:
+                    seen.add(tf)
+                    unique.append(tf)
+            return f"{base_cmd} {' '.join(unique)}"
+
+    return base_cmd
+
+
+def wire_critique_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
+    """Register critique-before-commit hooks.
+
+    At turn end, if 2+ files were modified, generates a diff and sends it to
+    the fast model for review. Issues are stored on deps for injection into
+    the next turn's system prompt.
+    """
+
+    async def _run_critique(event: TurnEnd) -> None:
+        if not settings.agent.critique_enabled:
+            return
+        # Only critique multi-file changes
+        real_files = [
+            f for f in deps._files_modified_this_turn
+            if not f.startswith("__cmd_write:")
+        ]
+        if len(real_files) < settings.agent.critique_min_writes:
+            return
+
+        # Generate diff of changes
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["git", "diff", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(deps.cwd),
+            )
+            diff_text = result.stdout.strip()
+            if not diff_text:
+                # Try unstaged diff
+                result = subprocess.run(
+                    ["git", "diff"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(deps.cwd),
+                )
+                diff_text = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
+
+        if not diff_text:
+            return
+
+        # Truncate diff
+        max_chars = settings.agent.critique_max_diff_chars
+        if len(diff_text) > max_chars:
+            diff_text = diff_text[:max_chars] + "\n... (diff truncated)"
+
+        # Send to fast model for critique
+        critique = await _call_critique_model(diff_text, deps)
+        if critique and "LGTM" not in critique.upper():
+            deps.critique_results = critique
+            logger.info("Critique found issues in multi-file changes")
+
+    hook_registry.on(TurnEnd, _run_critique, priority=30)
+
+
+async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
+    """Send diff to the fast model with CRITIQUE_SYSTEM prompt."""
+    import httpx
+
+    from forge.prompts.refine import CRITIQUE_SYSTEM
+
+    fast_model = settings.ollama.fast_model
+    base_url = settings.ollama.base_url
+
+    prompt = f"Review this code diff:\n\n```diff\n{diff_text}\n```"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": fast_model,
+                    "messages": [
+                        {"role": "system", "content": CRITIQUE_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                    "options": {"num_ctx": 8192},
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("message", {}).get("content", "")
+    except Exception:
+        logger.debug("Critique model call failed", exc_info=True)
+
+    return None
 
 
 def wire_syntax_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
@@ -422,6 +684,7 @@ def print_welcome(
     rag_info = " | [green]RAG indexed[/green]" if rag_available else ""
     memory_info = f" | [green]{memory_count} memories[/green]" if memory_count else ""
     mcp_info = f" | [green]{len(mcp_servers)} MCP server(s)[/green]" if mcp_servers else ""
+    cloud_info = " | [yellow]cloud reasoning ON[/yellow]" if deps.cloud_reasoning_enabled else ""
 
     persist_info = f"\nSession: [dim]{session_id[:8]}…[/dim]" if db else ""
     worktree_banner = ""
@@ -439,7 +702,7 @@ def print_welcome(
             f"Model: [green]{active_model}[/green]\n"
             f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
             f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
-            f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}\n"
+            f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}{cloud_info}\n"
             f"Working directory: [dim]{deps.cwd}[/dim]"
             f"{worktree_banner}"
             f"{persist_info}\n"
@@ -465,6 +728,25 @@ async def cleanup(
 
     # Emit SessionEnd
     msg_count = len(message_history) if message_history else 0
+
+    # Post-session memory summary
+    if (
+        msg_count >= settings.agent.session_memory_threshold
+        and db
+        and deps.memory_db
+        and deps.memory_project
+    ):
+        try:
+            from forge.agent.memory import get_startup_memories
+
+            rows = await get_startup_memories(deps.memory_db, deps.memory_project, limit=5)
+            if rows:
+                console.print("[dim]Memories persisted this session:[/dim]")
+                for r in rows:
+                    console.print(f"  [dim][{r.category}] {r.subject}[/dim]")
+        except Exception:
+            logger.debug("Session memory summary failed", exc_info=True)
+
     await hook_registry.emit(SessionEnd(session_id=session_id, message_count=msg_count))
 
     # Close Ollama monitor
