@@ -902,6 +902,54 @@ async def delegate(
     return result.output
 
 
+async def delegate_parallel(
+    ctx: RunContext[AgentDeps],
+    tasks: list[str],
+    model: str | None = None,
+) -> str:
+    """Delegate multiple independent tasks to sub-agents running in parallel.
+
+    Each task runs in its own isolated git worktree. Use when tasks are
+    independent and don't modify the same files. Max 4 concurrent.
+
+    Args:
+        ctx: The run context.
+        tasks: List of task descriptions (2-4 tasks).
+        model: Optional model override.
+
+    Returns:
+        Combined summary of all sub-agent results.
+    """
+    if len(tasks) < 2:
+        raise ModelRetry("Use 'delegate' for single tasks. delegate_parallel requires 2+ tasks.")
+    if len(tasks) > 4:
+        raise ModelRetry("Max 4 parallel tasks. Split into batches if needed.")
+
+    from forge.agent.subagent import run_subagents_parallel
+
+    results = await run_subagents_parallel(
+        tasks=tasks,
+        cwd=ctx.deps.cwd,
+        model=model,
+        parent_hooks=ctx.deps.hook_registry,
+        mcp_servers=ctx.deps.mcp_servers,
+    )
+
+    parts = []
+    any_failed = False
+    for i, r in enumerate(results):
+        status = "OK" if r.success else "FAILED"
+        parts.append(f"### Task {i + 1} [{status}]\n{r.output}")
+        if not r.success:
+            any_failed = True
+
+    summary = "\n\n".join(parts)
+    if any_failed:
+        summary += "\n\n**Note:** Some tasks failed. Review above and retry individually if needed."
+    return summary
+
+
 DELEGATE_TOOLS: list[Tool] = [
     Tool(with_hooks(delegate), sequential=True),
+    Tool(with_hooks(delegate_parallel), sequential=True),
 ]

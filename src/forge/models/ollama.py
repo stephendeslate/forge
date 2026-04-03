@@ -14,7 +14,10 @@ from forge.config import settings
 def _model_settings(timeout: int = 300, num_ctx: int | None = None) -> ModelSettings:
     """Build ModelSettings with num_ctx passed through to Ollama via extra_body."""
     ctx = num_ctx or settings.agent.num_ctx
-    return ModelSettings(timeout=timeout, extra_body={"options": {"num_ctx": ctx}})
+    return ModelSettings(
+        timeout=timeout,
+        extra_body={"options": {"num_ctx": ctx}, "keep_alive": -1},
+    )
 
 
 # Legacy alias — callers that just need the default timeout + num_ctx
@@ -104,7 +107,7 @@ class OllamaMonitor:
         import httpx
 
         client = await self._client()
-        body: dict = {"model": model, "prompt": "", "stream": False}
+        body: dict = {"model": model, "prompt": "", "stream": False, "keep_alive": -1}
         if num_ctx:
             body["options"] = {"num_ctx": num_ctx}
         try:

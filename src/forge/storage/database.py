@@ -191,6 +191,46 @@ class Database:
             for r in rows
         ]
 
+    async def text_search(
+        self,
+        query: str,
+        project: str,
+        *,
+        limit: int = 20,
+    ) -> list[ChunkRow]:
+        """Full-text search using PostgreSQL tsvector/tsquery."""
+        rows = await self.pool.fetch(
+            """
+            SELECT id, project, file_path, chunk_type, name, content,
+                   start_line, end_line, token_count, file_hash,
+                   ts_rank(tsv, websearch_to_tsquery('english', $1)) AS score
+            FROM chunks
+            WHERE project = $2
+              AND tsv @@ websearch_to_tsquery('english', $1)
+            ORDER BY score DESC
+            LIMIT $3
+            """,
+            query,
+            project,
+            limit,
+        )
+        return [
+            ChunkRow(
+                id=r["id"],
+                project=r["project"],
+                file_path=r["file_path"],
+                chunk_type=r["chunk_type"],
+                name=r["name"],
+                content=r["content"],
+                start_line=r["start_line"],
+                end_line=r["end_line"],
+                token_count=r["token_count"],
+                file_hash=r["file_hash"],
+                score=r["score"],
+            )
+            for r in rows
+        ]
+
     # --- Session / conversation persistence ---
 
     async def create_session(self, session_id: str, mode: str = "chat", project: str | None = None) -> None:

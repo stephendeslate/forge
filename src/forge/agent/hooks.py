@@ -237,6 +237,13 @@ def with_hooks(fn: Callable) -> Callable:
                 result=result,
                 elapsed=elapsed,
             ))
+
+            # Check for post-tool feedback injected by hooks (e.g. syntax errors)
+            feedback = getattr(deps, "_post_tool_feedback", None)
+            if feedback and isinstance(result, str):
+                result = f"{result}\n\n{feedback}"
+                deps._post_tool_feedback = None
+
             return result
         except Exception as exc:
             # PostToolUseFailure (non-blocking)

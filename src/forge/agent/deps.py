@@ -62,3 +62,6 @@ class AgentDeps:
     escalator: ModelEscalator | None = None
     # MCP servers (for passing to sub-agents)
     mcp_servers: list | None = None
+    # Syntax/lint feedback injection
+    _post_tool_feedback: str | None = None
+    lint_results: str | None = None

@@ -364,7 +364,9 @@ async def agent_repl(
         setup_rag,
         setup_worktree,
         wire_dynamic_prompts,
+        wire_lint_hooks,
         wire_rag_hooks,
+        wire_syntax_hooks,
     )
 
     console = Console()
@@ -423,6 +425,8 @@ async def agent_repl(
         system, cwd, deps, rag_available, mcp_servers,
     )
     wire_dynamic_prompts(agent, deps)
+    wire_syntax_hooks(hook_registry, deps)
+    wire_lint_hooks(hook_registry, deps)
 
     if rag_available and db:
         wire_rag_hooks(hook_registry, deps, db, rag_project_name)

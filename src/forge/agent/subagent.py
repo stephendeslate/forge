@@ -401,3 +401,34 @@ async def run_subagent_and_merge(
         )
 
     return result
+
+
+async def run_subagents_parallel(
+    tasks: list[str],
+    cwd: Path,
+    *,
+    model: str | None = None,
+    timeout: float = 300.0,
+    parent_hooks: HookRegistry | None = None,
+    mcp_servers: list | None = None,
+    max_concurrent: int = 4,
+) -> list[SubagentResult]:
+    """Run multiple sub-agents concurrently, respecting max_concurrent.
+
+    Each sub-agent gets its own isolated worktree. Results are returned
+    in the same order as the input tasks list.
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _run_one(task: str) -> SubagentResult:
+        async with semaphore:
+            return await run_subagent_and_merge(
+                task=task,
+                cwd=cwd,
+                model=model,
+                timeout=timeout,
+                parent_hooks=parent_hooks,
+                mcp_servers=mcp_servers,
+            )
+
+    return list(await asyncio.gather(*[_run_one(t) for t in tasks]))

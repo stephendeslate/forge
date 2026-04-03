@@ -255,6 +255,14 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
         return ""
 
     @agent.system_prompt
+    async def _inject_lint(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps.lint_results:
+            results = ctx.deps.lint_results
+            ctx.deps.lint_results = None  # Clear after injection
+            return f"## Lint issues from previous turn\n```\n{results}\n```\nFix these before proceeding."
+        return ""
+
+    @agent.system_prompt
     async def _inject_memories(ctx: RunContext[AgentDeps]) -> str:
         if ctx.deps.memory_db and ctx.deps.memory_project:
             try:
@@ -271,6 +279,93 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
             except Exception:
                 logger.debug("Memory injection failed", exc_info=True)
         return ""
+
+
+def wire_lint_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
+    """Register turn-end background lint hook.
+
+    Tracks files modified during a turn via PostToolUse, then at TurnEnd
+    runs a fast lint pass (ruff check) in the background. Results are
+    stored on deps for injection into the next turn's context.
+    """
+    _pending_lint: set[Path] = set()
+
+    async def _track_writes(event: PostToolUse) -> None:
+        if event.tool_name in ("write_file", "edit_file"):
+            file_path = event.args.get("file_path", "")
+            if file_path.endswith(".py"):
+                p = Path(file_path)
+                if not p.is_absolute():
+                    p = (deps.cwd / p).resolve()
+                _pending_lint.add(p)
+
+    async def _run_lint(event: TurnEnd) -> None:
+        if not _pending_lint:
+            return
+        files = [str(p) for p in _pending_lint if p.exists()]
+        _pending_lint.clear()
+        if not files:
+            return
+
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["ruff", "check", "--no-fix", "--output-format=concise", *files],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(deps.cwd),
+            )
+            if result.stdout.strip():
+                deps.lint_results = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # ruff not installed or timed out — skip silently
+
+    hook_registry.on(PostToolUse, _track_writes, priority=15)
+    hook_registry.on(TurnEnd, _run_lint, priority=20)
+
+
+def wire_syntax_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
+    """Register post-write syntax check hooks.
+
+    After write_file/edit_file on Python files, runs py_compile to catch
+    syntax errors immediately. Injects error feedback into tool result via deps.
+    """
+
+    async def _check_syntax(event: PostToolUse) -> None:
+        if event.tool_name not in ("write_file", "edit_file"):
+            return
+        file_path = event.args.get("file_path", "")
+        if not file_path.endswith(".py"):
+            return
+
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = (deps.cwd / p).resolve()
+
+        if not p.exists():
+            return
+
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["python", "-m", "py_compile", str(p)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                deps._post_tool_feedback = (
+                    f"⚠ SYNTAX ERROR in {p.name}: {error_msg}\n"
+                    "Fix this before proceeding."
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass  # Don't block on check failures
+
+    hook_registry.on(PostToolUse, _check_syntax, priority=10)
 
 
 def wire_rag_hooks(
