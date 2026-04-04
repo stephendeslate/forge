@@ -32,12 +32,12 @@ class OllamaSettings(BaseSettings):
 class GeminiSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_GEMINI_")
 
-    enabled: bool = Field(default=False, description="Enable cloud reasoning via Gemini 2.5 Pro (uses internet)")
+    enabled: bool = Field(default=True, description="Enable cloud reasoning via Gemini 2.5 Pro (uses internet)")
     model: str = Field(default="gemini-2.5-pro", description="Gemini model name")
     fallback_model: str = Field(default="gemini-2.0-flash", description="Fallback model if primary fails")
     api_key: str = Field(default="", description="Google AI Studio API key (or set GOOGLE_API_KEY env var)")
     timeout: int = Field(default=120, description="Request timeout in seconds")
-    critique_model: str = Field(default="", description="Gemini model for critique (empty = don't use Gemini for critique)")
+    critique_model: str = Field(default="gemini-2.5-flash", description="Gemini model for critique (empty = don't use Gemini for critique)")
 
 
 class NPUSettings(BaseSettings):
@@ -91,7 +91,7 @@ class AgentSettings(BaseSettings):
     list_files_limit: int = Field(default=500, description="Max files returned by list_files")
     rag_max_tokens: int = Field(default=12000, description="Max tokens of RAG context injected into prompts")
     delegate_model: str = Field(default="", description="Model for sub-agent delegation (empty = use heavy model)")
-    compaction_model: str = Field(default="", description="Model for compaction summarization (empty = use heavy model)")
+    compaction_model: str = Field(default="qwen3.5:4b", description="Model for compaction summarization (empty = use heavy model)")
     preload_model: bool = Field(default=True, description="Preload the heavy model on agent startup")
 
     # Circuit breaker

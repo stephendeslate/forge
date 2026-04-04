@@ -476,11 +476,20 @@ async def _summarize_with_prompt(
     try:
         from forge.models.ollama import _model_settings
         model_name = settings.agent.compaction_model or settings.ollama.heavy_model
+
+        # Model-aware context window selection
+        if model_name == settings.ollama.fast_model:
+            summarizer_ctx = settings.agent.fast_num_ctx
+        elif model_name == settings.ollama.heavy_model:
+            summarizer_ctx = min(settings.agent.num_ctx, 32768)
+        else:
+            summarizer_ctx = 16384  # Safe default for unknown models
+
         summarizer: Agent[None, str] = Agent(
             model=f"ollama:{model_name}",
             instructions="You are a concise conversation summarizer for an AI coding assistant.",
             tools=[],
-            model_settings=_model_settings(timeout=60, num_ctx=settings.agent.fast_num_ctx),
+            model_settings=_model_settings(timeout=60, num_ctx=summarizer_ctx),
         )
         result = await summarizer.run(prompt)
         summary = result.output

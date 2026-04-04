@@ -9,6 +9,9 @@ from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings
 
 from forge.config import settings
+from forge.log import get_logger
+
+logger = get_logger(__name__)
 
 
 def _model_settings(timeout: int = 300, num_ctx: int | None = None) -> ModelSettings:
@@ -122,6 +125,30 @@ class OllamaMonitor:
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def unload(self, model: str) -> bool:
+        """Unload a model from VRAM by setting keep_alive=0.
+
+        Returns True if the unload request succeeded.
+        """
+        try:
+            client = await self._client()
+            resp = await client.post(
+                "/api/generate",
+                json={"model": model, "prompt": "", "stream": False, "keep_alive": 0},
+                timeout=30,
+            )
+            return resp.status_code == 200
+        except Exception:
+            logger.debug("Failed to unload model %s", model, exc_info=True)
+            return False
+
+    async def swap_model(
+        self, unload_model: str, load_model: str, num_ctx: int | None = None,
+    ) -> bool:
+        """Unload one model and preload another. Returns True if load succeeded."""
+        await self.unload(unload_model)
+        return await self.preload(load_model, num_ctx=num_ctx)
 
     async def close(self) -> None:
         """Close the httpx session."""

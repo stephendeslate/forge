@@ -580,21 +580,31 @@ async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
 
     prompt = f"Review this code diff:\n\n```diff\n{diff_text}\n```"
 
-    # Try Gemini critique if configured
-    if settings.gemini.critique_model and deps.cloud_reasoning_enabled:
+    # Try Gemini critique if configured (independent of gemini.enabled)
+    from forge.agent.gemini import is_gemini_critique_available, mark_rate_limited
+
+    if is_gemini_critique_available():
         try:
-            from forge.agent.gemini import _ensure_api_key
+            from pydantic_ai import Agent as _Agent
 
-            if _ensure_api_key():
-                from pydantic_ai import Agent as _Agent
-
-                gemini_model = f"google-gla:{settings.gemini.critique_model}"
-                critique_agent = _Agent(model=gemini_model, instructions=CRITIQUE_SYSTEM)
-                result = await critique_agent.run(
-                    prompt, model_settings={"timeout": settings.gemini.timeout},
-                )
-                return result.output
-        except Exception:
+            gemini_model = f"google-gla:{settings.gemini.critique_model}"
+            critique_agent = _Agent(model=gemini_model, instructions=CRITIQUE_SYSTEM)
+            result = await critique_agent.run(
+                prompt, model_settings={"timeout": settings.gemini.timeout},
+            )
+            logger.info("Gemini critique completed via %s", settings.gemini.critique_model)
+            return result.output
+        except Exception as exc:
+            # Check for rate limiting (429)
+            exc_str = str(exc).lower()
+            if "429" in exc_str or "rate" in exc_str:
+                retry_after = 60.0
+                # Try to extract retry-after from error
+                import re
+                match = re.search(r"retry.?after[:\s]*(\d+)", exc_str)
+                if match:
+                    retry_after = float(match.group(1))
+                mark_rate_limited(retry_after)
             logger.debug("Gemini critique failed, falling back to local", exc_info=True)
 
     # Local critique: use configured critique_model or heavy_model
@@ -732,10 +742,27 @@ def print_welcome(
 
     active_model = deps.model_override or settings.ollama.heavy_model
     is_agent = system is AGENT_SYSTEM
+
+    # Build model assignment lines
+    model_line = f"Models: [green]{settings.ollama.heavy_model}[/green] (heavy) + [green]{settings.ollama.fast_model}[/green] (fast)"
+
+    # Show role-specific model assignments
+    role_parts: list[str] = []
+    critique_model = settings.gemini.critique_model
+    if critique_model:
+        role_parts.append(f"Critique: [cyan]{critique_model}[/cyan]")
+    planning_model = settings.gemini.model if settings.gemini.enabled else None
+    if planning_model:
+        role_parts.append(f"Planning: [cyan]{planning_model}[/cyan]")
+    compaction_model = settings.agent.compaction_model or settings.ollama.heavy_model
+    role_parts.append(f"Compaction: [green]{compaction_model}[/green]")
+    roles_line = " | ".join(role_parts)
+
     console.print(
         Panel(
             f"[bold]Forge v{__version__}[/bold] — {'agentic coding mode' if is_agent else 'chat + tools'}\n"
-            f"Model: [green]{active_model}[/green]\n"
+            f"{model_line}\n"
+            f"{roles_line}\n"
             f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
             f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
             f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}{cloud_info}\n"

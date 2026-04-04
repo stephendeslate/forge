@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,48 @@ from forge.config import settings
 from forge.log import get_logger
 
 logger = get_logger(__name__)
+
+# Simple task indicators for fast model routing
+_SIMPLE_INDICATORS = re.compile(
+    r"\b(?:docstring|rename|format|type.?hint|import|comment|typo|lint|style|sort|reorder)\b",
+    re.IGNORECASE,
+)
+# Complex task indicators that require heavy model
+_HEAVY_INDICATORS = re.compile(
+    r"\b(?:refactor|implement|design|architect|multi.?file|migration|performance|optimize|security)\b",
+    re.IGNORECASE,
+)
+
+
+def _select_delegate_model(task: str, agent_type: str) -> tuple[str, int]:
+    """Select the best model for a delegated task.
+
+    Returns (model_name, num_ctx) tuple.
+
+    Priority:
+    1. Explicit delegate_model config overrides everything
+    2. Read-only agents (research, reviewer) → fast model
+    3. Short + simple tasks → fast model
+    4. Heavy indicators or coder default → heavy model
+    """
+    # Explicit config override
+    if settings.agent.delegate_model:
+        is_fast = settings.agent.delegate_model == settings.ollama.fast_model
+        ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
+        return settings.agent.delegate_model, ctx
+
+    # Read-only agents → fast model (already loaded, zero VRAM cost)
+    if agent_type in ("research", "reviewer"):
+        return settings.ollama.fast_model, settings.agent.fast_num_ctx
+
+    # Heuristic for coder agents: check task complexity
+    if agent_type == "coder" and len(task) < 200 and _SIMPLE_INDICATORS.search(task):
+        if not _HEAVY_INDICATORS.search(task):
+            return settings.ollama.fast_model, settings.agent.fast_num_ctx
+
+    # Default: heavy model for code generation quality
+    return settings.ollama.heavy_model, min(settings.agent.num_ctx, 32768)
+
 
 # Sub-agent gets a focused toolset (no web, no memory, no tasks)
 SUBAGENT_TOOLS: list[Tool] = [
@@ -254,7 +297,12 @@ async def run_subagent(
             base = f"{base}/v1"
         os.environ["OLLAMA_BASE_URL"] = base
 
-    model_name = model or settings.agent.delegate_model or settings.ollama.heavy_model
+    if model:
+        model_name = model
+        is_fast = model == settings.ollama.fast_model
+        delegate_ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
+    else:
+        model_name, delegate_ctx = _select_delegate_model(task, agent_type)
     worktree_info: WorktreeInfo | None = None
     work_dir = cwd
 
@@ -282,7 +330,7 @@ async def run_subagent(
         tools=tools,
         toolsets=mcp_servers or [],
         deps_type=AgentDeps,
-        model_settings=_model_settings(timeout=int(timeout), num_ctx=min(settings.agent.num_ctx, 32768)),
+        model_settings=_model_settings(timeout=int(timeout), num_ctx=delegate_ctx),
         retries=2,
     )
 

@@ -15,11 +15,12 @@ class TestGeminiSettingsDefaults:
 
     def test_defaults(self):
         s = GeminiSettings()
-        assert s.enabled is False
+        assert s.enabled is True
         assert s.model == "gemini-2.5-pro"
         assert s.fallback_model == "gemini-2.0-flash"
         assert s.api_key == ""
         assert s.timeout == 120
+        assert s.critique_model == "gemini-2.5-flash"
 
     def test_env_override(self):
         env = {
@@ -45,4 +46,4 @@ class TestGeminiInSettings:
         s = Settings()
         assert hasattr(s, "gemini")
         assert isinstance(s.gemini, GeminiSettings)
-        assert s.gemini.enabled is False
+        assert s.gemini.enabled is True

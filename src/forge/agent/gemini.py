@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
+
+# Rate limit tracking — module-level state
+_rate_limited_until: float = 0.0
 
 
 def _ensure_api_key() -> str | None:
@@ -54,3 +58,31 @@ def is_gemini_available(deps) -> bool:
     if not deps.cloud_reasoning_enabled:
         return False
     return _ensure_api_key() is not None
+
+
+def is_gemini_critique_available() -> bool:
+    """Check if Gemini critique is available — independent of gemini.enabled.
+
+    Requires: gemini.critique_model is set AND API key exists.
+    Does NOT depend on the global gemini.enabled flag, so users can
+    run local-only main loop but still use cloud critique.
+    """
+    from forge.config import settings
+
+    if not settings.gemini.critique_model:
+        return False
+    if is_rate_limited():
+        return False
+    return _ensure_api_key() is not None
+
+
+def is_rate_limited() -> bool:
+    """Check if Gemini is currently rate-limited."""
+    return time.monotonic() < _rate_limited_until
+
+
+def mark_rate_limited(retry_after: float = 60.0) -> None:
+    """Mark Gemini as rate-limited for the given duration (seconds)."""
+    global _rate_limited_until
+    _rate_limited_until = time.monotonic() + retry_after
+    logger.info("Gemini rate-limited for %.0fs", retry_after)
