@@ -76,6 +76,8 @@ class AgentDeps:
     # Cloud reasoning (Gemini)
     cloud_reasoning_enabled: bool = False
     _gemini_recovery_pending: bool = False
+    # Cloud fallback (Anthropic → local)
+    _cloud_fallback_pending: bool = False
     # Write escalation flag (set by sandbox write detector for sed -i, etc.)
     _write_escalated: bool = False
     # Prompt cache monitoring

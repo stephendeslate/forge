@@ -125,6 +125,11 @@ def create_agent(
 ) -> Agent[AgentDeps, str]:
     """Create a pydantic-ai Agent with coding tools."""
     from forge.core.project import build_project_context
+    from forge.models.anthropic import (
+        get_anthropic_model_settings,
+        get_anthropic_model_string,
+        is_anthropic_available,
+    )
 
     _ensure_ollama_env()
 
@@ -132,15 +137,30 @@ def create_agent(
     if cwd:
         full_system += "\n\n" + build_project_context(cwd)
 
-    model_name = model or settings.ollama.heavy_model
+    # Model selection: explicit override → Anthropic cloud → local Ollama
+    if model:
+        # Explicit model passed — use as-is if already qualified, else assume Ollama
+        if ":" in model and not model.startswith("ollama:"):
+            model_id = model
+            ms = get_anthropic_model_settings() if model.startswith("anthropic:") else _model_settings()
+        else:
+            model_name = model.removeprefix("ollama:")
+            model_id = f"ollama:{model_name}"
+            ms = _model_settings()
+    elif is_anthropic_available():
+        model_id = get_anthropic_model_string()
+        ms = get_anthropic_model_settings()
+    else:
+        model_id = f"ollama:{settings.ollama.heavy_model}"
+        ms = _model_settings()
 
     return Agent(
-        model=f"ollama:{model_name}",
+        model=model_id,
         instructions=full_system,
         tools=tools if tools is not None else ALL_TOOLS,
         toolsets=toolsets or [],
         deps_type=AgentDeps,
-        model_settings=_model_settings(),
+        model_settings=ms,
         retries=3,
     )
 
@@ -157,7 +177,25 @@ async def _run_with_status(
 
     Returns the updated message history.
     """
-    tracker = StatusTracker(console=deps.console, visible=deps.status_visible)
+    # Determine active model name for status bar display
+    active_model = ""
+    if model_override:
+        active_model = model_override
+    elif deps.model_override:
+        active_model = deps.model_override
+    else:
+        from forge.models.anthropic import is_anthropic_available
+        if is_anthropic_available():
+            active_model = settings.anthropic.model
+        else:
+            active_model = settings.ollama.heavy_model
+
+    tracker = StatusTracker(
+        console=deps.console,
+        visible=deps.status_visible,
+        model_name=active_model,
+        token_budget=settings.agent.token_budget,
+    )
     deps.status_tracker = tracker
 
     # Create turn buffer for this turn
@@ -194,9 +232,13 @@ async def _run_with_status(
             usage_limits=UsageLimits(request_limit=settings.agent.request_limit),
         )
         if model_override:
-            run_kwargs["model"] = model_override  # Already fully qualified (e.g., "google-gla:gemini-2.5-pro")
+            run_kwargs["model"] = model_override  # Already fully qualified
         elif deps.model_override:
-            run_kwargs["model"] = f"ollama:{deps.model_override}"
+            # Support both qualified ("anthropic:claude-opus-4-6") and unqualified ("qwen3.5:4b") overrides
+            if deps.model_override.startswith(("anthropic:", "google-gla:", "openai:")):
+                run_kwargs["model"] = deps.model_override
+            else:
+                run_kwargs["model"] = f"ollama:{deps.model_override}"
 
         from forge.models.retry import with_retry
 
@@ -234,7 +276,9 @@ async def _run_with_status(
         tracker.tokens_in = deps.tokens_in
         tracker.tokens_out = deps.tokens_out
         tracker.stop()
-        turn_buffer.add(tracker.summary(), is_tool=False)
+        summary = tracker.summary()
+        if summary:
+            turn_buffer.add(summary, is_tool=False)
         turn_buffer.print_final(deps.tools_visible)
 
         # Emit TurnEnd
@@ -281,6 +325,10 @@ async def _plan_and_execute(
         plan_system += "\n\n" + build_project_context(deps.cwd)
 
     from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string, is_gemini_available
+    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
+
+    plan_model = None
+    plan_model_settings = None
 
     if is_gemini_available(deps):
         gemini_model = get_gemini_model_string()
@@ -288,13 +336,16 @@ async def _plan_and_execute(
             plan_model = gemini_model
             plan_model_settings = get_gemini_model_settings()
             console.print("[yellow dim]Using cloud reasoning for planning (Gemini)...[/yellow dim]")
-        else:
-            plan_model = f"ollama:{settings.ollama.heavy_model}"
-            plan_model_settings = _model_settings(num_ctx=65536)
-            console.print("[dim]Gemini unavailable, falling back to local model...[/dim]")
-    else:
+
+    if not plan_model and is_anthropic_available():
+        plan_model = get_anthropic_model_string()
+        plan_model_settings = get_anthropic_model_settings()
+        console.print("[yellow dim]Using cloud reasoning for planning (Opus)...[/yellow dim]")
+
+    if not plan_model:
         plan_model = f"ollama:{settings.ollama.heavy_model}"
         plan_model_settings = _model_settings(num_ctx=65536)
+        console.print("[dim]Cloud unavailable, falling back to local model...[/dim]")
 
     plan_agent: Agent[AgentDeps, str] = Agent(
         model=plan_model,
@@ -591,6 +642,21 @@ async def agent_repl(
         except Exception as e:
             _handle_agent_error(console, e, deps=deps)
 
+            # Cloud → local fallback for initial prompt
+            if deps._cloud_fallback_pending:
+                deps._cloud_fallback_pending = False
+                from forge.models.anthropic import mark_rate_limited
+                mark_rate_limited(300.0)
+                try:
+                    prompt = _maybe_prepend_think(parsed_initial, deps)
+                    message_history = await _run_with_status(
+                        agent, prompt, deps, message_history,
+                        turn_number=turn_counter,
+                        model_override=f"ollama:{settings.ollama.heavy_model}",
+                    )
+                except Exception as fallback_e:
+                    _handle_agent_error(console, fallback_e, deps=deps)
+
     # --- REPL loop ---
     title_set = initial_prompt is not None
     try:
@@ -720,6 +786,20 @@ async def agent_repl(
                                 settings.agent.cb_identical,
                             )
                             message_history.extend(recovery_result)
+
+                # Cloud → local fallback: retry the same prompt with local model
+                if deps._cloud_fallback_pending:
+                    deps._cloud_fallback_pending = False
+                    from forge.models.anthropic import mark_rate_limited
+                    mark_rate_limited(300.0)  # Cool down cloud for 5 min
+                    try:
+                        message_history = await _run_with_status(
+                            agent, user_input, deps, message_history,
+                            turn_number=turn_counter,
+                            model_override=f"ollama:{settings.ollama.heavy_model}",
+                        )
+                    except Exception as fallback_e:
+                        _handle_agent_error(console, fallback_e, deps=deps)
     finally:
         await cleanup(
             deps, hook_registry, mcp_stack, db, session_id, message_history, console,
@@ -824,6 +904,7 @@ async def _cloud_recovery(
     Returns recovery messages to append to history, or None on failure.
     """
     from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string
+    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
 
     # Reset circuit breaker for the retry
     if deps.circuit_breaker:
@@ -842,26 +923,38 @@ async def _cloud_recovery(
     if deps.cwd:
         recovery_system += "\n\n" + build_project_context(deps.cwd)
 
-    models_to_try = [
-        (get_gemini_model_string(fallback=False), "primary"),
-        (get_gemini_model_string(fallback=True), "fallback"),
-    ]
-    # Deduplicate if primary == fallback
-    seen = set()
-    unique_models = []
-    for m, label in models_to_try:
-        if m and m not in seen:
-            seen.add(m)
-            unique_models.append((m, label))
+    models_to_try: list[tuple[str, dict | None, str]] = []
 
-    for model_str, label in unique_models:
+    # Try Opus first (best quality for recovery)
+    if is_anthropic_available():
+        anthropic_str = get_anthropic_model_string()
+        if anthropic_str:
+            models_to_try.append((anthropic_str, get_anthropic_model_settings(), "anthropic"))
+
+    # Then Gemini primary/fallback
+    gemini_primary = get_gemini_model_string(fallback=False)
+    gemini_fallback = get_gemini_model_string(fallback=True)
+    if gemini_primary:
+        models_to_try.append((gemini_primary, get_gemini_model_settings(), "gemini-primary"))
+    if gemini_fallback and gemini_fallback != gemini_primary:
+        models_to_try.append((gemini_fallback, get_gemini_model_settings(), "gemini-fallback"))
+
+    # Deduplicate
+    seen: set[str] = set()
+    unique_models: list[tuple[str, dict | None, str]] = []
+    for m, ms, label in models_to_try:
+        if m not in seen:
+            seen.add(m)
+            unique_models.append((m, ms, label))
+
+    for model_str, model_settings, label in unique_models:
         try:
             recovery_agent: Agent[AgentDeps, str] = Agent(
                 model=model_str,
                 instructions=recovery_system,
                 tools=ALL_TOOLS,
                 deps_type=AgentDeps,
-                model_settings=get_gemini_model_settings(),
+                model_settings=model_settings,
                 retries=3,
             )
             result = await _run_with_status(
@@ -870,10 +963,10 @@ async def _cloud_recovery(
             )
             return result
         except Exception as exc:
-            if label == "primary" and len(unique_models) > 1:
+            if len(unique_models) > 1:
                 console.print(
                     f"[yellow]Cloud recovery ({label}) failed: {exc}[/yellow]\n"
-                    f"[yellow]Trying fallback model...[/yellow]"
+                    f"[yellow]Trying next model...[/yellow]"
                 )
             else:
                 console.print(f"[red]Cloud recovery failed:[/red] {exc}")
@@ -886,6 +979,36 @@ def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None =
     from pydantic_ai.exceptions import UsageLimitExceeded
 
     from forge.agent.circuit_breaker import CircuitBreakerTripped
+    from forge.models.anthropic import _is_anthropic_error
+
+    # Anthropic cloud errors → fall back to local
+    if _is_anthropic_error(e):
+        console.print(
+            "[yellow]Cloud model unavailable, falling back to local...[/yellow]"
+        )
+        if deps:
+            deps._cloud_fallback_pending = True
+        return
+
+    # Anthropic-specific error messages
+    try:
+        import anthropic
+
+        if isinstance(e, anthropic.AuthenticationError):
+            console.print("[red]Anthropic auth failed.[/red] Check proxy at 127.0.0.1:3456")
+            return
+        if isinstance(e, anthropic.RateLimitError):
+            console.print("[yellow]Anthropic rate limited.[/yellow] Falling back to local model.")
+            if deps:
+                deps._cloud_fallback_pending = True
+            return
+        if isinstance(e, anthropic.APIStatusError) and e.status_code == 529:
+            console.print("[yellow]Anthropic overloaded.[/yellow] Falling back to local model.")
+            if deps:
+                deps._cloud_fallback_pending = True
+            return
+    except ImportError:
+        pass
 
     if isinstance(e, CircuitBreakerTripped):
         if deps:

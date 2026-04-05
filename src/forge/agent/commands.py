@@ -214,19 +214,27 @@ async def cmd_model(ctx: CommandContext, args: str) -> CommandResult:
         current = ctx.deps.model_override or settings.ollama.heavy_model
         ctx.console.print(
             f"[dim]Current model: {current}\n"
-            f"Usage: /model fast | /model heavy | /model <name>[/dim]"
+            f"Usage: /model fast | /model heavy | /model opus | /model <name>[/dim]"
         )
         return CommandResult()
 
     arg = args.strip()
     if arg == "heavy":
         ctx.deps.model_override = None
-        ctx.console.print(f"[dim]Model: {settings.ollama.heavy_model} (heavy)[/dim]")
+        ctx.console.print(f"[dim]Model: {settings.ollama.heavy_model} (heavy/local)[/dim]")
     elif arg == "fast":
         ctx.deps.model_override = settings.ollama.fast_model
         if ctx.deps.escalator:
             ctx.deps.escalator.reset()
         ctx.console.print(f"[dim]Model: {settings.ollama.fast_model} (fast)[/dim]")
+    elif arg in ("opus", "anthropic", "cloud"):
+        from forge.models.anthropic import get_anthropic_model_string
+        model_str = get_anthropic_model_string()
+        if model_str:
+            ctx.deps.model_override = model_str
+            ctx.console.print(f"[dim]Model: {model_str} (cloud)[/dim]")
+        else:
+            ctx.console.print("[red]Anthropic not available[/red]")
     else:
         ctx.deps.model_override = arg
         ctx.console.print(f"[dim]Model: {arg}[/dim]")
@@ -351,7 +359,7 @@ async def cmd_help(ctx: CommandContext, args: str) -> CommandResult:
             "/compact       — compact history to fit token budget\n"
             "/tokens        — show estimated token count\n"
             "/messages      — list message history\n"
-            "/model         — switch model (fast/heavy/<name>)\n"
+            "/model         — switch model (fast/heavy/opus/<name>)\n"
             "/status        — toggle status line (or Ctrl-O)\n"
             "/tools         — toggle tool result display (or Ctrl-R)\n"
             "/think         — toggle extended thinking on/off\n"

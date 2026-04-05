@@ -43,9 +43,38 @@ def _is_retryable(exc: Exception) -> bool:
     except ImportError:
         pass
 
-    # Check pydantic-ai wrapped errors
+    # Check anthropic SDK errors — only retry connection/timeout, NOT rate limits
+    # Rate limits (429) should fail fast so the fallback handler kicks in
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.APIStatusError):
+            if exc.status_code == 503:  # Service unavailable — transient
+                return True
+            if exc.status_code == 529:  # Anthropic overloaded — transient
+                return True
+            # 429 rate limit: do NOT retry, let fallback handle it
+            return False
+        if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+            return True
+    except ImportError:
+        pass
+
+    # Check pydantic-ai wrapped errors — skip Anthropic 429s (fall back instead of retrying)
+    try:
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        if isinstance(exc, ModelHTTPError):
+            if exc.status_code == 429 and "claude" in (exc.model_name or "").lower():
+                return False  # Don't retry Anthropic rate limits
+    except ImportError:
+        pass
+
     exc_str = str(exc)
     if "429" in exc_str and "rate" in exc_str.lower():
+        # Don't retry if it's from Anthropic/Claude
+        if "claude" in exc_str.lower() or "anthropic" in exc_str.lower():
+            return False
         return True
     if "503" in exc_str and ("service unavailable" in exc_str.lower() or "overloaded" in exc_str.lower()):
         return True

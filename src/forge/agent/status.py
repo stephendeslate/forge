@@ -1,4 +1,4 @@
-"""Real-time status line for agent execution."""
+"""Real-time status bar for agent execution."""
 
 from __future__ import annotations
 
@@ -31,14 +31,17 @@ class Phase(Enum):
     DONE = "done"
 
 
-# Phase display config: (emoji, style)
+# Phase display config: (emoji, ansi_color_code)
 _PHASE_DISPLAY: dict[Phase, tuple[str, str]] = {
-    Phase.THINKING: ("🧠", "dim"),
-    Phase.STREAMING: ("✍️ ", "dim"),
-    Phase.TOOL_CALL: ("🔧", "dim"),
-    Phase.TOOL_EXEC: ("⏳", "dim"),
-    Phase.DONE: ("✅", "dim"),
+    Phase.THINKING: ("◆", "\033[35m"),      # magenta
+    Phase.STREAMING: ("▸", "\033[36m"),      # cyan
+    Phase.TOOL_CALL: ("⚙", "\033[33m"),     # yellow
+    Phase.TOOL_EXEC: ("⏳", "\033[33m"),     # yellow
+    Phase.DONE: ("✓", "\033[32m"),           # green
 }
+
+# Spinner frames for animated phase indicator
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def _set_nonblocking(fd: int) -> int:
@@ -64,14 +67,16 @@ def _try_read_byte(fd: int) -> int | None:
 
 @dataclass
 class StatusTracker:
-    """Ephemeral ANSI status line showing phase + elapsed time + tool count.
+    """Persistent bottom status bar showing phase, model, tokens, and elapsed time.
 
-    Prints an overwriting status line via \\r\\033[2K. Pauses when Rich Live
-    is active (streaming text) and resumes between events.
+    Renders a formatted bar via \\r\\033[2K using ANSI escape codes. Pauses when
+    Rich Live is active (streaming text) and resumes between events.
     """
 
     console: Console
     visible: bool = True
+    model_name: str = ""
+    token_budget: int = 0
     _start_time: float = field(default=0.0, init=False)
     _phase: Phase = field(default=Phase.THINKING, init=False)
     _detail: str = field(default="", init=False)
@@ -82,6 +87,7 @@ class StatusTracker:
     _active: bool = field(default=False, init=False)
     _on_toggle: Callable[[bool], None] | None = field(default=None, init=False)
     _on_tools_toggle: Callable[[], None] | None = field(default=None, init=False)
+    _spinner_idx: int = field(default=0, init=False)
 
     @property
     def tool_calls(self) -> int:
@@ -92,12 +98,7 @@ class StatusTracker:
         on_toggle: Callable[[bool], None] | None = None,
         on_tools_toggle: Callable[[], None] | None = None,
     ) -> None:
-        """Start the status ticker and optional keypress monitor.
-
-        Args:
-            on_toggle: Callable invoked with (visible: bool) when Ctrl-O is pressed.
-            on_tools_toggle: Callable invoked (no args) when Ctrl-R is pressed.
-        """
+        """Start the status ticker and optional keypress monitor."""
         self._start_time = time.monotonic()
         self._active = True
         self._on_toggle = on_toggle
@@ -111,7 +112,6 @@ class StatusTracker:
             self._ticker = loop.create_task(self._tick_loop())
             self._key_monitor = loop.create_task(self._key_loop())
         except RuntimeError:
-            # No running event loop — skip ticker (non-async context)
             pass
 
     def stop(self) -> None:
@@ -153,36 +153,96 @@ class StatusTracker:
     tokens_out: int = field(default=0, init=False)
 
     def summary(self) -> str:
-        """Return a final summary string."""
+        """Return a final summary string with Rich markup."""
         elapsed = time.monotonic() - self._start_time
         tc = self._tool_calls
         parts: list[str] = []
         if tc > 0:
             calls = "call" if tc == 1 else "calls"
-            parts.append(f"{tc} tool {calls}")
+            parts.append(f"[dim cyan]{tc} tool {calls}[/dim cyan]")
         if self.tokens_in > 0 or self.tokens_out > 0:
-            parts.append(f"{self.tokens_in:,}↑ {self.tokens_out:,}↓ tok")
-        parts.append(f"{elapsed:.1f}s")
-        return f"[dim]{' · '.join(parts)}[/dim]"
+            parts.append(f"[dim]{self.tokens_in:,}↑ {self.tokens_out:,}↓ tok[/dim]")
+        parts.append(f"[dim]{elapsed:.1f}s[/dim]")
+        return " · ".join(parts)
 
     def _elapsed(self) -> str:
         return f"{time.monotonic() - self._start_time:.1f}s"
 
+    def _context_bar(self) -> str:
+        """Build a mini context usage bar like [████░░░░ 45%]."""
+        if self.token_budget <= 0 or self.tokens_in <= 0:
+            return ""
+        pct = min(self.tokens_in / self.token_budget, 1.0)
+        bar_width = 8
+        filled = int(pct * bar_width)
+        empty = bar_width - filled
+
+        # Color gradient: green < 60%, yellow 60-80%, red > 80%
+        if pct < 0.6:
+            color = "\033[32m"  # green
+        elif pct < 0.8:
+            color = "\033[33m"  # yellow
+        else:
+            color = "\033[31m"  # red
+
+        bar = f"{color}{'█' * filled}{'░' * empty}\033[0m"
+        return f" [{bar} \033[2m{pct:.0%}\033[0m]"
+
     def _print_status(self) -> None:
-        """Print the ephemeral status line."""
+        """Print the formatted status bar."""
         if not self.console.is_terminal or self._paused or not self._active or not self.visible:
             return
-        emoji, _ = _PHASE_DISPLAY.get(self._phase, ("", "dim"))
-        parts = [emoji, self._elapsed(), "│", self._phase.value]
+
+        icon, color = _PHASE_DISPLAY.get(self._phase, ("·", "\033[2m"))
+
+        # Animated spinner for active phases
+        if self._phase in (Phase.THINKING, Phase.TOOL_EXEC):
+            spinner = _SPINNER_FRAMES[self._spinner_idx % len(_SPINNER_FRAMES)]
+            self._spinner_idx += 1
+        else:
+            spinner = icon
+
+        # Build segments
+        reset = "\033[0m"
+        dim = "\033[2m"
+
+        # Phase + detail
+        phase_str = f"{color}{spinner}{reset} {dim}{self._phase.value}{reset}"
         if self._detail:
-            parts.extend(["│", self._detail])
-        tc = self._tool_calls
-        if tc > 0:
-            calls = "call" if tc == 1 else "calls"
-            parts.extend(["│", f"{tc} tool {calls}"])
-        line = " ".join(parts)
-        # Write directly to stderr to avoid Rich markup processing
-        sys.stderr.write(f"\r\033[2K\033[2m{line}\033[0m")
+            phase_str += f" {dim}│{reset} {color}{self._detail}{reset}"
+
+        # Elapsed
+        elapsed_str = f"{dim}{self._elapsed()}{reset}"
+
+        # Tool count
+        tc_str = ""
+        if self._tool_calls > 0:
+            calls = "call" if self._tool_calls == 1 else "calls"
+            tc_str = f" {dim}│{reset} {dim}{self._tool_calls} tool {calls}{reset}"
+
+        # Token counts
+        tok_str = ""
+        if self.tokens_in > 0 or self.tokens_out > 0:
+            tok_str = f" {dim}│ {self.tokens_in:,}↑ {self.tokens_out:,}↓{reset}"
+
+        # Context bar
+        ctx_bar = self._context_bar()
+
+        # Model badge
+        model_str = ""
+        if self.model_name:
+            # Shorten model name for display
+            short = self.model_name
+            if ":" in short:
+                parts = short.split(":")
+                short = parts[-1] if parts[-1] else parts[0]
+            if len(short) > 20:
+                short = short[:18] + "…"
+            model_str = f" {dim}│{reset} \033[36m{short}{reset}"
+
+        line = f" {phase_str} {dim}│{reset} {elapsed_str}{tc_str}{tok_str}{ctx_bar}{model_str} "
+
+        sys.stderr.write(f"\r\033[2K{line}")
         sys.stderr.flush()
 
     def _clear_line(self) -> None:
@@ -192,12 +252,12 @@ class StatusTracker:
             sys.stderr.flush()
 
     async def _tick_loop(self) -> None:
-        """Tick the status line every 100ms."""
+        """Tick the status line every 80ms for smooth spinner animation."""
         try:
             while self._active:
                 if not self._paused:
                     self._print_status()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.08)
         except asyncio.CancelledError:
             pass
 
@@ -211,7 +271,7 @@ class StatusTracker:
             old_settings = termios.tcgetattr(fd)
             tty.setcbreak(fd)
         except (termios.error, OSError):
-            return  # Can't set up terminal — degrade to no key monitoring
+            return
         try:
             old_flags = _set_nonblocking(fd)
             try:

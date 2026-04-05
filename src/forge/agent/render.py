@@ -40,6 +40,37 @@ _READ_TOOLS = {"read_file", "search_code", "list_files"}
 # Diff-producing tools get syntax-highlighted results
 _DIFF_TOOLS = {"edit_file"}
 
+# Icons for tool categories
+_TOOL_ICONS: dict[str, str] = {
+    "read_file": "📖",
+    "search_code": "🔍",
+    "list_files": "📂",
+    "write_file": "📝",
+    "edit_file": "✏️ ",
+    "run_command": "▶",
+    "web_search": "🌐",
+    "web_fetch": "🌐",
+    "rag_search": "🔍",
+    "save_memory": "💾",
+    "recall_memories": "💭",
+    "task_create": "📋",
+    "task_update": "📋",
+    "task_list": "📋",
+    "task_get": "📋",
+    "delegate": "🔀",
+    "delegate_parallel": "🔀",
+}
+
+
+def _tool_icon(tool_name: str) -> str:
+    """Return an icon for the tool, falling back to category-based icons."""
+    if tool_name in _TOOL_ICONS:
+        return _TOOL_ICONS[tool_name]
+    # MCP tools (prefixed with server name)
+    if "_" in tool_name:
+        return "🔌"
+    return "🔧"
+
 # Regex to strip <think>...</think> blocks (possibly incomplete at stream end)
 _THINK_OPEN = re.compile(r"<think>", re.IGNORECASE)
 _THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
@@ -118,7 +149,8 @@ def _extract_diff_block(text: str) -> str | None:
 
 
 def _format_result_renderable(
-    content_str: str, tool_name: str, result_style: str
+    content_str: str, tool_name: str, result_style: str,
+    duration_badge: str = "",
 ) -> Panel:
     """Build a result panel with tool-aware formatting.
 
@@ -126,6 +158,9 @@ def _format_result_renderable(
     - read-only tool results: compact display with dimmer border
     """
     from rich.console import Group
+
+    outcome_icon = "✓" if "green" in result_style else "✗"
+    badge = f" {duration_badge}" if duration_badge else ""
 
     # For diff-producing tools, render the diff with syntax highlighting
     if tool_name in _DIFF_TOOLS:
@@ -141,7 +176,7 @@ def _format_result_renderable(
             )
             return Panel(
                 Group(*parts) if len(parts) > 1 else parts[0],
-                title="[dim]result[/dim]",
+                title=f"[dim]{outcome_icon} result{badge}[/dim]",
                 border_style=result_style,
                 padding=(0, 1),
             )
@@ -150,7 +185,7 @@ def _format_result_renderable(
     if tool_name in _READ_TOOLS:
         return Panel(
             Text(content_str, style="dim"),
-            title=f"[dim]{tool_name} result[/dim]",
+            title=f"[dim]{outcome_icon} {tool_name}{badge}[/dim]",
             border_style="dim green",
             padding=(0, 1),
         )
@@ -158,7 +193,7 @@ def _format_result_renderable(
     # Default: plain text result
     return Panel(
         Text(content_str, style="dim"),
-        title="[dim]result[/dim]",
+        title=f"[dim]{outcome_icon} result{badge}[/dim]",
         border_style=result_style,
         padding=(0, 1),
     )
@@ -203,6 +238,8 @@ async def render_events(
     events: AsyncIterable[AgentStreamEvent],
 ) -> None:
     """Render agent events to the console with streaming text and tool call panels."""
+    import time
+
     console = ctx.deps.console
     tracker = ctx.deps.status_tracker
     text_chunks: list[str] = []
@@ -211,6 +248,7 @@ async def render_events(
     tool_call_count = 0
     has_thinking = False
     last_tool_name: str = ""
+    tool_start_time: float = 0.0
 
     def _stop_thinking_spinner() -> None:
         nonlocal thinking_live
@@ -318,21 +356,24 @@ async def render_events(
 
                 tool_name = event.part.tool_name
                 last_tool_name = tool_name
+                tool_start_time = time.monotonic()
                 style = _tool_style(tool_name)
+                icon = _tool_icon(tool_name)
                 args_str = _format_tool_args(event.part.args)
 
-                # Build the full panel (always with title for buffer rerenders)
+                # Build the full panel with icon in title
+                title = f"{icon} [bold]{tool_name}[/bold]"
                 if args_str:
                     panel = Panel(
                         Text(args_str, style="dim"),
-                        title=f"[bold]{tool_name}[/bold]",
+                        title=title,
                         border_style=style,
                         padding=(0, 1),
                     )
                 else:
                     panel = Panel(
                         Text("(no args)", style="dim"),
-                        title=f"[bold]{tool_name}[/bold]",
+                        title=title,
                         border_style=style,
                         padding=(0, 1),
                     )
@@ -361,6 +402,10 @@ async def render_events(
                 outcome = getattr(event.result, "outcome", "success")
                 result_style = "dim green" if outcome == "success" else "dim red"
 
+                # Calculate duration since tool call started
+                duration = time.monotonic() - tool_start_time if tool_start_time > 0 else 0.0
+                duration_badge = f" [dim]({duration:.1f}s)[/dim]" if duration >= 0.1 else ""
+
                 # Get tool name from the result part or fall back to tracked name
                 result_tool_name = getattr(event.result, "tool_name", last_tool_name)
 
@@ -369,7 +414,8 @@ async def render_events(
                 content_str = _truncate(content_str, trunc_limit)
 
                 result_panel = _format_result_renderable(
-                    content_str, result_tool_name, result_style
+                    content_str, result_tool_name, result_style,
+                    duration_badge=duration_badge,
                 )
 
                 printed = False

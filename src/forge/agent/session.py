@@ -36,7 +36,7 @@ logger = get_logger(__name__)
 
 
 async def setup_model_monitor(deps: AgentDeps, console: Console) -> None:
-    """Create OllamaMonitor, optionally preload the heavy model."""
+    """Create OllamaMonitor, optionally preload the heavy model. Check Anthropic proxy."""
     from forge.models.ollama import OllamaMonitor
 
     monitor = OllamaMonitor()
@@ -56,6 +56,18 @@ async def setup_model_monitor(deps: AgentDeps, console: Console) -> None:
                 console.print(f"[dim]Model {model} loaded.[/dim]")
             else:
                 console.print("[yellow]Model preload timed out — will load on first request.[/yellow]")
+
+    # Check Anthropic proxy health
+    from forge.models.anthropic import _ensure_anthropic_env, anthropic_health_check, is_anthropic_available, mark_rate_limited
+
+    _ensure_anthropic_env()
+    if is_anthropic_available():
+        proxy_ok = await anthropic_health_check()
+        if proxy_ok:
+            console.print("[dim]Anthropic proxy: [green]connected[/green][/dim]")
+        else:
+            console.print("[yellow]Anthropic proxy unreachable — using local models[/yellow]")
+            mark_rate_limited(600.0)  # 10 min cooldown, will auto-retry later
 
 
 def setup_worktree(
@@ -719,61 +731,141 @@ def print_welcome(
     memory_count: int,
     mcp_servers: list,
 ) -> None:
-    """Print the welcome banner."""
+    """Print the welcome banner with styled title and grid layout."""
+    from rich.table import Table
+    from rich.text import Text
+
     from forge.agent.loop import AGENT_SYSTEM
     from forge.core.project import INSTRUCTION_FILES, detect_project_type
 
-    project_type = detect_project_type(deps.cwd)
-    project_info = f"Project: [cyan]{project_type}[/cyan] | " if project_type else ""
-    instructions_loaded = any((deps.cwd / f).is_file() for f in INSTRUCTION_FILES)
-    instr_info = "[green]instructions loaded[/green]" if instructions_loaded else ""
-    rag_info = " | [green]RAG indexed[/green]" if rag_available else ""
-    memory_info = f" | [green]{memory_count} memories[/green]" if memory_count else ""
-    mcp_info = f" | [green]{len(mcp_servers)} MCP server(s)[/green]" if mcp_servers else ""
-    cloud_info = " | [yellow]cloud reasoning ON[/yellow]" if deps.cloud_reasoning_enabled else ""
+    is_agent = AGENT_SYSTEM in system
 
-    persist_info = f"\nSession: [dim]{session_id[:8]}…[/dim]" if db else ""
-    worktree_banner = ""
-    if deps.worktree:
-        worktree_banner = (
-            f"\nWorktree: [cyan]{deps.worktree.branch}[/cyan] "
-            f"at [dim]{deps.worktree.path}[/dim]"
+    # ── Styled title ──
+    logo = Text()
+    logo.append("⚒ ", style="bold bright_magenta")
+    logo.append("F", style="bold bright_magenta")
+    logo.append("O", style="bold magenta")
+    logo.append("R", style="bold bright_magenta")
+    logo.append("G", style="bold magenta")
+    logo.append("E", style="bold bright_magenta")
+    logo.append(f"  v{__version__}", style="dim")
+    mode_text = "agentic coding" if is_agent else "chat + tools"
+    logo.append(f"  {mode_text}", style="italic dim")
+
+    # ── Model grid ──
+    from forge.models.anthropic import is_anthropic_available
+
+    model_grid = Table.grid(padding=(0, 2))
+    model_grid.add_column(style="dim", min_width=10)  # label
+    model_grid.add_column()  # value
+
+    if is_anthropic_available():
+        model_grid.add_row(
+            "  heavy",
+            Text.assemble(
+                ("☁ ", "cyan"), (settings.anthropic.model, "bold cyan"),
+                ("  fallback: ", "dim"), (settings.ollama.heavy_model, "green"),
+            ),
         )
+    else:
+        model_grid.add_row(
+            "  heavy",
+            Text.assemble((settings.ollama.heavy_model, "bold green")),
+        )
+    model_grid.add_row(
+        "  fast",
+        Text.assemble((settings.ollama.fast_model, "green")),
+    )
 
-    active_model = deps.model_override or settings.ollama.heavy_model
-    is_agent = system is AGENT_SYSTEM
-
-    # Build model assignment lines
-    model_line = f"Models: [green]{settings.ollama.heavy_model}[/green] (heavy) + [green]{settings.ollama.fast_model}[/green] (fast)"
-
-    # Show role-specific model assignments
-    role_parts: list[str] = []
+    # Role-specific models
     critique_model = settings.gemini.critique_model
     if critique_model:
-        role_parts.append(f"Critique: [cyan]{critique_model}[/cyan]")
+        model_grid.add_row(
+            "  critique",
+            Text.assemble(("☁ ", "cyan"), (critique_model, "cyan")),
+        )
     planning_model = settings.gemini.model if settings.gemini.enabled else None
     if planning_model:
-        role_parts.append(f"Planning: [cyan]{planning_model}[/cyan]")
-    compaction_model = settings.agent.compaction_model or settings.ollama.heavy_model
-    role_parts.append(f"Compaction: [green]{compaction_model}[/green]")
-    roles_line = " | ".join(role_parts)
-
-    console.print(
-        Panel(
-            f"[bold]Forge v{__version__}[/bold] — {'agentic coding mode' if is_agent else 'chat + tools'}\n"
-            f"{model_line}\n"
-            f"{roles_line}\n"
-            f"Permissions: [{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]"
-            f"{deps.permission.value}[/{'green' if deps.permission == PermissionPolicy.YOLO else 'yellow'}]\n"
-            f"{project_info}{instr_info}{rag_info}{memory_info}{mcp_info}{cloud_info}\n"
-            f"Working directory: [dim]{deps.cwd}[/dim]"
-            f"{worktree_banner}"
-            f"{persist_info}\n"
-            "Type [bold]/help[/bold] for commands, [bold]Ctrl-O[/bold] status, [bold]Ctrl-R[/bold] tools, [bold]Ctrl-D[/bold] exit",
-            title="forge agent" if is_agent else "forge",
-            border_style="magenta",
+        model_grid.add_row(
+            "  planning",
+            Text.assemble(("☁ ", "cyan"), (planning_model, "cyan")),
         )
+    compaction_model = settings.agent.compaction_model or settings.ollama.heavy_model
+    model_grid.add_row(
+        "  compact",
+        Text.assemble((compaction_model, "green")),
     )
+
+    # ── Status indicators ──
+    indicators: list[Text] = []
+
+    perm_color = "green" if deps.permission == PermissionPolicy.YOLO else "yellow"
+    indicators.append(Text.assemble(
+        ("● ", perm_color), (deps.permission.value.upper(), f"bold {perm_color}"),
+    ))
+
+    project_type = detect_project_type(deps.cwd)
+    if project_type:
+        indicators.append(Text.assemble(("● ", "cyan"), (project_type, "cyan")))
+
+    instructions_loaded = any((deps.cwd / f).is_file() for f in INSTRUCTION_FILES)
+    if instructions_loaded:
+        indicators.append(Text.assemble(("● ", "green"), ("instructions", "green")))
+
+    if rag_available:
+        indicators.append(Text.assemble(("● ", "green"), ("RAG", "green")))
+
+    if memory_count:
+        indicators.append(Text.assemble(
+            ("● ", "green"), (f"{memory_count} memories", "green"),
+        ))
+
+    if mcp_servers:
+        indicators.append(Text.assemble(
+            ("● ", "green"), (f"{len(mcp_servers)} MCP", "green"),
+        ))
+
+    if deps.cloud_reasoning_enabled:
+        indicators.append(Text.assemble(("● ", "yellow"), ("cloud reasoning", "yellow")))
+
+    # Build indicators line with separator
+    indicator_line = Text("  ")
+    for i, ind in enumerate(indicators):
+        if i > 0:
+            indicator_line.append("  ", style="dim")
+        indicator_line.append_text(ind)
+
+    # ── Info rows ──
+    info_grid = Table.grid(padding=(0, 1))
+    info_grid.add_column()
+    info_grid.add_row(Text.assemble(("  cwd  ", "dim"), (str(deps.cwd), "dim")))
+    if deps.worktree:
+        info_grid.add_row(Text.assemble(
+            ("  wt   ", "dim"),
+            (deps.worktree.branch, "cyan"), ("  ", ""), (str(deps.worktree.path), "dim"),
+        ))
+    if db:
+        info_grid.add_row(Text.assemble(("  sid  ", "dim"), (session_id[:8] + "…", "dim")))
+
+    # ── Hotkeys ──
+    hotkeys = Text("  ", style="dim")
+    hotkeys.append("/help", style="bold dim")
+    hotkeys.append(" commands  ")
+    hotkeys.append("^O", style="bold dim")
+    hotkeys.append(" status  ")
+    hotkeys.append("^R", style="bold dim")
+    hotkeys.append(" tools  ")
+    hotkeys.append("^D", style="bold dim")
+    hotkeys.append(" exit")
+
+    # ── Assemble banner ──
+    from rich.console import Group
+
+    console.print(Panel(
+        Group(logo, Text(), model_grid, indicator_line, info_grid, Text(), hotkeys),
+        border_style="bright_magenta",
+        padding=(0, 1),
+    ))
 
 
 async def cleanup(

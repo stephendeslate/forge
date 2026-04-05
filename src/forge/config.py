@@ -40,6 +40,16 @@ class GeminiSettings(BaseSettings):
     critique_model: str = Field(default="gemini-2.5-flash", description="Gemini model for critique (empty = don't use Gemini for critique)")
 
 
+class AnthropicSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="FORGE_ANTHROPIC_")
+
+    enabled: bool = Field(default=True, description="Use Anthropic as primary heavy model")
+    model: str = Field(default="claude-opus-4-6", description="Anthropic model name")
+    api_key: str = Field(default="", description="API key (or set ANTHROPIC_API_KEY; proxy handles real auth)")
+    timeout: int = Field(default=300, description="Request timeout in seconds")
+    max_tokens: int = Field(default=16384, description="Max output tokens per request")
+
+
 class NPUSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_NPU_")
 
@@ -181,6 +191,7 @@ class Settings(BaseSettings):
 
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
+    anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     npu: NPUSettings = Field(default_factory=NPUSettings)
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)

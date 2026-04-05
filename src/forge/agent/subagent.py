@@ -45,34 +45,43 @@ _HEAVY_INDICATORS = re.compile(
 )
 
 
-def _select_delegate_model(task: str, agent_type: str) -> tuple[str, int]:
+def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
     """Select the best model for a delegated task.
 
-    Returns (model_name, num_ctx) tuple.
+    Returns (model_id, model_settings) tuple.
+    model_id is fully qualified (e.g., "ollama:model" or "anthropic:model").
 
     Priority:
     1. Explicit delegate_model config overrides everything
     2. Read-only agents (research, reviewer) → fast model
     3. Short + simple tasks → fast model
-    4. Heavy indicators or coder default → heavy model
+    4. Complex tasks → Anthropic cloud if available, else local heavy
     """
+    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
+    from forge.models.ollama import _model_settings
+
     # Explicit config override
     if settings.agent.delegate_model:
         is_fast = settings.agent.delegate_model == settings.ollama.fast_model
         ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
-        return settings.agent.delegate_model, ctx
+        return f"ollama:{settings.agent.delegate_model}", _model_settings(num_ctx=ctx)
 
     # Read-only agents → fast model (already loaded, zero VRAM cost)
     if agent_type in ("research", "reviewer"):
-        return settings.ollama.fast_model, settings.agent.fast_num_ctx
+        return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
     # Heuristic for coder agents: check task complexity
     if agent_type == "coder" and len(task) < 200 and _SIMPLE_INDICATORS.search(task):
         if not _HEAVY_INDICATORS.search(task):
-            return settings.ollama.fast_model, settings.agent.fast_num_ctx
+            return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
-    # Default: heavy model for code generation quality
-    return settings.ollama.heavy_model, min(settings.agent.num_ctx, 32768)
+    # Complex tasks → Opus if available, else local heavy
+    if is_anthropic_available():
+        model_str = get_anthropic_model_string()
+        if model_str:
+            return model_str, get_anthropic_model_settings()
+
+    return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
 
 
 # Sub-agent gets a focused toolset (no web, no memory, no tasks)
@@ -298,11 +307,19 @@ async def run_subagent(
         os.environ["OLLAMA_BASE_URL"] = base
 
     if model:
-        model_name = model
-        is_fast = model == settings.ollama.fast_model
-        delegate_ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
+        # Explicit model — assume Ollama if not qualified
+        if model.startswith(("anthropic:", "google-gla:", "openai:")):
+            model_id = model
+            from forge.models.anthropic import get_anthropic_model_settings
+            delegate_settings = get_anthropic_model_settings() if model.startswith("anthropic:") else {}
+        else:
+            model_name = model.removeprefix("ollama:")
+            model_id = f"ollama:{model_name}"
+            is_fast = model_name == settings.ollama.fast_model
+            delegate_ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
+            delegate_settings = None  # Will use _model_settings below
     else:
-        model_name, delegate_ctx = _select_delegate_model(task, agent_type)
+        model_id, delegate_settings = _select_delegate_model(task, agent_type)
     worktree_info: WorktreeInfo | None = None
     work_dir = cwd
 
@@ -324,13 +341,18 @@ async def run_subagent(
     # Create sub-agent with limited tools and permissive policy
     from forge.models.ollama import _model_settings
     tools = SUBAGENT_TOOL_PROFILES.get(agent_type, SUBAGENT_TOOLS)
+
+    # Use delegate_settings if already computed, otherwise build from Ollama defaults
+    if delegate_settings is None:
+        delegate_settings = _model_settings(timeout=int(timeout), num_ctx=delegate_ctx)
+
     agent: Agent[AgentDeps, str] = Agent(
-        model=f"ollama:{model_name}",
+        model=model_id,
         instructions=full_system,
         tools=tools,
         toolsets=mcp_servers or [],
         deps_type=AgentDeps,
-        model_settings=_model_settings(timeout=int(timeout), num_ctx=delegate_ctx),
+        model_settings=delegate_settings,
         retries=2,
     )
 
