@@ -61,7 +61,7 @@ class TestCmdCloud:
         env = os.environ.copy()
         env.pop("GOOGLE_API_KEY", None)
         with patch.dict(os.environ, env, clear=True):
-            with patch("forge.config.settings") as mock_settings:
+            with patch("forge.agent.commands.settings") as mock_settings:
                 mock_settings.gemini.api_key = ""
                 result = await cmd_cloud(cloud_ctx, "")
         # Should stay off

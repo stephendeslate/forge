@@ -219,7 +219,7 @@ async def _run_with_status(
     # Emit TurnStart
     registry = deps.hook_registry
     if registry:
-        await registry.emit(TurnStart(turn_number=turn_number, prompt=prompt))
+        await registry.emit_sequential(TurnStart(turn_number=turn_number, prompt=prompt))
 
     import time as _time
     turn_start = _time.monotonic()
@@ -284,7 +284,7 @@ async def _run_with_status(
         # Emit TurnEnd
         if registry:
             elapsed = _time.monotonic() - turn_start
-            await registry.emit(TurnEnd(
+            await registry.emit_sequential(TurnEnd(
                 turn_number=turn_number,
                 tool_call_count=tracker.tool_calls,
                 elapsed=elapsed,

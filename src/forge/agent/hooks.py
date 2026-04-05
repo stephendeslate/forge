@@ -155,9 +155,26 @@ class HookRegistry:
             except HookEscalation:
                 raise
             except Exception:
-                logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
+                logger.warning("Hook handler error on %s", type(event).__name__, exc_info=True)
 
         await asyncio.gather(*[_run(h) for _, h in handlers])
+
+    async def emit_sequential(self, event: object) -> None:
+        """Fire a notification event sequentially, respecting priority order.
+
+        Use instead of emit() when handler execution order matters (e.g.
+        TurnEnd where later handlers depend on state set by earlier ones).
+        """
+        handlers = self._handlers.get(type(event), [])
+        for _, handler in handlers:
+            try:
+                result = handler(event)
+                if asyncio.iscoroutine(result):
+                    await result
+            except HookEscalation:
+                raise
+            except Exception:
+                logger.warning("Hook handler error on %s", type(event).__name__, exc_info=True)
 
     async def emit_and_collect_feedback(self, event: object) -> list[str]:
         """Fire a notification event, collecting feedback strings from handlers."""
@@ -173,7 +190,7 @@ class HookRegistry:
             except HookEscalation:
                 raise
             except Exception:
-                logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
+                logger.warning("Hook handler error on %s", type(event).__name__, exc_info=True)
         return feedbacks
 
     def get_handlers(self, event_type: type) -> list[tuple[int, HookHandler]]:
@@ -193,7 +210,7 @@ class HookRegistry:
             except HookEscalation:
                 raise
             except Exception:
-                logger.debug("Hook handler error on %s", type(event).__name__, exc_info=True)
+                logger.warning("Hook handler error on %s", type(event).__name__, exc_info=True)
         return HookResult()
 
 
@@ -216,7 +233,7 @@ def with_hooks(fn: Callable) -> Callable:
         bound.apply_defaults()
 
         # First arg is always ctx (RunContext)
-        ctx = bound.arguments.get("ctx") or next(iter(bound.arguments.values()))
+        ctx = bound.arguments["ctx"]
         deps: AgentDeps = ctx.deps
 
         registry: HookRegistry | None = getattr(deps, "hook_registry", None)
@@ -258,10 +275,10 @@ def with_hooks(fn: Callable) -> Callable:
 
             # Merge all feedback sources into tool result
             all_feedback: list[str] = list(feedbacks)
-            manual_feedback = getattr(deps, "_post_tool_feedback", None)
+            manual_feedback = getattr(deps, "_post_tool_feedback", [])
             if manual_feedback:
-                all_feedback.append(manual_feedback)
-                deps._post_tool_feedback = None
+                all_feedback.extend(manual_feedback)
+                manual_feedback.clear()
 
             if all_feedback and isinstance(result, str):
                 result = result + "\n\n" + "\n".join(all_feedback)

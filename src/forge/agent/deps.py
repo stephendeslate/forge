@@ -64,7 +64,7 @@ class AgentDeps:
     # MCP servers (for passing to sub-agents)
     mcp_servers: list | None = None
     # Syntax/lint feedback injection
-    _post_tool_feedback: str | None = None
+    _post_tool_feedback: list[str] = field(default_factory=list)
     lint_results: str | None = None
     # Test-driven self-correction
     test_results: str | None = None

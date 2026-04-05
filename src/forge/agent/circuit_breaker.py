@@ -27,6 +27,7 @@ class ToolCallRecord:
     args_hash: str
     succeeded: bool
     timestamp: float
+    file_path: str = ""
 
 
 @dataclass
@@ -85,6 +86,7 @@ class ToolCallTracker:
             args_hash=_hash_args(args),
             succeeded=succeeded,
             timestamp=time.monotonic(),
+            file_path=args.get("file_path", ""),
         ))
 
     def check(self) -> str | None:
@@ -204,13 +206,11 @@ class ToolCallTracker:
 
         # read_file after edit_file/write_file on the same file_path is OK
         current = records[-1]
-        if current.tool_name in _READ_TOOLS:
-            # Check if there's a recent write to the same path in the history
+        if current.tool_name in _READ_TOOLS and current.file_path:
+            # Scan all history (not just until first non-read) for a write to the same path
             for prev in reversed(list(self._history)[:-1]):
-                if prev.tool_name in _WRITE_TOOLS:
+                if prev.tool_name in _WRITE_TOOLS and prev.file_path == current.file_path:
                     return True
-                if prev.tool_name not in _READ_TOOLS:
-                    break
 
         return False
 

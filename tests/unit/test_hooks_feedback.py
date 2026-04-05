@@ -124,7 +124,7 @@ class TestWithHooksFeedbackMerge:
         """deps._post_tool_feedback is also merged into the result."""
         registry = HookRegistry()
         deps.hook_registry = registry
-        deps._post_tool_feedback = "syntax check: ok"
+        deps._post_tool_feedback = ["syntax check: ok"]
 
         async def my_tool(ctx) -> str:
             return "done"
@@ -137,7 +137,7 @@ class TestWithHooksFeedbackMerge:
         assert "done" in result
         assert "syntax check: ok" in result
         # Legacy feedback should be cleared after use
-        assert deps._post_tool_feedback is None
+        assert deps._post_tool_feedback == []
 
     async def test_no_feedback_result_unchanged(self, deps):
         """When no feedback, result stays as-is."""

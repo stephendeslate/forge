@@ -678,7 +678,7 @@ def wire_syntax_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
             )
             if result.returncode != 0:
                 error_msg = result.stderr.strip() or result.stdout.strip()
-                deps._post_tool_feedback = (
+                deps._post_tool_feedback.append(
                     f"⚠ SYNTAX ERROR in {p.name}: {error_msg}\n"
                     "Fix this before proceeding."
                 )
