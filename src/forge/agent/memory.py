@@ -79,3 +79,29 @@ async def get_startup_memories(
 ) -> list[MemoryRow]:
     """Get most recent memories for system prompt injection at startup."""
     return await db.list_memories(project, limit=limit)
+
+
+async def get_relevant_startup_memories(
+    db: Database,
+    project: str,
+    query: str,
+    *,
+    limit: int = 10,
+) -> list[MemoryRow]:
+    """Get memories relevant to a context query for startup injection.
+
+    Falls back to chronological (get_startup_memories) if query is empty
+    or embedding fails.
+    """
+    if not query.strip():
+        return await get_startup_memories(db, project, limit=limit)
+
+    try:
+        embedding = await embed_single(query)
+        embedding_str = format_embedding_for_pg(embedding)
+        return await db.search_memories(
+            embedding_str, project, limit=limit,
+        )
+    except Exception:
+        logger.debug("Semantic startup memory failed, falling back to chronological", exc_info=True)
+        return await get_startup_memories(db, project, limit=limit)

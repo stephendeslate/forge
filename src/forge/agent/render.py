@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import AsyncIterable
 
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -249,6 +249,7 @@ async def render_events(
     has_thinking = False
     last_tool_name: str = ""
     tool_start_time: float = 0.0
+    _last_render_len: int = 0
 
     def _stop_thinking_spinner() -> None:
         nonlocal thinking_live
@@ -337,13 +338,19 @@ async def render_events(
                             visible = _render_text_with_thinking(
                                 raw, console, has_thinking
                             )
+                            _last_render_len = len(raw)
+                            live.update(visible)
                         else:
                             safe_end = _find_safe_boundary(raw)
-                            if safe_end > 0:
+                            # Only re-render when 200+ chars have accumulated since last render
+                            if safe_end > 0 and (safe_end - _last_render_len) >= 200:
                                 visible = Markdown(raw[:safe_end])
-                            else:
+                                _last_render_len = safe_end
+                                live.update(visible)
+                            elif safe_end <= 0 and (len(raw) - _last_render_len) >= 200:
                                 visible = Markdown(raw)
-                        live.update(visible)
+                                _last_render_len = len(raw)
+                                live.update(visible)
 
             elif event.event_kind == "function_tool_call":
                 _stop_thinking_spinner()
@@ -399,8 +406,13 @@ async def render_events(
                 assert isinstance(event, FunctionToolResultEvent)
                 content = event.result.content if hasattr(event.result, "content") else str(event.result)
                 content_str = str(content) if content else "(no output)"
-                outcome = getattr(event.result, "outcome", "success")
-                result_style = "dim green" if outcome == "success" else "dim red"
+                is_error = (
+                    content_str.startswith(("Error:", "Error ", "ModelRetry:"))
+                    or "error:" in content_str[:80].lower()
+                    or content_str.startswith("Command timed out")
+                    or content_str.startswith("Process killed")
+                )
+                result_style = "dim red" if is_error else "dim green"
 
                 # Calculate duration since tool call started
                 duration = time.monotonic() - tool_start_time if tool_start_time > 0 else 0.0
@@ -470,7 +482,7 @@ async def render_events(
 
 def _render_text_with_thinking(
     raw: str, console: Console, has_thinking: bool
-) -> Markdown | Text:
+) -> RenderableType:
     """Render streamed text, handling <think> blocks."""
     if not has_thinking:
         return Markdown(raw)
@@ -496,4 +508,4 @@ def _render_text_with_thinking(
     if not parts:
         return Markdown("")
 
-    return Group(*parts)  # type: ignore[return-value]
+    return Group(*parts)

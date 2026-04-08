@@ -66,8 +66,17 @@ def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
         ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
         return f"ollama:{settings.agent.delegate_model}", _model_settings(num_ctx=ctx)
 
-    # Read-only agents → fast model (already loaded, zero VRAM cost)
+    # Mode-aware routing
+    mode = settings.agent.mode
+
+    # Read-only agents (research, reviewer)
     if agent_type in ("research", "reviewer"):
+        if mode == "max" and is_anthropic_available():
+            # Max mode: cloud for research/review quality
+            model_str = get_anthropic_model_string()
+            if model_str:
+                return model_str, get_anthropic_model_settings()
+        # Local/balanced: fast model (already loaded, zero VRAM cost)
         return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
     # Heuristic for coder agents: check task complexity
@@ -75,7 +84,15 @@ def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
         if not _HEAVY_INDICATORS.search(task):
             return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
-    # Complex tasks → Opus if available, else local heavy
+    # Complex task routing by mode
+    if mode == "local":
+        # Local mode: never use cloud, always local heavy
+        return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
+    elif mode == "max":
+        # Max mode: execution tasks use local heavy (zero API cost)
+        return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
+
+    # Balanced mode: cloud for complex tasks if available, else local heavy
     if is_anthropic_available():
         model_str = get_anthropic_model_string()
         if model_str:
@@ -158,8 +175,6 @@ def _validate_output(result: SubagentResult) -> SubagentResult:
     rather than domain references ("error handling was improved").
     Sets result.success = False if problems are detected.
     """
-    import re
-
     if not result.output or not result.output.strip():
         result.success = False
         result.output = result.output or "(empty output from sub-agent)"
@@ -280,6 +295,7 @@ async def run_subagent(
     parent_hooks: HookRegistry | None = None,
     mcp_servers: list | None = None,
     agent_type: str = "coder",
+    parent_summary: str | None = None,
 ) -> SubagentResult:
     """Spawn a sub-agent to handle a contained task.
 
@@ -291,6 +307,9 @@ async def run_subagent(
         timeout: Maximum execution time in seconds.
         system: System prompt override.
         parent_hooks: If provided, PostToolUse handlers are inherited for observability.
+        mcp_servers: MCP tool servers to pass to the sub-agent.
+        agent_type: Sub-agent role (coder, research, reviewer) — affects tool profile.
+        parent_summary: Conversation context summary from the parent agent.
 
     Returns:
         SubagentResult with output, worktree info, and message history.
@@ -306,12 +325,13 @@ async def run_subagent(
             base = f"{base}/v1"
         os.environ["OLLAMA_BASE_URL"] = base
 
+    delegate_ctx = min(settings.agent.num_ctx, 32768)  # default for Ollama fallback
     if model:
         # Explicit model — assume Ollama if not qualified
         if model.startswith(("anthropic:", "google-gla:", "openai:")):
             model_id = model
             from forge.models.anthropic import get_anthropic_model_settings
-            delegate_settings = get_anthropic_model_settings() if model.startswith("anthropic:") else {}
+            delegate_settings = get_anthropic_model_settings() if model.startswith("anthropic:") else {"timeout": int(timeout)}
         else:
             model_name = model.removeprefix("ollama:")
             model_id = f"ollama:{model_name}"
@@ -334,6 +354,8 @@ async def run_subagent(
 
     # Build system prompt with project context
     full_system = system
+    if parent_summary:
+        full_system += f"\n\n## Current Conversation Context\n{parent_summary}"
     project_ctx = build_project_context(work_dir)
     if project_ctx:
         full_system += f"\n\n{project_ctx}"
@@ -415,6 +437,7 @@ async def run_subagent_and_merge(
     auto_merge: bool = True,
     mcp_servers: list | None = None,
     agent_type: str = "coder",
+    parent_summary: str | None = None,
 ) -> SubagentResult:
     """Run a sub-agent in a worktree, validate output, and optionally merge.
 
@@ -429,11 +452,12 @@ async def run_subagent_and_merge(
     Args:
         parent_hooks: Parent hook registry — PostToolUse handlers inherited for observability.
         auto_merge: If True (default), automatically merge the branch back on success.
+        parent_summary: Brief conversation summary for sub-agent context.
     """
     result = await run_subagent(
         task, cwd, model=model, isolate=True, timeout=timeout,
         parent_hooks=parent_hooks, mcp_servers=mcp_servers,
-        agent_type=agent_type,
+        agent_type=agent_type, parent_summary=parent_summary,
     )
 
     # Validate output for error indicators
@@ -509,6 +533,7 @@ async def run_subagents_parallel(
     mcp_servers: list | None = None,
     max_concurrent: int = 4,
     agent_type: str = "coder",
+    parent_summary: str | None = None,
 ) -> list[SubagentResult]:
     """Run multiple sub-agents concurrently, respecting max_concurrent.
 
@@ -527,6 +552,7 @@ async def run_subagents_parallel(
                 parent_hooks=parent_hooks,
                 mcp_servers=mcp_servers,
                 agent_type=agent_type,
+                parent_summary=parent_summary,
             )
 
     return list(await asyncio.gather(*[_run_one(t) for t in tasks]))

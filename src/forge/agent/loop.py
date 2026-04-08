@@ -61,7 +61,9 @@ These tags are automatically stripped during context compaction, so use them fre
 
 ## General guidelines
 - Read files before editing them to understand existing code.
-- Use edit_file for targeted changes (exact string replacement). Use write_file only for new files or complete rewrites.
+- When you need to read 2+ files, prefer batch_read over multiple read_file calls — it's faster.
+- Use edit_file for single targeted changes. Use multi_edit when making 2+ replacements in the same file — it applies all edits in one call.
+- Use write_file only for new files or complete rewrites.
 - When searching, use search_code with ripgrep patterns. Use list_files to understand project structure.
 - Run commands to test changes, run builds, or gather information.
 - Be concise in explanations. Show what you did, not what you plan to do.
@@ -137,7 +139,8 @@ def create_agent(
     if cwd:
         full_system += "\n\n" + build_project_context(cwd)
 
-    # Model selection: explicit override → Anthropic cloud → local Ollama
+    # Model selection: explicit override → mode-aware → fallback
+    mode = settings.agent.mode
     if model:
         # Explicit model passed — use as-is if already qualified, else assume Ollama
         if ":" in model and not model.startswith("ollama:"):
@@ -147,10 +150,21 @@ def create_agent(
             model_name = model.removeprefix("ollama:")
             model_id = f"ollama:{model_name}"
             ms = _model_settings()
-    elif is_anthropic_available():
-        model_id = get_anthropic_model_string()
-        ms = get_anthropic_model_settings()
+    elif mode == "max":
+        # Max mode: require Anthropic as primary
+        if is_anthropic_available():
+            model_id = get_anthropic_model_string()
+            ms = get_anthropic_model_settings()
+        else:
+            logger.warning("Max mode requested but Anthropic unavailable — falling back to local heavy")
+            model_id = f"ollama:{settings.ollama.heavy_model}"
+            ms = _model_settings()
+    elif mode == "local":
+        # Local mode: always use local heavy, never try cloud
+        model_id = f"ollama:{settings.ollama.heavy_model}"
+        ms = _model_settings()
     else:
+        # Balanced mode: local primary, cloud available for recovery/critique/planning
         model_id = f"ollama:{settings.ollama.heavy_model}"
         ms = _model_settings()
 
@@ -183,18 +197,20 @@ async def _run_with_status(
         active_model = model_override
     elif deps.model_override:
         active_model = deps.model_override
-    else:
+    elif settings.agent.mode == "max":
         from forge.models.anthropic import is_anthropic_available
-        if is_anthropic_available():
-            active_model = settings.anthropic.model
-        else:
-            active_model = settings.ollama.heavy_model
+        active_model = settings.anthropic.model if is_anthropic_available() else settings.ollama.heavy_model
+    elif settings.agent.mode == "local":
+        active_model = settings.ollama.heavy_model
+    else:
+        active_model = settings.ollama.heavy_model
 
     tracker = StatusTracker(
         console=deps.console,
         visible=deps.status_visible,
         model_name=active_model,
         token_budget=settings.agent.token_budget,
+        mode=settings.agent.mode,
     )
     deps.status_tracker = tracker
 
@@ -295,6 +311,8 @@ async def _run_with_status(
         deps.status_tracker = None
         return result.all_messages()
     except BaseException:
+        tracker.tokens_in = deps.tokens_in
+        tracker.tokens_out = deps.tokens_out
         tracker.stop()
         deps.console.print(tracker.summary())
         deps.status_tracker = None
@@ -365,7 +383,7 @@ async def _plan_and_execute(
         )
         plan_text = plan_result.output
     except Exception as e:
-        _handle_agent_error(console, e)
+        _handle_agent_error(console, e, deps=deps)
         return message_history
 
     # Display the plan
@@ -463,7 +481,7 @@ async def agent_repl(
 ) -> None:
     """Run the agentic REPL with tool use."""
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
 
     from forge.agent.commands import _UNCHANGED, CommandContext, dispatch
@@ -590,8 +608,10 @@ async def agent_repl(
             sys.stderr.write(f"\r\033[2K\033[2mTool results: {state} (Ctrl-R to toggle)\033[0m\n")
             sys.stderr.flush()
 
+    history_path = Path.home() / ".config" / "forge" / "history.txt"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
     pt_session: PromptSession[str] = PromptSession(
-        history=InMemoryHistory(), key_bindings=kb,
+        history=FileHistory(str(history_path)), key_bindings=kb,
     )
 
     # Model escalation
@@ -703,9 +723,14 @@ async def agent_repl(
                         turn_counter = result.turn_counter
                 continue
 
+            # Progressive tool result aging — every 5 turns, truncate old results
+            if message_history and turn_counter % 5 == 0:
+                from forge.agent.context import age_tool_results
+                message_history = age_tool_results(message_history)
+
             # Auto-compact if history is getting large
             budget = settings.agent.token_budget
-            if message_history and len(message_history) > 40:
+            if message_history:
                 # Prefer real token count from last Ollama response over estimation
                 if deps._last_prompt_eval_count > 0:
                     tokens = deps._last_prompt_eval_count
@@ -754,6 +779,11 @@ async def agent_repl(
                     agent, prompt, deps, message_history, turn_number=turn_counter,
                 )
 
+                # Update conversation summary for sub-agent context
+                if message_history:
+                    from forge.agent.context import summarize_for_delegation
+                    deps._conversation_summary = summarize_for_delegation(message_history)
+
                 # Restore model after vision turn
                 if vision_override is not None or (isinstance(parsed, list) and settings.ollama.vision_model):
                     deps.model_override = vision_override
@@ -770,8 +800,8 @@ async def agent_repl(
                 _handle_agent_error(console, e, deps=deps)
 
                 # Gemini recovery: retry with fresh cloud agent (no history leak)
-                if deps._gemini_recovery_pending:
-                    deps._gemini_recovery_pending = False
+                if deps._cloud_recovery_pending:
+                    deps._cloud_recovery_pending = False
                     recovery_result = await _cloud_recovery(
                         user_input, deps, console, turn_counter,
                     )
@@ -949,10 +979,14 @@ async def _cloud_recovery(
 
     for model_str, model_settings, label in unique_models:
         try:
+            # Balanced mode: read-only tools to limit cloud's filesystem access
+            # Max mode: full tools (user opted into cloud control)
+            from forge.config import settings as _cfg
+            recovery_tools = READ_ONLY_TOOLS if _cfg.agent.mode == "balanced" else ALL_TOOLS
             recovery_agent: Agent[AgentDeps, str] = Agent(
                 model=model_str,
                 instructions=recovery_system,
-                tools=ALL_TOOLS,
+                tools=recovery_tools,
                 deps_type=AgentDeps,
                 model_settings=model_settings,
                 retries=3,
@@ -981,8 +1015,11 @@ def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None =
     from forge.agent.circuit_breaker import CircuitBreakerTripped
     from forge.models.anthropic import _is_anthropic_error
 
-    # Anthropic cloud errors → fall back to local
+    # Anthropic cloud errors → fall back to local (not in local mode, already local)
     if _is_anthropic_error(e):
+        if settings.agent.mode == "local":
+            console.print(f"[red]Agent error:[/red] {e}")
+            return
         console.print(
             "[yellow]Cloud model unavailable, falling back to local...[/yellow]"
         )
@@ -1011,14 +1048,14 @@ def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None =
         pass
 
     if isinstance(e, CircuitBreakerTripped):
-        if deps:
+        if deps and settings.agent.mode != "local":
             from forge.agent.gemini import is_gemini_available
             if is_gemini_available(deps):
                 console.print(
                     f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
                     "[yellow]Escalating to cloud reasoning (Gemini) for recovery...[/yellow]"
                 )
-                deps._gemini_recovery_pending = True
+                deps._cloud_recovery_pending = True
                 return
         console.print(
             f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
@@ -1029,7 +1066,7 @@ def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None =
 
     if isinstance(e, UsageLimitExceeded):
         console.print(
-            "[yellow]Agent hit the request limit (15 iterations).[/yellow] "
+            f"[yellow]Agent hit the request limit ({settings.agent.request_limit} iterations).[/yellow] "
             "This usually means the model was stuck in a loop. "
             "The partial result has been preserved in history."
         )

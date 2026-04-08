@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -131,7 +132,7 @@ async def setup_persistence(
 
         try:
             await db.create_session(
-                session_id, mode="agent" if system is AGENT_SYSTEM else "chat",
+                session_id, mode="agent" if AGENT_SYSTEM in system else "chat",
             )
         except Exception:
             logger.warning("Session creation failed, disabling persistence", exc_info=True)
@@ -294,15 +295,39 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
             return f"\n\n🔍 AUTO-REVIEW of your recent changes:\n{results}\nAddress these issues."
         return ""
 
+    _memory_cache: list | None = None
+
     @agent.system_prompt
     async def _inject_memories(ctx: RunContext[AgentDeps]) -> str:
+        nonlocal _memory_cache
         if ctx.deps.memory_db and ctx.deps.memory_project:
             try:
-                from forge.agent.memory import get_startup_memories
+                if _memory_cache is not None and not ctx.deps._memory_cache_dirty:
+                    rows = _memory_cache
+                else:
+                    from forge.agent.memory import get_relevant_startup_memories
 
-                rows = await get_startup_memories(
-                    ctx.deps.memory_db, ctx.deps.memory_project, limit=10,
-                )
+                    # Build context query from cwd + git branch
+                    parts = [ctx.deps.cwd.name]
+                    try:
+                        from forge.agent.async_utils import async_run
+                        branch = await async_run(
+                            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                            timeout=5.0,
+                            cwd=str(ctx.deps.cwd),
+                        )
+                        if branch.returncode == 0:
+                            parts.append(branch.stdout.strip())
+                    except Exception:
+                        pass
+
+                    rows = await get_relevant_startup_memories(
+                        ctx.deps.memory_db, ctx.deps.memory_project,
+                        query=" ".join(parts), limit=10,
+                    )
+                    _memory_cache = rows
+                    ctx.deps._memory_cache_dirty = False
+
                 if rows:
                     lines = ["## Remembered context\n"]
                     for r in rows:
@@ -339,14 +364,12 @@ def wire_lint_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
         if not files:
             return
 
-        import subprocess
+        from forge.agent.async_utils import async_run
 
         try:
-            result = subprocess.run(
+            result = await async_run(
                 ["ruff", "check", "--no-fix", "--output-format=concise", *files],
-                capture_output=True,
-                text=True,
-                timeout=30,
+                timeout=30.0,
                 cwd=str(deps.cwd),
             )
             if result.stdout.strip():
@@ -397,13 +420,11 @@ def wire_test_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
         ]
         scoped_cmd = _scope_test_command(test_cmd, real_files)
 
-        import subprocess
+        from forge.agent.async_utils import async_run
 
         try:
-            result = subprocess.run(
+            result = await async_run(
                 scoped_cmd,
-                capture_output=True,
-                text=True,
                 timeout=settings.agent.test_timeout,
                 cwd=str(deps.cwd),
                 shell=True,
@@ -526,6 +547,9 @@ def wire_critique_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
     the fast model for review. Issues are stored on deps for injection into
     the next turn's system prompt.
     """
+    # Skip critique in local mode (no cloud models available for review)
+    if settings.agent.mode == "local":
+        return
 
     async def _run_critique(event: TurnEnd) -> None:
         if not settings.agent.critique_enabled:
@@ -539,24 +563,20 @@ def wire_critique_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
             return
 
         # Generate diff of changes
-        import subprocess
+        from forge.agent.async_utils import async_run
 
         try:
-            result = subprocess.run(
+            result = await async_run(
                 ["git", "diff", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                timeout=10.0,
                 cwd=str(deps.cwd),
             )
             diff_text = result.stdout.strip()
             if not diff_text:
                 # Try unstaged diff
-                result = subprocess.run(
+                result = await async_run(
                     ["git", "diff"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                    timeout=10.0,
                     cwd=str(deps.cwd),
                 )
                 diff_text = result.stdout.strip()
@@ -667,14 +687,12 @@ def wire_syntax_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
         if not p.exists():
             return
 
-        import subprocess
+        from forge.agent.async_utils import async_run
 
         try:
-            result = subprocess.run(
+            result = await async_run(
                 ["python", "-m", "py_compile", str(p)],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                timeout=10.0,
             )
             if result.returncode != 0:
                 error_msg = result.stderr.strip() or result.stdout.strip()
@@ -752,6 +770,13 @@ def print_welcome(
     mode_text = "agentic coding" if is_agent else "chat + tools"
     logo.append(f"  {mode_text}", style="italic dim")
 
+    # Mode badge
+    mode = settings.agent.mode
+    mode_styles = {"local": "bold green", "balanced": "bold cyan", "max": "bold magenta"}
+    mode_labels = {"local": "LOCAL", "balanced": "HYBRID", "max": "MAX"}
+    logo.append("  ")
+    logo.append(f"[{mode_labels.get(mode, mode.upper())}]", style=mode_styles.get(mode, "bold"))
+
     # ── Model grid ──
     from forge.models.anthropic import is_anthropic_available
 
@@ -759,12 +784,21 @@ def print_welcome(
     model_grid.add_column(style="dim", min_width=10)  # label
     model_grid.add_column()  # value
 
-    if is_anthropic_available():
+    if mode == "max" and is_anthropic_available():
         model_grid.add_row(
             "  heavy",
             Text.assemble(
                 ("☁ ", "cyan"), (settings.anthropic.model, "bold cyan"),
                 ("  fallback: ", "dim"), (settings.ollama.heavy_model, "green"),
+            ),
+        )
+    elif mode == "max":
+        # Max mode but Anthropic unavailable — show warning
+        model_grid.add_row(
+            "  heavy",
+            Text.assemble(
+                (settings.ollama.heavy_model, "bold green"),
+                ("  ⚠ cloud unavailable", "yellow"),
             ),
         )
     else:
@@ -907,6 +941,9 @@ async def cleanup(
     # Close Ollama monitor
     if deps.ollama_monitor:
         await deps.ollama_monitor.close()
+
+    # Kill orphan background processes
+    await deps.cleanup()
 
     # Shut down MCP servers
     await mcp_stack.aclose()

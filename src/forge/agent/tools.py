@@ -19,6 +19,9 @@ from forge.log import get_logger
 
 logger = get_logger(__name__)
 
+# Image file extensions — used by read_file and batch_read
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"})
+
 
 # --- Edit diff formatting ---
 
@@ -102,10 +105,16 @@ async def _read_output_incremental(
     max_bytes: int,
     status_tracker: object | None = None,
     status_interval: float = 2.0,
+    shared_stdout: list[bytes] | None = None,
+    shared_stderr: list[bytes] | None = None,
 ) -> tuple[bytes, bytes, bool]:
     """Read stdout/stderr incrementally with size guard and optional streaming.
 
     Returns (stdout_bytes, stderr_bytes, was_killed_for_size).
+
+    If shared_stdout/shared_stderr lists are provided, chunks are appended
+    there too, making partial output accessible even if this coroutine is
+    cancelled (e.g. by auto-background timeout).
     """
     from forge.agent.status import Phase
 
@@ -115,7 +124,11 @@ async def _read_output_incremental(
     killed = False
     last_status_update = 0.0
 
-    async def _read_stream(stream: asyncio.StreamReader | None, chunks: list[bytes]) -> None:
+    async def _read_stream(
+        stream: asyncio.StreamReader | None,
+        chunks: list[bytes],
+        shared: list[bytes] | None = None,
+    ) -> None:
         nonlocal total_bytes, killed, last_status_update
         if stream is None:
             return
@@ -124,6 +137,8 @@ async def _read_output_incremental(
             if not chunk:
                 break
             chunks.append(chunk)
+            if shared is not None:
+                shared.append(chunk)
             total_bytes += len(chunk)
 
             # Output size kill guard
@@ -137,7 +152,7 @@ async def _read_output_incremental(
 
             # Streaming status updates
             if status_tracker and hasattr(status_tracker, "set_phase"):
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 if (now - last_status_update) >= status_interval:
                     last_line = chunk.decode("utf-8", errors="replace").rstrip().rsplit("\n", 1)[-1]
                     if last_line.strip():
@@ -146,8 +161,8 @@ async def _read_output_incremental(
 
     # Read both streams concurrently
     await asyncio.gather(
-        _read_stream(proc.stdout, stdout_chunks),
-        _read_stream(proc.stderr, stderr_chunks),
+        _read_stream(proc.stdout, stdout_chunks, shared_stdout),
+        _read_stream(proc.stderr, stderr_chunks, shared_stderr),
     )
 
     return b"".join(stdout_chunks), b"".join(stderr_chunks), killed
@@ -159,6 +174,34 @@ def _resolve_path(ctx: RunContext[AgentDeps], file_path: str) -> Path:
     if not p.is_absolute():
         p = ctx.deps.cwd / p
     return p.resolve()
+
+
+def _validate_path(ctx: RunContext[AgentDeps], file_path: str) -> Path:
+    """Resolve and validate a file path against sandbox boundaries.
+
+    Returns the resolved Path, or raises ModelRetry if the path is outside
+    allowed directories. Defense-in-depth — sandbox hooks also check this.
+    """
+    from forge.agent.sandbox import check_path_boundary
+
+    resolved = _resolve_path(ctx, file_path)
+    error = check_path_boundary(str(resolved), ctx.deps.cwd)
+    if error:
+        raise ModelRetry(error)
+    return resolved
+
+
+def _validate_command(command: str) -> None:
+    """Check a command against the sandbox blocklist.
+
+    Raises ModelRetry if the command is blocked.
+    Defense-in-depth — sandbox hooks also check this.
+    """
+    from forge.agent.sandbox import check_command_blocklist
+
+    error = check_command_blocklist(command)
+    if error:
+        raise ModelRetry(error)
 
 
 async def read_file(
@@ -174,14 +217,13 @@ async def read_file(
         offset: Line number to start reading from (0-based).
         limit: Maximum number of lines to return.
     """
-    path = _resolve_path(ctx, file_path)
+    path = _validate_path(ctx, file_path)
     if not path.exists():
         raise ModelRetry(f"File not found: {path} — check the path and try again")
     if not path.is_file():
         raise ModelRetry(f"Not a file: {path} — this is a directory, use list_files instead")
 
     # Detect image files — return metadata instead of garbled binary
-    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
     if path.suffix.lower() in IMAGE_EXTENSIONS:
         size = path.stat().st_size
         return (
@@ -220,7 +262,7 @@ async def write_file(
         file_path: Path to the file (relative to cwd or absolute).
         content: The full content to write to the file.
     """
-    path = _resolve_path(ctx, file_path)
+    path = _validate_path(ctx, file_path)
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +290,7 @@ async def edit_file(
     """
     from forge.agent.edit_utils import EditMatchError, find_and_replace
 
-    path = _resolve_path(ctx, file_path)
+    path = _validate_path(ctx, file_path)
     if not path.exists():
         raise ModelRetry(f"File not found: {path} — check the path and try again")
 
@@ -281,6 +323,116 @@ async def edit_file(
     return msg
 
 
+async def batch_read(
+    ctx: RunContext[AgentDeps],
+    file_paths: list[str],
+) -> str:
+    """Read multiple files in a single call. Use this instead of multiple read_file
+    calls when you need to examine several files at once.
+
+    Args:
+        file_paths: List of file paths to read (relative to cwd or absolute). Max 20.
+    """
+    if not file_paths:
+        raise ModelRetry("file_paths is empty — provide at least one path")
+    if len(file_paths) > 20:
+        raise ModelRetry("Too many files — max 20 per batch_read call")
+
+    parts: list[str] = []
+    for fp in file_paths:
+        path = _validate_path(ctx, fp)
+        if not path.exists():
+            parts.append(f"=== {fp} ===\nError: File not found: {path}")
+            continue
+        if not path.is_file():
+            parts.append(f"=== {fp} ===\nError: Not a file (directory?): {path}")
+            continue
+
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            size = path.stat().st_size
+            parts.append(f"=== {fp} ===\n[Image file: {path.suffix.lower()}, {size:,} bytes]")
+            continue
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            parts.append(f"=== {fp} ===\nError reading: {e}")
+            continue
+
+        lines = text.splitlines()
+        total = len(lines)
+        selected = lines[:2000]
+        numbered = [f"{i:>6}\t{line}" for i, line in enumerate(selected, start=1)]
+        header = f"=== {fp} ({total} lines) ==="
+        if len(selected) < total:
+            header += f" [showing lines 1-{len(selected)}]"
+        parts.append(header + "\n" + "\n".join(numbered))
+
+    return "\n\n".join(parts)
+
+
+async def multi_edit(
+    ctx: RunContext[AgentDeps],
+    file_path: str,
+    edits: list[dict[str, str]],
+) -> str:
+    """Apply multiple edits to a single file in one call. Each edit is an
+    old_text/new_text replacement applied sequentially on the updated content.
+
+    Args:
+        file_path: Path to the file (relative to cwd or absolute).
+        edits: List of dicts, each with 'old_text' and 'new_text' keys.
+    """
+    from forge.agent.edit_utils import EditMatchError, apply_edits
+
+    if not edits:
+        raise ModelRetry("edits list is empty")
+    if len(edits) > 20:
+        raise ModelRetry("Too many edits — max 20 per multi_edit call")
+
+    path = _validate_path(ctx, file_path)
+    if not path.exists():
+        raise ModelRetry(f"File not found: {path} — check the path and try again")
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    edit_pairs = []
+    for i, ed in enumerate(edits):
+        old = ed.get("old_text")
+        new = ed.get("new_text")
+        if old is None or new is None:
+            raise ModelRetry(f"Edit {i + 1} missing 'old_text' or 'new_text' key")
+        edit_pairs.append((old, new))
+
+    try:
+        new_content, methods, warnings = apply_edits(text, edit_pairs)
+    except EditMatchError as e:
+        raise ModelRetry(str(e))
+
+    try:
+        path.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        return f"Error writing {path}: {e}"
+
+    # Build summary
+    parts = [f"Applied {len(edits)} edits to {path}"]
+    for i, (method, warning) in enumerate(zip(methods, warnings)):
+        if method != "exact" or warning:
+            detail = f"  Edit {i + 1}: matched via {method}"
+            if warning:
+                detail += f" — {warning}"
+            parts.append(detail)
+
+    diff_str = _format_edit_diff(text, new_content, str(path))
+    if diff_str:
+        parts.append(f"\n{diff_str}")
+
+    return "\n".join(parts)
+
+
 async def run_command(
     ctx: RunContext[AgentDeps],
     command: str,
@@ -297,6 +449,8 @@ async def run_command(
     if timeout <= 0:
         timeout = _settings.agent.run_command_timeout
 
+    _validate_command(command)
+
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -311,29 +465,37 @@ async def run_command(
     # Auto-background: if threshold is set, wait that long then background it
     bg_threshold = _settings.agent.run_command_background_threshold
     if bg_threshold > 0:
-        try:
-            stdout, stderr, was_killed = await asyncio.wait_for(
-                _read_output_incremental(
-                    proc,
-                    max_bytes=_settings.agent.run_command_max_output_bytes,
-                    status_tracker=ctx.deps.status_tracker,
-                    status_interval=_settings.agent.run_command_status_interval,
-                ),
-                timeout=bg_threshold,
+        # Create the reader task upfront — if we background, this same task
+        # keeps running (no data loss from cancellation/re-creation).
+        _shared_out: list[bytes] = []
+        _shared_err: list[bytes] = []
+        reader_task = asyncio.create_task(
+            _read_output_incremental(
+                proc,
+                max_bytes=_settings.agent.run_command_max_output_bytes,
+                status_tracker=ctx.deps.status_tracker,
+                status_interval=_settings.agent.run_command_status_interval,
+                shared_stdout=_shared_out,
+                shared_stderr=_shared_err,
             )
-        except asyncio.TimeoutError:
-            # Background the process instead of killing it
-            bg_task = asyncio.create_task(
-                _read_output_incremental(
-                    proc,
-                    max_bytes=_settings.agent.run_command_max_output_bytes,
-                )
-            )
-            ctx.deps._background_procs[proc.pid] = (bg_task, proc)
-            return (
-                f"Command still running after {bg_threshold:.0f}s — moved to background (PID: {proc.pid}).\n"
-                f"Use check_background(pid={proc.pid}) to check status."
-            )
+        )
+        done, _pending = await asyncio.wait({reader_task}, timeout=bg_threshold)
+        if reader_task in done:
+            stdout, stderr, was_killed = reader_task.result()
+        else:
+            # Not done yet — background the still-running task
+            ctx.deps._background_procs[proc.pid] = (reader_task, proc)
+            partial = b"".join(_shared_out).decode("utf-8", errors="replace").strip()
+            partial_err = b"".join(_shared_err).decode("utf-8", errors="replace").strip()
+            msg = f"Command still running after {bg_threshold:.0f}s — moved to background (PID: {proc.pid}).\n"
+            if partial:
+                truncated = partial[:5000] + ("..." if len(partial) > 5000 else "")
+                msg += f"\nPartial stdout so far:\n{truncated}\n"
+            if partial_err:
+                truncated_err = partial_err[:2000] + ("..." if len(partial_err) > 2000 else "")
+                msg += f"\nPartial stderr so far:\n{truncated_err}\n"
+            msg += f"\nUse check_background(pid={proc.pid}) to check status."
+            return msg
     else:
         try:
             stdout, stderr, was_killed = await asyncio.wait_for(
@@ -409,7 +571,7 @@ async def search_code(
     """
     from forge.config import settings as _settings
 
-    search_path = _resolve_path(ctx, path)
+    search_path = _validate_path(ctx, path)
     if not search_path.exists():
         return f"Error: Path not found: {search_path}"
 
@@ -464,7 +626,7 @@ async def list_files(
         pattern: Glob pattern (default: "**/*" for all files).
         path: Directory to search in (relative to cwd or absolute).
     """
-    search_path = _resolve_path(ctx, path)
+    search_path = _validate_path(ctx, path)
     if not search_path.exists():
         return f"Error: Path not found: {search_path}"
 
@@ -474,7 +636,7 @@ async def list_files(
         return f"Error: {e}"
 
     # Filter to files only, skip hidden dirs and common noise
-    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", ".mypy_cache", ".ruff_cache"}
+    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", ".forge", ".mypy_cache", ".ruff_cache"}
     files = []
     for m in matches:
         if m.is_file() and not any(part in skip_dirs for part in m.parts):
@@ -891,6 +1053,7 @@ async def save_memory(
         mid = await save_memory_to_db(
             ctx.deps.memory_db, ctx.deps.memory_project, category, subject, content,
         )
+        ctx.deps._memory_cache_dirty = True
         return f"Memory saved (id={mid}, category={category}): {subject}"
     except Exception as e:
         return f"Error saving memory: {e}"
@@ -1093,6 +1256,7 @@ async def check_background(
 ALL_TOOLS: list[Tool] = [
     # Read-only tools — safe for parallel execution
     Tool(with_hooks(read_file)),
+    Tool(with_hooks(batch_read)),
     Tool(with_hooks(search_code)),
     Tool(with_hooks(list_files)),
     Tool(with_hooks(web_search)),
@@ -1102,12 +1266,14 @@ ALL_TOOLS: list[Tool] = [
     # Write/execute tools — sequential to prevent races
     Tool(with_hooks(write_file), sequential=True),
     Tool(with_hooks(edit_file), sequential=True),
+    Tool(with_hooks(multi_edit), sequential=True),
     Tool(with_hooks(run_command), sequential=True),
 ]
 
 # Read-only tools for planning mode — explore codebase before planning
 READ_ONLY_TOOLS: list[Tool] = [
     Tool(with_hooks(read_file)),
+    Tool(with_hooks(batch_read)),
     Tool(with_hooks(search_code)),
     Tool(with_hooks(list_files)),
     Tool(with_hooks(analyze_impact)),
@@ -1159,6 +1325,7 @@ async def delegate(
         parent_hooks=ctx.deps.hook_registry,
         mcp_servers=ctx.deps.mcp_servers,
         agent_type=agent_type,
+        parent_summary=ctx.deps._conversation_summary or None,
     )
     if not result.success:
         raise ModelRetry(f"Sub-agent failed: {result.output}")
@@ -1196,6 +1363,7 @@ async def delegate_parallel(
         model=model,
         parent_hooks=ctx.deps.hook_registry,
         mcp_servers=ctx.deps.mcp_servers,
+        parent_summary=ctx.deps._conversation_summary or None,
     )
 
     parts = []

@@ -14,6 +14,78 @@ logger = get_logger(__name__)
 FILE_TOOLS = frozenset({"read_file", "write_file", "edit_file"})
 
 
+# ── Pure check functions (reusable outside hooks, e.g. in MCP server) ──
+
+def check_command_blocklist(command: str) -> str | None:
+    """Check a command against the sandbox blocklist.
+
+    Returns an error message if blocked, None if allowed.
+    """
+    from forge.config import settings
+
+    if not settings.sandbox.enabled:
+        return None
+
+    segments = _split_command_segments(command)
+    check_targets = [command] + [s for s in segments if s != command]
+
+    for target in check_targets:
+        for pattern in settings.sandbox.blocked_patterns:
+            try:
+                if re.search(pattern, target):
+                    detail = f"Matched segment: `{target}`\n" if target != command else ""
+                    return (
+                        f"Command blocked by safety policy: `{command}`\n"
+                        f"{detail}"
+                        f"Matched pattern: `{pattern}`"
+                    )
+            except re.error:
+                pass
+
+    # Infinite loop detection
+    if re.search(r"\bwhile\s+true\s*;?\s*do\b", command) or re.search(
+        r"\bfor\s*\(\s*;\s*;\s*\)", command
+    ):
+        return f"Blocked: infinite loop detected in `{command[:80]}`."
+
+    return None
+
+
+def check_path_boundary(file_path: str, cwd: Path) -> str | None:
+    """Check if a file path is within allowed boundaries.
+
+    Returns an error message if outside boundaries, None if allowed.
+    """
+    from forge.config import settings
+
+    if not settings.sandbox.enabled or not settings.sandbox.restrict_paths:
+        return None
+
+    p = Path(file_path)
+    if not p.is_absolute():
+        p = (cwd / p).resolve()
+    else:
+        p = p.resolve()
+
+    resolved_cwd = cwd.resolve()
+    allowed_roots = [resolved_cwd, Path("/tmp")]
+    for extra in settings.sandbox.allowed_paths:
+        allowed_roots.append(Path(extra).resolve())
+
+    for root in allowed_roots:
+        try:
+            p.relative_to(root)
+            return None
+        except ValueError:
+            continue
+
+    return (
+        f"Path outside allowed directories: `{p}`\n"
+        f"Allowed: {resolved_cwd}, /tmp"
+        + (f", {', '.join(settings.sandbox.allowed_paths)}" if settings.sandbox.allowed_paths else "")
+    )
+
+
 def _split_command_segments(command: str) -> list[str]:
     """Split a compound command into individual segments.
 

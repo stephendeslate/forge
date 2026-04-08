@@ -631,3 +631,81 @@ async def smart_compact_history(
     # Fallback to mechanical compaction
     logger.debug("Compact fallback: mechanical compaction")
     return compact_history(messages, token_budget)
+
+
+def age_tool_results(
+    messages: list[ModelMessage],
+    age_threshold: int = 15,
+    max_chars: int = 1500,
+) -> list[ModelMessage]:
+    """Truncate old tool results to save context budget.
+
+    Messages older than `age_threshold` from the end with ToolReturnPart
+    content longer than `max_chars` get truncated via head_tail_truncate.
+    Returns a new list — no in-place mutation.
+    """
+    from forge.agent.utils import head_tail_truncate
+
+    if len(messages) <= age_threshold:
+        return messages
+
+    cutoff = len(messages) - age_threshold
+    result: list[ModelMessage] = []
+
+    for i, msg in enumerate(messages):
+        if i < cutoff and isinstance(msg, ModelRequest):
+            new_parts: list[ModelRequestPart] = []
+            changed = False
+            for part in msg.parts:
+                if isinstance(part, ToolReturnPart) and isinstance(part.content, str) and len(part.content) > max_chars:
+                    new_part = ToolReturnPart(
+                        tool_name=part.tool_name,
+                        content=head_tail_truncate(part.content, max_chars),
+                        tool_call_id=part.tool_call_id,
+                        timestamp=part.timestamp,
+                    )
+                    new_parts.append(new_part)
+                    changed = True
+                else:
+                    new_parts.append(part)
+            if changed:
+                result.append(ModelRequest(parts=new_parts))
+            else:
+                result.append(msg)
+        else:
+            result.append(msg)
+
+    return result
+
+
+def summarize_for_delegation(messages: list[ModelMessage], *, max_chars: int = 1500) -> str:
+    """Build a brief conversation summary for sub-agent context injection.
+
+    Extracts the last few user/assistant messages and formats as bullet points.
+    No LLM call — purely mechanical extraction.
+    """
+    snippets: list[str] = []
+    for msg in reversed(messages):
+        if len(snippets) >= 5:
+            break
+        if isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                    text = part.content.strip()
+                    if text and not text.startswith("[Context compacted"):
+                        snippets.append(f"- User: {text[:300]}")
+                        break
+        elif isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, TextPart) and part.content.strip():
+                    snippets.append(f"- Assistant: {part.content.strip()[:300]}")
+                    break
+
+    if not snippets:
+        return ""
+
+    snippets.reverse()
+    result = "\n".join(snippets)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "..."
+    return result

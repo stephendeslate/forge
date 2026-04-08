@@ -77,6 +77,7 @@ class StatusTracker:
     visible: bool = True
     model_name: str = ""
     token_budget: int = 0
+    mode: str = ""
     _start_time: float = field(default=0.0, init=False)
     _phase: Phase = field(default=Phase.THINKING, init=False)
     _detail: str = field(default="", init=False)
@@ -88,6 +89,9 @@ class StatusTracker:
     _on_toggle: Callable[[bool], None] | None = field(default=None, init=False)
     _on_tools_toggle: Callable[[], None] | None = field(default=None, init=False)
     _spinner_idx: int = field(default=0, init=False)
+    # Token tracking — set externally after each turn
+    tokens_in: int = field(default=0, init=False)
+    tokens_out: int = field(default=0, init=False)
 
     @property
     def tool_calls(self) -> int:
@@ -147,10 +151,6 @@ class StatusTracker:
     def increment_tool_calls(self) -> None:
         """Increment the tool call counter."""
         self._tool_calls += 1
-
-    # Token tracking — set externally after each turn
-    tokens_in: int = field(default=0, init=False)
-    tokens_out: int = field(default=0, init=False)
 
     def summary(self) -> str:
         """Return a final summary string with Rich markup."""
@@ -240,7 +240,16 @@ class StatusTracker:
                 short = short[:18] + "…"
             model_str = f" {dim}│{reset} \033[36m{short}{reset}"
 
-        line = f" {phase_str} {dim}│{reset} {elapsed_str}{tc_str}{tok_str}{ctx_bar}{model_str} "
+        # Mode badge
+        mode_str = ""
+        if self.mode:
+            mode_labels = {"local": "LOCAL", "balanced": "HYBRID", "max": "MAX"}
+            mode_colors = {"local": "\033[32m", "balanced": "\033[36m", "max": "\033[35m"}
+            label = mode_labels.get(self.mode, self.mode.upper())
+            mcolor = mode_colors.get(self.mode, dim)
+            mode_str = f" {mcolor}[{label}]{reset}"
+
+        line = f" {phase_str} {dim}│{reset} {elapsed_str}{tc_str}{tok_str}{ctx_bar}{model_str}{mode_str} "
 
         sys.stderr.write(f"\r\033[2K{line}")
         sys.stderr.flush()

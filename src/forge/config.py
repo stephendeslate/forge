@@ -88,6 +88,7 @@ class HookSettings(BaseSettings):
 class AgentSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_AGENT_")
 
+    mode: Literal["local", "balanced", "max"] = Field(default="balanced", description="Operating mode: local (all local), balanced (local-first, cloud-augmented), max (cloud-orchestrated)")
     num_ctx: int = Field(default=131072, description="Ollama num_ctx — context window size in tokens")
     fast_num_ctx: int = Field(default=8192, description="Context window for fast model (smaller = less VRAM, enables coexistence)")
     token_budget: int = Field(default=120000, description="Max tokens before auto-compaction triggers")
@@ -101,7 +102,7 @@ class AgentSettings(BaseSettings):
     list_files_limit: int = Field(default=500, description="Max files returned by list_files")
     rag_max_tokens: int = Field(default=12000, description="Max tokens of RAG context injected into prompts")
     delegate_model: str = Field(default="", description="Model for sub-agent delegation (empty = use heavy model)")
-    compaction_model: str = Field(default="qwen3.5:4b", description="Model for compaction summarization (empty = use heavy model)")
+    compaction_model: str = Field(default="", description="Model for compaction summarization (empty = use heavy model)")
     preload_model: bool = Field(default=True, description="Preload the heavy model on agent startup")
 
     # Circuit breaker
@@ -209,6 +210,31 @@ class Settings(BaseSettings):
     def ensure_config_dir(cls) -> Path:
         _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         return _CONFIG_DIR
+
+
+_VALID_MODES = {"local", "balanced", "max"}
+
+
+def apply_mode(mode: str) -> None:
+    """Override settings based on operating mode.
+
+    - local: disable all cloud services
+    - balanced: re-enable cloud services (defaults)
+    - max: ensure Anthropic is enabled, set mode for create_agent to force cloud primary
+    """
+    if mode not in _VALID_MODES:
+        raise ValueError(f"Invalid mode '{mode}'. Must be one of: {', '.join(sorted(_VALID_MODES))}")
+    settings.agent.mode = mode  # type: ignore[assignment]
+    if mode == "local":
+        settings.anthropic.enabled = False
+        settings.gemini.enabled = False
+    elif mode == "balanced":
+        # Explicit reset — ensures switching from local→balanced re-enables cloud
+        settings.anthropic.enabled = True
+        settings.gemini.enabled = True
+    elif mode == "max":
+        settings.anthropic.enabled = True
+        settings.gemini.enabled = True
 
 
 settings = Settings()

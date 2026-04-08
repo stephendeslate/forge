@@ -75,7 +75,7 @@ class AgentDeps:
     critique_results: str | None = None
     # Cloud reasoning (Gemini)
     cloud_reasoning_enabled: bool = False
-    _gemini_recovery_pending: bool = False
+    _cloud_recovery_pending: bool = False
     # Cloud fallback (Anthropic → local)
     _cloud_fallback_pending: bool = False
     # Write escalation flag (set by sandbox write detector for sed -i, etc.)
@@ -84,3 +84,23 @@ class AgentDeps:
     _last_prompt_eval_count: int = 0
     # Background processes (auto-backgrounded long commands)
     _background_procs: dict[int, tuple[asyncio.Task, asyncio.subprocess.Process]] = field(default_factory=dict)
+    # Conversation summary for sub-agent context injection
+    _conversation_summary: str = ""
+    # Memory cache invalidation (set True when save_memory is called)
+    _memory_cache_dirty: bool = False
+
+    async def cleanup(self) -> None:
+        """Clean up orphan background processes and resources."""
+        for pid, (task, proc) in list(self._background_procs.items()):
+            try:
+                if proc.returncode is None:
+                    import os
+                    import signal
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        proc.kill()
+                task.cancel()
+            except Exception:
+                pass
+        self._background_procs.clear()

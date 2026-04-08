@@ -264,3 +264,31 @@ def _build_diagnostic(text: str, old_text: str) -> str:
         )
 
     return "old_text not found in file — read the file first to get the exact text"
+
+
+def apply_edits(
+    content: str, edits: list[tuple[str, str]]
+) -> tuple[str, list[str], list[str]]:
+    """Apply multiple find-and-replace edits sequentially on the same buffer.
+
+    Each edit operates on the content produced by the previous edit.
+
+    Args:
+        content: Original file content.
+        edits: List of (old_text, new_text) pairs.
+
+    Returns:
+        (final_content, match_methods, warnings) — match_methods[i] is
+        the method used for edit i. On failure, raises EditMatchError
+        indicating which edit index failed.
+    """
+    methods: list[str] = []
+    warnings: list[str] = []
+    for i, (old_text, new_text) in enumerate(edits):
+        try:
+            content, method, warning = find_and_replace(content, old_text, new_text)
+        except EditMatchError as e:
+            raise EditMatchError(f"Edit {i + 1}/{len(edits)} failed: {e}") from e
+        methods.append(method)
+        warnings.append(warning)
+    return content, methods, warnings
