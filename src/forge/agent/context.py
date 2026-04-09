@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 
 from pydantic_ai.messages import (
@@ -467,11 +466,8 @@ async def _summarize_with_prompt(
             f"Conversation:\n{conversation_text}"
         )
 
-    if "OLLAMA_BASE_URL" not in os.environ:
-        base = settings.ollama.base_url.rstrip("/")
-        if not base.endswith("/v1"):
-            base = f"{base}/v1"
-        os.environ["OLLAMA_BASE_URL"] = base
+    from forge.models.ollama import _ensure_ollama_env
+    _ensure_ollama_env()
 
     try:
         from forge.models.ollama import _model_settings

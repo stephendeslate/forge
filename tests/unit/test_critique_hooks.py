@@ -72,7 +72,7 @@ class TestCritiqueHooksExecution:
             with patch(
                 "forge.agent.session._call_critique_model",
                 new_callable=AsyncMock,
-                return_value="Issue: missing error handling in a.py",
+                return_value=("Issue: missing error handling in a.py", "gemini"),
             ):
                 await registry.emit(TurnEnd(
                     turn_number=1, tool_call_count=2, elapsed=1.0,
@@ -154,7 +154,7 @@ class TestCritiqueHooksExecution:
             with patch(
                 "forge.agent.session._call_critique_model",
                 new_callable=AsyncMock,
-                return_value="LGTM - looks good to me",
+                return_value=("LGTM - looks good to me", "gemini"),
             ):
                 await registry.emit(TurnEnd(
                     turn_number=1, tool_call_count=2, elapsed=1.0,
@@ -179,7 +179,7 @@ class TestCritiqueHooksExecution:
 
         async def capture_critique(diff_text, deps):
             captured_diff.append(diff_text)
-            return "LGTM"
+            return "LGTM", "local"
 
         with patch("subprocess.run", return_value=mock_diff):
             with patch(
@@ -249,8 +249,9 @@ class TestCallCritiqueModel:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            result = await _call_critique_model("diff content", deps)
+            result, source = await _call_critique_model("diff content", deps)
             assert result == "Found potential bug in line 5"
+            assert source == "local"
 
     @pytest.mark.asyncio
     async def test_returns_none_on_error(self, deps):
@@ -261,7 +262,7 @@ class TestCallCritiqueModel:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            result = await _call_critique_model("diff", deps)
+            result, source = await _call_critique_model("diff", deps)
             assert result is None
 
     @pytest.mark.asyncio
@@ -276,7 +277,7 @@ class TestCallCritiqueModel:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = mock_client
 
-            result = await _call_critique_model("diff", deps)
+            result, source = await _call_critique_model("diff", deps)
             assert result is None
 
 

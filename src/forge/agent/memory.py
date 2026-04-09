@@ -61,14 +61,16 @@ async def recall_from_db(
     *,
     category: str | None = None,
     limit: int = 5,
+    min_score: float | None = None,
 ) -> list[MemoryRow]:
     """Embed query and search memories by similarity."""
     embedding = await embed_single(query)
     embedding_str = format_embedding_for_pg(embedding)
 
-    return await db.search_memories(
-        embedding_str, project, category=category, limit=limit,
-    )
+    kwargs: dict = dict(category=category, limit=limit)
+    if min_score is not None:
+        kwargs["min_score"] = min_score
+    return await db.search_memories(embedding_str, project, **kwargs)
 
 
 async def get_startup_memories(

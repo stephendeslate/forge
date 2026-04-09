@@ -227,14 +227,6 @@ async def cmd_model(ctx: CommandContext, args: str) -> CommandResult:
         if ctx.deps.escalator:
             ctx.deps.escalator.reset()
         ctx.console.print(f"[dim]Model: {settings.ollama.fast_model} (fast)[/dim]")
-    elif arg in ("opus", "anthropic", "cloud"):
-        from forge.models.anthropic import get_anthropic_model_string
-        model_str = get_anthropic_model_string()
-        if model_str:
-            ctx.deps.model_override = model_str
-            ctx.console.print(f"[dim]Model: {model_str} (cloud)[/dim]")
-        else:
-            ctx.console.print("[red]Anthropic not available[/red]")
     else:
         ctx.deps.model_override = arg
         ctx.console.print(f"[dim]Model: {arg}[/dim]")
@@ -291,7 +283,10 @@ async def cmd_memory(ctx: CommandContext, args: str) -> CommandResult:
             try:
                 from forge.agent.memory import recall_from_db
 
-                rows = await recall_from_db(ctx.deps.memory_db, ctx.deps.memory_project, query)
+                rows = await recall_from_db(
+                    ctx.deps.memory_db, ctx.deps.memory_project, query,
+                    min_score=0.1,  # Permissive for explicit user searches
+                )
                 if rows:
                     for r in rows:
                         score = f"{r.score:.2f}" if r.score else ""
@@ -370,6 +365,7 @@ async def cmd_help(ctx: CommandContext, args: str) -> CommandResult:
             "/mcp           — list connected MCP servers\n"
             "/memory        — show memory stats / search memories\n"
             "/forget <id>   — delete a memory by ID\n"
+            "/exemplars     — list captured cloud model exemplars\n"
             "/checkpoint    — save conversation checkpoint [name]\n"
             "/restore <n>   — restore to named checkpoint\n"
             "/checkpoints   — list saved checkpoints\n"
@@ -532,6 +528,94 @@ async def cmd_checkpoints(ctx: CommandContext, args: str) -> CommandResult:
     return CommandResult()
 
 
+async def cmd_exemplars(ctx: CommandContext, args: str) -> CommandResult:
+    """List or manage exemplars — captured cloud model successes for local model learning."""
+    parts = args.strip().split(maxsplit=1)
+
+    # /exemplars show <id>
+    if parts and parts[0].lower() == "show" and len(parts) > 1:
+        try:
+            eid = int(parts[1])
+            if ctx.deps.memory_db:
+                ex = await ctx.deps.memory_db.get_exemplar(eid)
+                if ex:
+                    created = ex.created_at.strftime("%Y-%m-%d %H:%M") if ex.created_at else "?"
+                    last_used = ex.last_used_at.strftime("%Y-%m-%d %H:%M") if ex.last_used_at else "never"
+                    ctx.console.print(Panel(
+                        f"[cyan]Type:[/cyan] {ex.task_type}  "
+                        f"[cyan]Source:[/cyan] {ex.model_source}  "
+                        f"[cyan]Score:[/cyan] {ex.outcome_score:.2f}  "
+                        f"[cyan]Used:[/cyan] {ex.used_count}x\n"
+                        f"[cyan]Created:[/cyan] {created}  "
+                        f"[cyan]Last used:[/cyan] {last_used}\n\n"
+                        f"[bold]Task:[/bold]\n{ex.task_description}\n\n"
+                        f"[bold]Approach:[/bold]\n{ex.solution_approach[:2000]}"
+                        + (f"\n... ({len(ex.solution_approach)} chars total)" if len(ex.solution_approach) > 2000 else ""),
+                        title=f"Exemplar #{ex.id}",
+                        border_style="cyan",
+                    ))
+                else:
+                    ctx.console.print(f"[dim]Exemplar #{eid} not found.[/dim]")
+            else:
+                ctx.console.print("[dim]Database unavailable.[/dim]")
+        except ValueError:
+            ctx.console.print("[dim]Usage: /exemplars show <id> (numeric ID)[/dim]")
+        return CommandResult()
+
+    # /exemplars delete <id>
+    if parts and parts[0].lower() == "delete" and len(parts) > 1:
+        try:
+            eid = int(parts[1])
+            if ctx.deps.memory_db:
+                deleted = await ctx.deps.memory_db.delete_exemplar(eid)
+                if deleted:
+                    ctx.console.print(f"[dim]Deleted exemplar #{eid}.[/dim]")
+                else:
+                    ctx.console.print(f"[dim]Exemplar #{eid} not found.[/dim]")
+            else:
+                ctx.console.print("[dim]Database unavailable.[/dim]")
+        except ValueError:
+            ctx.console.print("[dim]Usage: /exemplars delete <id> (numeric ID)[/dim]")
+        return CommandResult()
+
+    # /exemplars — list all
+    if ctx.deps.memory_db and ctx.deps.memory_project:
+        try:
+            exemplars = await ctx.deps.memory_db.list_exemplars(ctx.deps.memory_project)
+            if exemplars:
+                from rich.table import Table
+
+                table = Table(title="Exemplars", border_style="dim")
+                table.add_column("ID", style="cyan", justify="right")
+                table.add_column("Type")
+                table.add_column("Task", max_width=40)
+                table.add_column("Score", justify="right")
+                table.add_column("Source")
+                table.add_column("Used", justify="right")
+                for ex in exemplars:
+                    score_style = "green" if ex.outcome_score >= 0.7 else "yellow" if ex.outcome_score >= 0.4 else "red"
+                    table.add_row(
+                        str(ex.id),
+                        ex.task_type,
+                        ex.task_description[:40] + ("..." if len(ex.task_description) > 40 else ""),
+                        f"[{score_style}]{ex.outcome_score:.2f}[/{score_style}]",
+                        ex.model_source,
+                        str(ex.used_count),
+                    )
+                ctx.console.print(table)
+                ctx.console.print("[dim]/exemplars show <id> — view details  |  /exemplars delete <id> — remove[/dim]")
+            else:
+                ctx.console.print(
+                    "[dim]No exemplars yet. They're captured automatically when "
+                    "cloud models (Gemini) succeed at recovery, planning, or critique.[/dim]"
+                )
+        except Exception as e:
+            ctx.console.print(f"[red]Exemplar list error:[/red] {e}")
+    else:
+        ctx.console.print("[dim]Database unavailable — exemplars require PostgreSQL.[/dim]")
+    return CommandResult()
+
+
 async def cmd_index(ctx: CommandContext, args: str) -> CommandResult:
     if not ctx.db:
         ctx.console.print("[yellow]Indexing requires a database.[/yellow]")
@@ -589,6 +673,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "/tasks": cmd_tasks,
     "/memory": cmd_memory,
     "/forget": cmd_forget,
+    "/exemplars": cmd_exemplars,
     "/mcp": cmd_mcp,
     "/help": cmd_help,
     "/cwd": cmd_cwd,

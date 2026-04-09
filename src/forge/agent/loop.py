@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,7 +11,6 @@ from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import UsageLimits
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 
 from forge.agent.context import (
@@ -22,16 +20,29 @@ from forge.agent.context import (
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import (
     HookRegistry,
-    TurnEnd,
-    TurnStart,
     make_permission_handler,
 )
 from forge.agent.permissions import PermissionPolicy
-from forge.agent.render import render_events
-from forge.agent.status import StatusTracker
+from forge.agent.persistence import (  # noqa: F401 — re-exported for external callers
+    _connect_db,
+    _load_agent_history,
+    _message_list_adapter,
+    _save_agent_session,
+)
+from forge.agent.recovery import (  # noqa: F401 — re-exported for external callers
+    _cloud_recovery,
+    _extract_text_from_messages,
+    _fork_history,
+    _handle_agent_error,
+)
 from forge.agent.task_store import TaskStore
 from forge.agent.tools import ALL_TOOLS, READ_ONLY_TOOLS
-from forge.agent.turn_buffer import TurnBuffer
+from forge.agent.turn import (  # noqa: F401 — re-exported for external callers
+    _execute_turn,
+    _handle_exemplar_failure,
+    _maybe_prepend_think,
+    _run_with_status,
+)
 from forge.config import settings
 from forge.log import get_logger
 from forge.models.ollama import _ensure_ollama_env, _model_settings
@@ -127,11 +138,6 @@ def create_agent(
 ) -> Agent[AgentDeps, str]:
     """Create a pydantic-ai Agent with coding tools."""
     from forge.core.project import build_project_context
-    from forge.models.anthropic import (
-        get_anthropic_model_settings,
-        get_anthropic_model_string,
-        is_anthropic_available,
-    )
 
     _ensure_ollama_env()
 
@@ -139,32 +145,20 @@ def create_agent(
     if cwd:
         full_system += "\n\n" + build_project_context(cwd)
 
-    # Model selection: explicit override → mode-aware → fallback
-    mode = settings.agent.mode
+    # Model selection: explicit override → local heavy (cloud used only for recovery/critique/planning)
+    # Known cloud provider prefixes that pydantic-ai resolves directly
+    _CLOUD_PREFIXES = ("google-gla:", "openai:", "anthropic:")
     if model:
-        # Explicit model passed — use as-is if already qualified, else assume Ollama
-        if ":" in model and not model.startswith("ollama:"):
+        # Explicit model passed — use as-is if it's a known cloud provider, else assume Ollama
+        if model.startswith(_CLOUD_PREFIXES):
             model_id = model
-            ms = get_anthropic_model_settings() if model.startswith("anthropic:") else _model_settings()
+            ms = _model_settings()
         else:
             model_name = model.removeprefix("ollama:")
             model_id = f"ollama:{model_name}"
             ms = _model_settings()
-    elif mode == "max":
-        # Max mode: require Anthropic as primary
-        if is_anthropic_available():
-            model_id = get_anthropic_model_string()
-            ms = get_anthropic_model_settings()
-        else:
-            logger.warning("Max mode requested but Anthropic unavailable — falling back to local heavy")
-            model_id = f"ollama:{settings.ollama.heavy_model}"
-            ms = _model_settings()
-    elif mode == "local":
-        # Local mode: always use local heavy, never try cloud
-        model_id = f"ollama:{settings.ollama.heavy_model}"
-        ms = _model_settings()
     else:
-        # Balanced mode: local primary, cloud available for recovery/critique/planning
+        # Local primary for both local and balanced modes
         model_id = f"ollama:{settings.ollama.heavy_model}"
         ms = _model_settings()
 
@@ -177,147 +171,6 @@ def create_agent(
         model_settings=ms,
         retries=3,
     )
-
-
-async def _run_with_status(
-    agent: Agent[AgentDeps, str],
-    prompt: str | Sequence,
-    deps: AgentDeps,
-    message_history: list[ModelMessage] | None,
-    turn_number: int = 0,
-    model_override: str | None = None,
-) -> list[ModelMessage]:
-    """Run agent with status tracker lifecycle management.
-
-    Returns the updated message history.
-    """
-    # Determine active model name for status bar display
-    active_model = ""
-    if model_override:
-        active_model = model_override
-    elif deps.model_override:
-        active_model = deps.model_override
-    elif settings.agent.mode == "max":
-        from forge.models.anthropic import is_anthropic_available
-        active_model = settings.anthropic.model if is_anthropic_available() else settings.ollama.heavy_model
-    elif settings.agent.mode == "local":
-        active_model = settings.ollama.heavy_model
-    else:
-        active_model = settings.ollama.heavy_model
-
-    tracker = StatusTracker(
-        console=deps.console,
-        visible=deps.status_visible,
-        model_name=active_model,
-        token_budget=settings.agent.token_budget,
-        mode=settings.agent.mode,
-    )
-    deps.status_tracker = tracker
-
-    # Create turn buffer for this turn
-    turn_buffer = TurnBuffer(console=deps.console)
-    deps.turn_buffer = turn_buffer
-
-    # Show active task in status detail
-    if deps.task_store:
-        active_task = deps.task_store.get_active()
-        if active_task and active_task.active_form:
-            tracker.set_phase(tracker._phase, active_task.active_form)
-
-    def _on_toggle(visible: bool) -> None:
-        deps.status_visible = visible
-
-    def _on_tools_toggle() -> None:
-        deps.tools_visible = not deps.tools_visible
-
-    tracker.start(on_toggle=_on_toggle, on_tools_toggle=_on_tools_toggle)
-
-    # Emit TurnStart
-    registry = deps.hook_registry
-    if registry:
-        await registry.emit_sequential(TurnStart(turn_number=turn_number, prompt=prompt))
-
-    import time as _time
-    turn_start = _time.monotonic()
-
-    try:
-        run_kwargs: dict = dict(
-            deps=deps,
-            message_history=message_history,
-            event_stream_handler=render_events,
-            usage_limits=UsageLimits(request_limit=settings.agent.request_limit),
-        )
-        if model_override:
-            run_kwargs["model"] = model_override  # Already fully qualified
-        elif deps.model_override:
-            # Support both qualified ("anthropic:claude-opus-4-6") and unqualified ("qwen3.5:4b") overrides
-            if deps.model_override.startswith(("anthropic:", "google-gla:", "openai:")):
-                run_kwargs["model"] = deps.model_override
-            else:
-                run_kwargs["model"] = f"ollama:{deps.model_override}"
-
-        from forge.models.retry import with_retry
-
-        result = await with_retry(
-            lambda: agent.run(prompt, **run_kwargs),
-            max_retries=settings.ollama.max_retries,
-            backoff_base=settings.ollama.retry_backoff_base,
-        )
-        # Capture real token counts from Ollama API response
-        try:
-            usage = result.usage()
-            prompt_eval = usage.input_tokens or 0
-            deps.tokens_in += prompt_eval
-            deps.tokens_out += usage.output_tokens or 0
-            # Prompt cache monitoring — detect KV cache invalidation
-            if (
-                deps._last_prompt_eval_count > 0
-                and prompt_eval > deps._last_prompt_eval_count * 1.5
-            ):
-                logger.info(
-                    "Prompt cache likely invalidated: prompt_eval %d → %d (%.0f%% increase)",
-                    deps._last_prompt_eval_count, prompt_eval,
-                    (prompt_eval / deps._last_prompt_eval_count - 1) * 100,
-                )
-            deps._last_prompt_eval_count = prompt_eval
-        except Exception:
-            pass  # usage() may not be available for all backends
-        # Pause tracker before printing to prevent status line garbling output
-        tracker.pause()
-
-        # Add final answer to turn buffer unless already streamed by render_events
-        streamed = any(not it.is_tool and it.was_printed for it in turn_buffer._items)
-        if not streamed and isinstance(result.output, str) and result.output.strip():
-            turn_buffer.add(Markdown(result.output), is_tool=False)
-        tracker.tokens_in = deps.tokens_in
-        tracker.tokens_out = deps.tokens_out
-        tracker.stop()
-        summary = tracker.summary()
-        if summary:
-            turn_buffer.add(summary, is_tool=False)
-        turn_buffer.print_final(deps.tools_visible)
-
-        # Emit TurnEnd
-        if registry:
-            elapsed = _time.monotonic() - turn_start
-            await registry.emit_sequential(TurnEnd(
-                turn_number=turn_number,
-                tool_call_count=tracker.tool_calls,
-                elapsed=elapsed,
-                tokens_in=deps.tokens_in,
-                tokens_out=deps.tokens_out,
-            ))
-
-        deps.status_tracker = None
-        return result.all_messages()
-    except BaseException:
-        tracker.tokens_in = deps.tokens_in
-        tracker.tokens_out = deps.tokens_out
-        tracker.stop()
-        deps.console.print(tracker.summary())
-        deps.status_tracker = None
-        deps.turn_buffer = None
-        raise
 
 
 async def _plan_and_execute(
@@ -343,7 +196,6 @@ async def _plan_and_execute(
         plan_system += "\n\n" + build_project_context(deps.cwd)
 
     from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string, is_gemini_available
-    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
 
     plan_model = None
     plan_model_settings = None
@@ -354,11 +206,6 @@ async def _plan_and_execute(
             plan_model = gemini_model
             plan_model_settings = get_gemini_model_settings()
             console.print("[yellow dim]Using cloud reasoning for planning (Gemini)...[/yellow dim]")
-
-    if not plan_model and is_anthropic_available():
-        plan_model = get_anthropic_model_string()
-        plan_model_settings = get_anthropic_model_settings()
-        console.print("[yellow dim]Using cloud reasoning for planning (Opus)...[/yellow dim]")
 
     if not plan_model:
         plan_model = f"ollama:{settings.ollama.heavy_model}"
@@ -374,6 +221,7 @@ async def _plan_and_execute(
     )
 
     console.print("[dim]Exploring codebase and planning...[/dim]")
+    used_cloud = plan_model != f"ollama:{settings.ollama.heavy_model}"
     try:
         plan_result = await plan_agent.run(
             prompt,
@@ -383,8 +231,32 @@ async def _plan_and_execute(
         )
         plan_text = plan_result.output
     except Exception as e:
-        _handle_agent_error(console, e, deps=deps)
-        return message_history
+        if used_cloud:
+            # Cloud model failed — fall back to local model
+            _handle_agent_error(console, e, deps=deps)
+            console.print("[yellow]Falling back to local model for planning...[/yellow]")
+            local_model = f"ollama:{settings.ollama.heavy_model}"
+            plan_agent = Agent(
+                model=local_model,
+                instructions=plan_system,
+                tools=READ_ONLY_TOOLS,
+                deps_type=AgentDeps,
+                model_settings=_model_settings(num_ctx=65536),
+            )
+            try:
+                plan_result = await plan_agent.run(
+                    prompt,
+                    deps=deps,
+                    message_history=None,
+                    usage_limits=UsageLimits(request_limit=10),
+                )
+                plan_text = plan_result.output
+            except Exception as e2:
+                _handle_agent_error(console, e2, deps=deps)
+                return message_history
+        else:
+            _handle_agent_error(console, e, deps=deps)
+            return message_history
 
     # Display the plan
     console.print(
@@ -412,6 +284,22 @@ async def _plan_and_execute(
         console.print("[dim]Plan cancelled.[/dim]")
         return message_history
 
+    # Capture accepted plan as exemplar (cloud planning success)
+    if deps.memory_db and plan_model != f"ollama:{settings.ollama.heavy_model}":
+        try:
+            from forge.agent.exemplars import capture_exemplar
+            await capture_exemplar(
+                deps.memory_db,
+                deps.memory_project or "default",
+                "planning",
+                prompt,
+                plan_text,
+                "gemini",
+                outcome_score=0.8,
+            )
+        except Exception:
+            logger.debug("Plan exemplar capture failed", exc_info=True)
+
     # Phase 3: Execute with full agent
     deps.active_plan = plan_text
     execution_prompt = (
@@ -425,40 +313,6 @@ async def _plan_and_execute(
     finally:
         deps.active_plan = None
     return result
-
-
-from pydantic_ai.messages import ModelMessagesTypeAdapter
-
-_message_list_adapter = ModelMessagesTypeAdapter
-
-
-async def _save_agent_session(
-    db: Database,
-    session_id: str,
-    messages: list[ModelMessage],
-) -> None:
-    """Persist agent message history as JSON to the conversations table."""
-    try:
-        history_json = _message_list_adapter.dump_json(messages).decode()
-        await db.delete_agent_history(session_id)
-        await db.save_message(session_id, "agent_history", history_json, model="")
-    except Exception:
-        logger.debug("Failed to save session", exc_info=True)
-
-
-async def _load_agent_history(
-    db: Database,
-    session_id: str,
-) -> list[ModelMessage] | None:
-    """Load agent message history from the database. Returns None if not found."""
-    try:
-        raw = await db.load_agent_history(session_id)
-        if raw is None:
-            return None
-        return _message_list_adapter.validate_json(raw)
-    except Exception:
-        logger.debug("Failed to load history", exc_info=True)
-        return None
 
 
 def _rebuild_agent(
@@ -632,50 +486,13 @@ async def agent_repl(
         turn_counter_ref[0] = turn_counter
         console.print(f"\n[bold]> {initial_prompt}[/bold]")
         try:
-            from forge.agent.multimodal import parse_multimodal_input
-            parsed_initial = parse_multimodal_input(initial_prompt, deps.cwd)
-
-            # Route to vision model if images detected
-            vision_override = None
-            if isinstance(parsed_initial, list) and settings.ollama.vision_model:
-                vision_override = deps.model_override
-                deps.model_override = settings.ollama.vision_model
-
-            prompt = _maybe_prepend_think(parsed_initial, deps)
-            message_history = await _run_with_status(
-                agent, prompt, deps, message_history, turn_number=turn_counter,
+            message_history = await _execute_turn(
+                agent, initial_prompt, deps, message_history, turn_counter,
+                db, session_id, is_initial_turn=True,
             )
-
-            # Restore model after vision turn
-            if vision_override is not None or (isinstance(parsed_initial, list) and settings.ollama.vision_model):
-                deps.model_override = vision_override
-            if db and message_history:
-                asyncio.create_task(_save_agent_session(db, session_id, message_history))
-            if db:
-                title = initial_prompt[:60].strip()
-                if len(initial_prompt) > 60:
-                    title = title.rsplit(" ", 1)[0] + "…"
-                try:
-                    await db.update_session_title(session_id, title)
-                except Exception:
-                    logger.debug("Title update failed", exc_info=True)
         except Exception as e:
             _handle_agent_error(console, e, deps=deps)
-
-            # Cloud → local fallback for initial prompt
-            if deps._cloud_fallback_pending:
-                deps._cloud_fallback_pending = False
-                from forge.models.anthropic import mark_rate_limited
-                mark_rate_limited(300.0)
-                try:
-                    prompt = _maybe_prepend_think(parsed_initial, deps)
-                    message_history = await _run_with_status(
-                        agent, prompt, deps, message_history,
-                        turn_number=turn_counter,
-                        model_override=f"ollama:{settings.ollama.heavy_model}",
-                    )
-                except Exception as fallback_e:
-                    _handle_agent_error(console, fallback_e, deps=deps)
+            await _handle_exemplar_failure(deps, e)
 
     # --- REPL loop ---
     title_set = initial_prompt is not None
@@ -764,19 +581,9 @@ async def agent_repl(
                 if deps.circuit_breaker and message_history:
                     deps.circuit_breaker.set_message_count(len(message_history))
 
-                # Parse multimodal input (@image.png references)
-                from forge.agent.multimodal import parse_multimodal_input
-                parsed = parse_multimodal_input(user_input, deps.cwd)
-
-                # Route to vision model if images detected
-                vision_override = None
-                if isinstance(parsed, list) and settings.ollama.vision_model:
-                    vision_override = deps.model_override
-                    deps.model_override = settings.ollama.vision_model
-
-                prompt = _maybe_prepend_think(parsed, deps)
-                message_history = await _run_with_status(
-                    agent, prompt, deps, message_history, turn_number=turn_counter,
+                message_history = await _execute_turn(
+                    agent, user_input, deps, message_history, turn_counter,
+                    db, session_id,
                 )
 
                 # Update conversation summary for sub-agent context
@@ -784,11 +591,7 @@ async def agent_repl(
                     from forge.agent.context import summarize_for_delegation
                     deps._conversation_summary = summarize_for_delegation(message_history)
 
-                # Restore model after vision turn
-                if vision_override is not None or (isinstance(parsed, list) and settings.ollama.vision_model):
-                    deps.model_override = vision_override
-                if db and message_history:
-                    asyncio.create_task(_save_agent_session(db, session_id, message_history))
+                # Persist task store
                 if db and deps.task_store:
                     try:
                         await db.save_task_store(session_id, deps.task_store.to_json())
@@ -798,6 +601,7 @@ async def agent_repl(
                 console.print("\n[dim]Interrupted.[/dim]")
             except Exception as e:
                 _handle_agent_error(console, e, deps=deps)
+                await _handle_exemplar_failure(deps, e)
 
                 # Gemini recovery: retry with fresh cloud agent (no history leak)
                 if deps._cloud_recovery_pending:
@@ -817,276 +621,9 @@ async def agent_repl(
                             )
                             message_history.extend(recovery_result)
 
-                # Cloud → local fallback: retry the same prompt with local model
-                if deps._cloud_fallback_pending:
-                    deps._cloud_fallback_pending = False
-                    from forge.models.anthropic import mark_rate_limited
-                    mark_rate_limited(300.0)  # Cool down cloud for 5 min
-                    try:
-                        message_history = await _run_with_status(
-                            agent, user_input, deps, message_history,
-                            turn_number=turn_counter,
-                            model_override=f"ollama:{settings.ollama.heavy_model}",
-                        )
-                    except Exception as fallback_e:
-                        _handle_agent_error(console, fallback_e, deps=deps)
     finally:
         await cleanup(
             deps, hook_registry, mcp_stack, db, session_id, message_history, console,
         )
 
 
-def _maybe_prepend_think(prompt: str | Sequence, deps: AgentDeps) -> str | Sequence:
-    """Prepend /think or /no_think tag based on thinking_enabled setting."""
-    if not deps.thinking_enabled:
-        return prompt
-    if isinstance(prompt, str):
-        return f"/think\n{prompt}"
-    # Multimodal: prepend think tag to first text element
-    result = list(prompt)
-    for i, part in enumerate(result):
-        if isinstance(part, str):
-            result[i] = f"/think\n{part}"
-            return result
-    # No text part found — prepend one
-    return ["/think", *result]
-
-
-async def _connect_db():
-    """Connect to DB for persistence. Returns None on failure."""
-    if not settings.persist_history:
-        return None
-    try:
-        from forge.storage.database import Database
-
-        db = Database()
-        await db.connect()
-        return db
-    except Exception:
-        logger.info("Database unavailable — persistence disabled", exc_info=True)
-        return None
-
-
-def _fork_history(
-    message_history: list[ModelMessage],
-    circuit_breaker: ToolCallTracker | None,
-    identical_threshold: int = 3,
-) -> list[ModelMessage]:
-    """Truncate toxic loop tail from history before appending recovery.
-
-    Removes the failed turns that led to the circuit breaker trip, preserving
-    all successful earlier turns. Appends a synthetic bridge message so the
-    local model understands the discontinuity.
-    """
-    from pydantic_ai.messages import ModelRequest, UserPromptPart
-
-    if not message_history:
-        return []
-
-    # Determine truncation point
-    loop_start = None
-    if circuit_breaker and circuit_breaker.loop_start_index is not None:
-        loop_start = circuit_breaker.loop_start_index
-
-    if loop_start is not None and 0 < loop_start < len(message_history):
-        truncated = message_history[:loop_start]
-    else:
-        # Fallback: remove last 2 * identical_threshold messages (conservative)
-        remove_count = 2 * identical_threshold
-        if remove_count < len(message_history):
-            truncated = message_history[:-remove_count]
-        else:
-            # History too short to truncate meaningfully — keep first message
-            truncated = message_history[:1] if message_history else []
-
-    # Append synthetic bridge message
-    bridge = ModelRequest(parts=[
-        UserPromptPart(
-            content=(
-                "[System note: The previous approach got stuck in a loop and was interrupted. "
-                "A cloud model was consulted to resolve the issue. "
-                "The following messages contain the cloud model's solution.]"
-            ),
-        ),
-    ])
-    truncated.append(bridge)
-
-    logger.info(
-        "Forked history: %d → %d messages (removed %d toxic tail messages)",
-        len(message_history), len(truncated),
-        len(message_history) - len(truncated) + 1,  # +1 for bridge
-    )
-    return truncated
-
-
-async def _cloud_recovery(
-    user_input: str,
-    deps: AgentDeps,
-    console: Console,
-    turn_number: int,
-) -> list[ModelMessage] | None:
-    """Attempt cloud recovery after circuit breaker trip.
-
-    Uses a fresh agent (no conversation history, no dynamic prompts) to avoid
-    leaking session context to the cloud API. Tries primary model first,
-    falls back to fallback model on failure.
-
-    Returns recovery messages to append to history, or None on failure.
-    """
-    from forge.agent.gemini import get_gemini_model_settings, get_gemini_model_string
-    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
-
-    # Reset circuit breaker for the retry
-    if deps.circuit_breaker:
-        deps.circuit_breaker.reset_state()
-
-    recovery_prompt = (
-        f"The previous attempt with a local model got stuck in a loop. "
-        f"Here's what was requested: {user_input}\n\n"
-        f"Take a fresh approach. Think carefully and solve this step by step."
-    )
-
-    # Build a fresh agent — no history, no dynamic prompt injections
-    from forge.core.project import build_project_context
-
-    recovery_system = AGENT_SYSTEM
-    if deps.cwd:
-        recovery_system += "\n\n" + build_project_context(deps.cwd)
-
-    models_to_try: list[tuple[str, dict | None, str]] = []
-
-    # Try Opus first (best quality for recovery)
-    if is_anthropic_available():
-        anthropic_str = get_anthropic_model_string()
-        if anthropic_str:
-            models_to_try.append((anthropic_str, get_anthropic_model_settings(), "anthropic"))
-
-    # Then Gemini primary/fallback
-    gemini_primary = get_gemini_model_string(fallback=False)
-    gemini_fallback = get_gemini_model_string(fallback=True)
-    if gemini_primary:
-        models_to_try.append((gemini_primary, get_gemini_model_settings(), "gemini-primary"))
-    if gemini_fallback and gemini_fallback != gemini_primary:
-        models_to_try.append((gemini_fallback, get_gemini_model_settings(), "gemini-fallback"))
-
-    # Deduplicate
-    seen: set[str] = set()
-    unique_models: list[tuple[str, dict | None, str]] = []
-    for m, ms, label in models_to_try:
-        if m not in seen:
-            seen.add(m)
-            unique_models.append((m, ms, label))
-
-    for model_str, model_settings, label in unique_models:
-        try:
-            # Balanced mode: read-only tools to limit cloud's filesystem access
-            # Max mode: full tools (user opted into cloud control)
-            from forge.config import settings as _cfg
-            recovery_tools = READ_ONLY_TOOLS if _cfg.agent.mode == "balanced" else ALL_TOOLS
-            recovery_agent: Agent[AgentDeps, str] = Agent(
-                model=model_str,
-                instructions=recovery_system,
-                tools=recovery_tools,
-                deps_type=AgentDeps,
-                model_settings=model_settings,
-                retries=3,
-            )
-            result = await _run_with_status(
-                recovery_agent, recovery_prompt, deps, None,
-                turn_number=turn_number,
-            )
-            return result
-        except Exception as exc:
-            if len(unique_models) > 1:
-                console.print(
-                    f"[yellow]Cloud recovery ({label}) failed: {exc}[/yellow]\n"
-                    f"[yellow]Trying next model...[/yellow]"
-                )
-            else:
-                console.print(f"[red]Cloud recovery failed:[/red] {exc}")
-
-    return None
-
-
-def _handle_agent_error(console: Console, e: Exception, deps: AgentDeps | None = None) -> None:
-    """Print a user-friendly agent error message."""
-    from pydantic_ai.exceptions import UsageLimitExceeded
-
-    from forge.agent.circuit_breaker import CircuitBreakerTripped
-    from forge.models.anthropic import _is_anthropic_error
-
-    # Anthropic cloud errors → fall back to local (not in local mode, already local)
-    if _is_anthropic_error(e):
-        if settings.agent.mode == "local":
-            console.print(f"[red]Agent error:[/red] {e}")
-            return
-        console.print(
-            "[yellow]Cloud model unavailable, falling back to local...[/yellow]"
-        )
-        if deps:
-            deps._cloud_fallback_pending = True
-        return
-
-    # Anthropic-specific error messages
-    try:
-        import anthropic
-
-        if isinstance(e, anthropic.AuthenticationError):
-            console.print("[red]Anthropic auth failed.[/red] Check proxy at 127.0.0.1:3456")
-            return
-        if isinstance(e, anthropic.RateLimitError):
-            console.print("[yellow]Anthropic rate limited.[/yellow] Falling back to local model.")
-            if deps:
-                deps._cloud_fallback_pending = True
-            return
-        if isinstance(e, anthropic.APIStatusError) and e.status_code == 529:
-            console.print("[yellow]Anthropic overloaded.[/yellow] Falling back to local model.")
-            if deps:
-                deps._cloud_fallback_pending = True
-            return
-    except ImportError:
-        pass
-
-    if isinstance(e, CircuitBreakerTripped):
-        if deps and settings.agent.mode != "local":
-            from forge.agent.gemini import is_gemini_available
-            if is_gemini_available(deps):
-                console.print(
-                    f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
-                    "[yellow]Escalating to cloud reasoning (Gemini) for recovery...[/yellow]"
-                )
-                deps._cloud_recovery_pending = True
-                return
-        console.print(
-            f"[yellow]Circuit breaker tripped:[/yellow] {e}\n"
-            "The model was stuck in a loop. Try rephrasing your request "
-            "or breaking it into smaller steps."
-        )
-        return
-
-    if isinstance(e, UsageLimitExceeded):
-        console.print(
-            f"[yellow]Agent hit the request limit ({settings.agent.request_limit} iterations).[/yellow] "
-            "This usually means the model was stuck in a loop. "
-            "The partial result has been preserved in history."
-        )
-        return
-
-    err_str = str(e).lower()
-    if "connection" in err_str or "connect" in err_str:
-        console.print(
-            "[red]Cannot connect to Ollama.[/red] Is it running? "
-            "Check with: [bold]systemctl status ollama[/bold]"
-        )
-    elif "timeout" in err_str or "timed out" in err_str:
-        console.print(
-            "[red]Request timed out.[/red] "
-            "The model may still be loading — try again in a moment."
-        )
-    elif "404" in err_str:
-        console.print(
-            "[red]Model not found.[/red] "
-            f"Pull it with: [bold]ollama pull {settings.ollama.heavy_model}[/bold]"
-        )
-    else:
-        console.print(f"[red]Agent error:[/red] {e}")

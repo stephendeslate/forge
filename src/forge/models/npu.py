@@ -89,3 +89,11 @@ def get_npu_backend() -> NPUBackend | None:
     if _npu_backend is None:
         _npu_backend = NPUBackend()
     return _npu_backend
+
+
+async def close_npu_backend() -> None:
+    """Close the NPU backend singleton if active."""
+    global _npu_backend
+    if _npu_backend is not None:
+        await _npu_backend.close()
+        _npu_backend = None

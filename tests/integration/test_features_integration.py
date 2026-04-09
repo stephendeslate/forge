@@ -80,14 +80,14 @@ class TestHookPriorityOrdering:
 
         async def capture_critique(diff_text, deps):
             critique_saw_files.append(len(deps._files_modified_this_turn))
-            return "LGTM"
+            return "LGTM", "local"
 
         with patch("subprocess.run", side_effect=capture_run):
             with patch(
                 "forge.agent.session._call_critique_model",
                 side_effect=capture_critique,
             ):
-                await registry.emit(TurnEnd(
+                await registry.emit_sequential(TurnEnd(
                     turn_number=1, tool_call_count=2, elapsed=1.0,
                     tokens_in=0, tokens_out=0,
                 ))
@@ -151,9 +151,9 @@ class TestFullPipeline:
             with patch(
                 "forge.agent.session._call_critique_model",
                 new_callable=AsyncMock,
-                return_value="Missing docstrings in a.py",
+                return_value=("Missing docstrings in a.py", "local"),
             ):
-                await registry.emit(TurnEnd(
+                await registry.emit_sequential(TurnEnd(
                     turn_number=1, tool_call_count=2, elapsed=1.0,
                     tokens_in=0, tokens_out=0,
                 ))
@@ -194,9 +194,9 @@ class TestFullPipeline:
             with patch(
                 "forge.agent.session._call_critique_model",
                 new_callable=AsyncMock,
-                return_value="Bug: off-by-one in loop",
+                return_value=("Bug: off-by-one in loop", "local"),
             ):
-                await registry.emit(TurnEnd(
+                await registry.emit_sequential(TurnEnd(
                     turn_number=1, tool_call_count=2, elapsed=1.0,
                     tokens_in=0, tokens_out=0,
                 ))
@@ -225,7 +225,7 @@ class TestFeatureGating:
         with patch.object(settings.agent, "test_enabled", False):
             with patch.object(settings.agent, "critique_enabled", False):
                 with patch("subprocess.run") as mock_run:
-                    await registry.emit(TurnEnd(
+                    await registry.emit_sequential(TurnEnd(
                         turn_number=1, tool_call_count=2, elapsed=1.0,
                         tokens_in=0, tokens_out=0,
                     ))

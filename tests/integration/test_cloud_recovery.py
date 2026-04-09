@@ -30,7 +30,7 @@ class TestHandleAgentErrorEscalation:
         with patch("forge.agent.gemini._ensure_api_key", return_value="test-key"):
             _handle_agent_error(console, exc, deps=deps)
 
-        assert deps._gemini_recovery_pending is True
+        assert deps._cloud_recovery_pending is True
 
     def test_circuit_breaker_without_gemini_no_flag(self):
         from forge.agent.loop import _handle_agent_error
@@ -45,7 +45,7 @@ class TestHandleAgentErrorEscalation:
 
         _handle_agent_error(console, exc, deps=deps)
 
-        assert deps._gemini_recovery_pending is False
+        assert deps._cloud_recovery_pending is False
 
     def test_circuit_breaker_no_deps_no_crash(self):
         """When deps is None, should print message without crashing."""
@@ -68,7 +68,7 @@ class TestHandleAgentErrorEscalation:
         )
 
         _handle_agent_error(console, RuntimeError("some error"), deps=deps)
-        assert deps._gemini_recovery_pending is False
+        assert deps._cloud_recovery_pending is False
 
 
 class TestCloudRecoveryFunction:
@@ -87,8 +87,8 @@ class TestCloudRecoveryFunction:
         )
 
         with patch("forge.agent.gemini._ensure_api_key", return_value="test-key"), \
-             patch("forge.agent.loop.Agent") as MockAgent, \
-             patch("forge.agent.loop._run_with_status", new_callable=AsyncMock) as mock_run:
+             patch("forge.agent.recovery.Agent") as MockAgent, \
+             patch("forge.agent.turn._run_with_status", new_callable=AsyncMock) as mock_run:
             MockAgent.return_value = MagicMock()
             mock_run.return_value = [MagicMock()]
 
@@ -115,8 +115,8 @@ class TestCloudRecoveryFunction:
         )
 
         with patch("forge.agent.gemini._ensure_api_key", return_value="test-key"), \
-             patch("forge.agent.loop.Agent") as MockAgent, \
-             patch("forge.agent.loop._run_with_status", new_callable=AsyncMock) as mock_run:
+             patch("forge.agent.recovery.Agent") as MockAgent, \
+             patch("forge.agent.turn._run_with_status", new_callable=AsyncMock) as mock_run:
             MockAgent.return_value = MagicMock()
             mock_run.return_value = [MagicMock()]
 
@@ -147,8 +147,8 @@ class TestCloudRecoveryFunction:
             return [MagicMock()]
 
         with patch("forge.agent.gemini._ensure_api_key", return_value="test-key"), \
-             patch("forge.agent.loop.Agent") as MockAgent, \
-             patch("forge.agent.loop._run_with_status", side_effect=mock_run_with_status):
+             patch("forge.agent.recovery.Agent") as MockAgent, \
+             patch("forge.agent.turn._run_with_status", side_effect=mock_run_with_status):
             MockAgent.return_value = MagicMock()
             result = await _cloud_recovery("fix it", deps, console, turn_number=1)
 
@@ -171,8 +171,8 @@ class TestCloudRecoveryFunction:
             raise ConnectionError("all failed")
 
         with patch("forge.agent.gemini._ensure_api_key", return_value="test-key"), \
-             patch("forge.agent.loop.Agent") as MockAgent, \
-             patch("forge.agent.loop._run_with_status", side_effect=always_fail):
+             patch("forge.agent.recovery.Agent") as MockAgent, \
+             patch("forge.agent.turn._run_with_status", side_effect=always_fail):
             MockAgent.return_value = MagicMock()
             result = await _cloud_recovery("fix it", deps, console, turn_number=1)
 
@@ -201,7 +201,7 @@ class TestPlanGeminiIntegration:
             mock_plan_result = MagicMock()
             mock_plan_result.output = "Plan: do the thing"
 
-            async def mock_run(**kwargs):
+            async def mock_run(*args, **kwargs):
                 return mock_plan_result
 
             mock_plan_agent.run = mock_run

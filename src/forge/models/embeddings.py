@@ -9,6 +9,24 @@ from forge.config import settings
 # nomic-embed-text-v2-moe produces 768-dim embeddings
 EMBEDDING_DIM = 768
 
+# Module-level singleton client — avoids TCP/TLS setup per call
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=120.0)
+    return _client
+
+
+async def close_embeddings_client() -> None:
+    """Close the embeddings HTTP client singleton."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
 
 async def embed_texts(texts: list[str], *, batch_size: int = 32) -> list[list[float]]:
     """Embed a list of texts using the configured embedding model.
@@ -17,21 +35,21 @@ async def embed_texts(texts: list[str], *, batch_size: int = 32) -> list[list[fl
     Batches requests to avoid overwhelming Ollama.
     """
     all_embeddings: list[list[float]] = []
+    client = _get_client()
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            resp = await client.post(
-                f"{settings.ollama.base_url}/api/embed",
-                json={
-                    "model": settings.ollama.embed_model,
-                    "input": batch,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            embeddings = data["embeddings"]
-            all_embeddings.extend(embeddings)
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        resp = await client.post(
+            f"{settings.ollama.base_url}/api/embed",
+            json={
+                "model": settings.ollama.embed_model,
+                "input": batch,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        embeddings = data["embeddings"]
+        all_embeddings.extend(embeddings)
 
     return all_embeddings
 

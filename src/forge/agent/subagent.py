@@ -7,9 +7,13 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import ModelMessage
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import Model
 
 from forge.agent.deps import AgentDeps
 from forge.agent.hooks import HookRegistry, PostToolUse
@@ -45,19 +49,18 @@ _HEAVY_INDICATORS = re.compile(
 )
 
 
-def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
+def _select_delegate_model(task: str, agent_type: str, cwd: str | None = None) -> tuple[str | Model, dict]:
     """Select the best model for a delegated task.
 
     Returns (model_id, model_settings) tuple.
-    model_id is fully qualified (e.g., "ollama:model" or "anthropic:model").
+    model_id can be a string (e.g., "ollama:model") or a pydantic-ai Model object.
 
     Priority:
     1. Explicit delegate_model config overrides everything
     2. Read-only agents (research, reviewer) → fast model
     3. Short + simple tasks → fast model
-    4. Complex tasks → Anthropic cloud if available, else local heavy
+    4. Complex tasks → local heavy
     """
-    from forge.models.anthropic import get_anthropic_model_settings, get_anthropic_model_string, is_anthropic_available
     from forge.models.ollama import _model_settings
 
     # Explicit config override
@@ -66,17 +69,8 @@ def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
         ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
         return f"ollama:{settings.agent.delegate_model}", _model_settings(num_ctx=ctx)
 
-    # Mode-aware routing
-    mode = settings.agent.mode
-
-    # Read-only agents (research, reviewer)
+    # Read-only agents (research, reviewer) → fast model (already loaded, zero VRAM cost)
     if agent_type in ("research", "reviewer"):
-        if mode == "max" and is_anthropic_available():
-            # Max mode: cloud for research/review quality
-            model_str = get_anthropic_model_string()
-            if model_str:
-                return model_str, get_anthropic_model_settings()
-        # Local/balanced: fast model (already loaded, zero VRAM cost)
         return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
     # Heuristic for coder agents: check task complexity
@@ -84,20 +78,7 @@ def _select_delegate_model(task: str, agent_type: str) -> tuple[str, dict]:
         if not _HEAVY_INDICATORS.search(task):
             return f"ollama:{settings.ollama.fast_model}", _model_settings(num_ctx=settings.agent.fast_num_ctx)
 
-    # Complex task routing by mode
-    if mode == "local":
-        # Local mode: never use cloud, always local heavy
-        return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
-    elif mode == "max":
-        # Max mode: execution tasks use local heavy (zero API cost)
-        return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
-
-    # Balanced mode: cloud for complex tasks if available, else local heavy
-    if is_anthropic_available():
-        model_str = get_anthropic_model_string()
-        if model_str:
-            return model_str, get_anthropic_model_settings()
-
+    # Complex tasks → local heavy
     return f"ollama:{settings.ollama.heavy_model}", _model_settings(num_ctx=min(settings.agent.num_ctx, 32768))
 
 
@@ -225,15 +206,16 @@ def _generate_diff_summary(worktree: WorktreeInfo) -> str:
     return "\n".join(parts) if parts else "(no diff available)"
 
 
-def _auto_merge(worktree: WorktreeInfo, base_dir: Path) -> MergeResult:
+async def _auto_merge(worktree: WorktreeInfo, base_dir: Path) -> MergeResult:
     """Merge the worktree branch back into the base repo.
 
     Returns MergeResult indicating success, conflict, or failure.
+    Uses asyncio.to_thread to avoid blocking the event loop.
     """
     from forge.agent.worktree import _run_git
 
     # Check base repo working tree is clean
-    status = _run_git(["status", "--porcelain"], base_dir)
+    status = await asyncio.to_thread(_run_git, ["status", "--porcelain"], base_dir)
     if status.stdout.strip():
         return MergeResult(
             merged=False,
@@ -243,7 +225,8 @@ def _auto_merge(worktree: WorktreeInfo, base_dir: Path) -> MergeResult:
 
     # Attempt merge
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["git", "merge", "--no-ff", worktree.branch, "-m",
              f"Merge sub-agent branch '{worktree.branch}'"],
             cwd=base_dir,
@@ -265,7 +248,8 @@ def _auto_merge(worktree: WorktreeInfo, base_dir: Path) -> MergeResult:
     # Merge failed — likely conflict
     if "CONFLICT" in result.stdout or "conflict" in result.stderr.lower():
         # Abort the conflicted merge
-        subprocess.run(
+        await asyncio.to_thread(
+            subprocess.run,
             ["git", "merge", "--abort"],
             cwd=base_dir,
             capture_output=True,
@@ -288,7 +272,7 @@ async def run_subagent(
     task: str,
     cwd: Path,
     *,
-    model: str | None = None,
+    model: str | Model | None = None,
     isolate: bool = True,
     timeout: float = 300.0,
     system: str = SUBAGENT_SYSTEM,
@@ -314,32 +298,29 @@ async def run_subagent(
     Returns:
         SubagentResult with output, worktree info, and message history.
     """
-    # Ensure OLLAMA_BASE_URL is set
-    import os
-
     from forge.core.project import build_project_context
+    from forge.models.ollama import _ensure_ollama_env
 
-    if "OLLAMA_BASE_URL" not in os.environ:
-        base = settings.ollama.base_url.rstrip("/")
-        if not base.endswith("/v1"):
-            base = f"{base}/v1"
-        os.environ["OLLAMA_BASE_URL"] = base
+    _ensure_ollama_env()
 
     delegate_ctx = min(settings.agent.num_ctx, 32768)  # default for Ollama fallback
     if model:
-        # Explicit model — assume Ollama if not qualified
-        if model.startswith(("anthropic:", "google-gla:", "openai:")):
+        # Explicit model — could be a string or a Model object
+        from pydantic_ai.models import Model as PydanticModel
+        if isinstance(model, PydanticModel):
             model_id = model
-            from forge.models.anthropic import get_anthropic_model_settings
-            delegate_settings = get_anthropic_model_settings() if model.startswith("anthropic:") else {"timeout": int(timeout)}
-        else:
+            delegate_settings = {"timeout": int(timeout)}
+        elif isinstance(model, str) and model.startswith(("google-gla:", "openai:")):
+            model_id = model
+            delegate_settings = {"timeout": int(timeout)}
+        elif isinstance(model, str):
             model_name = model.removeprefix("ollama:")
             model_id = f"ollama:{model_name}"
             is_fast = model_name == settings.ollama.fast_model
             delegate_ctx = settings.agent.fast_num_ctx if is_fast else min(settings.agent.num_ctx, 32768)
             delegate_settings = None  # Will use _model_settings below
     else:
-        model_id, delegate_settings = _select_delegate_model(task, agent_type)
+        model_id, delegate_settings = _select_delegate_model(task, agent_type, cwd=str(cwd) if cwd else None)
     worktree_info: WorktreeInfo | None = None
     work_dir = cwd
 
@@ -431,7 +412,7 @@ async def run_subagent_and_merge(
     task: str,
     cwd: Path,
     *,
-    model: str | None = None,
+    model: str | Model | None = None,
     timeout: float = 300.0,
     parent_hooks: HookRegistry | None = None,
     auto_merge: bool = True,
@@ -478,8 +459,8 @@ async def run_subagent_and_merge(
     # Check if the sub-agent made any changes
     from forge.agent.worktree import _run_git
 
-    diff = _run_git(["diff", "--stat", "HEAD"], result.worktree.path)
-    staged = _run_git(["diff", "--cached", "--stat"], result.worktree.path)
+    diff = await asyncio.to_thread(_run_git, ["diff", "--stat", "HEAD"], result.worktree.path)
+    staged = await asyncio.to_thread(_run_git, ["diff", "--cached", "--stat"], result.worktree.path)
     has_changes = bool(diff.stdout.strip() or staged.stdout.strip())
 
     if not has_changes:
@@ -492,16 +473,16 @@ async def run_subagent_and_merge(
         return result
 
     # Commit pending changes
-    committed = _commit_pending(result.worktree)
+    committed = await asyncio.to_thread(_commit_pending, result.worktree)
 
     # Generate diff summary
     if committed:
-        diff_summary = _generate_diff_summary(result.worktree)
+        diff_summary = await asyncio.to_thread(_generate_diff_summary, result.worktree)
         result.output += f"\n\n**Changes:**\n```\n{diff_summary}\n```"
 
     # Auto-merge if requested
     if auto_merge:
-        merge_result = _auto_merge(result.worktree, cwd)
+        merge_result = await _auto_merge(result.worktree, cwd)
         if merge_result.merged:
             result.output += f"\n\n{merge_result.message}"
             result.worktree = None  # Cleaned up by _auto_merge

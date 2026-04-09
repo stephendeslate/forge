@@ -733,30 +733,67 @@ def _format_search_results(query: str, results: list[dict]) -> str:
 
 
 def _parse_ddg_html(html: str) -> list[tuple[str, str, str]]:
-    """Parse DuckDuckGo HTML results into (title, url, snippet) tuples."""
-    results: list[tuple[str, str, str]] = []
-    # Match result links
-    links = re.findall(
-        r'<a[^>]+class="result__a"[^>]+href="([^"]*)"[^>]*>(.*?)</a>',
-        html, re.DOTALL,
-    )
-    snippets = re.findall(
-        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-        html, re.DOTALL,
-    )
-    for i, (raw_url, raw_title) in enumerate(links):
-        # DDG wraps URLs in redirects: /l/?uddg=<actual_url>&...
-        if "uddg=" in raw_url:
-            parsed = parse_qs(urlparse(raw_url).query)
-            actual_urls = parsed.get("uddg", [])
-            url = actual_urls[0] if actual_urls else raw_url
-        else:
-            url = raw_url
-        title = re.sub(r"<[^>]+>", "", raw_title).strip()
-        snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
-        if title and url:
-            results.append((title, url, snippet))
-    return results
+    """Parse DuckDuckGo HTML results into (title, url, snippet) tuples.
+
+    Uses stdlib html.parser instead of regex for resilience against
+    DDG layout changes.
+    """
+    from html.parser import HTMLParser
+
+    class _DDGParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.results: list[tuple[str, str, str]] = []
+            self._in_result = False
+            self._in_title_link = False
+            self._in_snippet = False
+            self._cur_url = ""
+            self._cur_title: list[str] = []
+            self._cur_snippet: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attr_dict = dict(attrs)
+            cls = attr_dict.get("class", "") or ""
+            if "result__a" in cls and tag == "a":
+                self._in_result = True
+                self._in_title_link = True
+                raw_url = attr_dict.get("href", "")
+                # DDG wraps URLs in redirects: /l/?uddg=<actual_url>&...
+                if raw_url and "uddg=" in raw_url:
+                    parsed = parse_qs(urlparse(raw_url).query)
+                    actual_urls = parsed.get("uddg", [])
+                    self._cur_url = actual_urls[0] if actual_urls else raw_url
+                else:
+                    self._cur_url = raw_url or ""
+            elif "result__snippet" in cls:
+                self._in_snippet = True
+
+        def handle_endtag(self, tag: str) -> None:
+            if self._in_title_link and tag == "a":
+                self._in_title_link = False
+            elif self._in_snippet and tag in ("a", "span", "div"):
+                self._in_snippet = False
+                title = "".join(self._cur_title).strip()
+                snippet = "".join(self._cur_snippet).strip()
+                if title and self._cur_url:
+                    self.results.append((title, self._cur_url, snippet))
+                self._cur_title = []
+                self._cur_snippet = []
+                self._cur_url = ""
+                self._in_result = False
+
+        def handle_data(self, data: str) -> None:
+            if self._in_title_link:
+                self._cur_title.append(data)
+            elif self._in_snippet:
+                self._cur_snippet.append(data)
+
+    try:
+        parser = _DDGParser()
+        parser.feed(html)
+        return parser.results
+    except Exception:
+        return []
 
 
 async def _ddg_search(query: str, max_results: int) -> str | None:

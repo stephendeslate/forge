@@ -1,4 +1,8 @@
-"""Forge MCP server — expose Forge tools to external clients."""
+"""Forge MCP server — expose Forge tools to external clients.
+
+Provides file I/O, code search, command execution, plus Forge-specific
+capabilities: local model inference, RAG search, and cross-session memory.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +23,10 @@ mcp = FastMCP("Forge")
 # Working directory — set at startup, tools operate relative to this
 _cwd: Path = Path.cwd()
 
+# Lazy-initialized database connection
+_db = None
+_db_lock = asyncio.Lock()
+
 
 def _resolve(path: str) -> Path:
     """Resolve a path relative to the working directory."""
@@ -26,6 +34,36 @@ def _resolve(path: str) -> Path:
     if not p.is_absolute():
         p = _cwd / p
     return p.resolve()
+
+
+async def _get_db():
+    """Lazy-init database connection pool."""
+    global _db
+    if _db is not None:
+        return _db
+
+    async with _db_lock:
+        if _db is not None:
+            return _db
+        try:
+            from forge.storage.database import Database
+            db = Database(settings.db.dsn)
+            await db.connect()
+            _db = db
+            return _db
+        except Exception as e:
+            logger.warning("Database unavailable for MCP server: %s", e)
+            return None
+
+
+def _project_name() -> str:
+    """Derive project name from working directory."""
+    return _cwd.name
+
+
+# ---------------------------------------------------------------------------
+# File I/O tools
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -254,6 +292,178 @@ def run_command(command: str, timeout: float = 30.0) -> str:
         return f"Error: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Forge-specific tools — local inference, RAG, memory
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def forge_ask(
+    prompt: str,
+    model: str = "auto",
+    system_prompt: str = "",
+) -> str:
+    """Send a prompt to a local model and get a response. Free and fast.
+
+    Use this for tasks that don't need cloud intelligence — code generation,
+    explanations, reformatting, summarization, etc.
+
+    Args:
+        prompt: The question or task.
+        model: "heavy", "fast", "npu", or "auto" (routes by complexity).
+        system_prompt: Optional system prompt override.
+    """
+    from forge.core.router import Route
+    from forge.models.npu import get_npu_backend
+    from forge.models.ollama import get_fast_backend, get_heavy_backend
+    from forge.prompts.system import CHAT_SYSTEM
+
+    system = system_prompt or CHAT_SYSTEM
+
+    route_map = {
+        "heavy": Route.HEAVY,
+        "fast": Route.FAST,
+        "npu": Route.NPU,
+    }
+    force_route = route_map.get(model)
+
+    # Build router and route
+    from forge.core.router import ModelRouter
+    router = ModelRouter(heavy=get_heavy_backend(), fast=get_fast_backend(), npu=get_npu_backend())
+    route, backend = router.route(prompt, force=force_route)
+
+    try:
+        result = await backend.generate(prompt, system=system)
+        return result
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def forge_rag_search(
+    query: str,
+    limit: int = 5,
+) -> str:
+    """Search the indexed codebase using semantic similarity.
+
+    Returns relevant code chunks ranked by hybrid vector + BM25 search.
+    Index the project first with `forge index .`
+
+    Args:
+        query: Natural language search query.
+        limit: Max results to return (default: 5).
+    """
+    db = await _get_db()
+    if db is None:
+        return "Error: Database unavailable. RAG search requires PostgreSQL."
+
+    project = _project_name()
+
+    try:
+        from forge.rag.retriever import retrieve
+        chunks = await retrieve(query, project, db, limit=limit)
+    except Exception as e:
+        return f"Error: RAG search failed: {e}"
+
+    if not chunks:
+        return f"No results found for '{query}'. Is the project indexed? Run: forge index ."
+
+    parts = []
+    for chunk in chunks:
+        score = f"{chunk.score:.2f}" if hasattr(chunk, "score") and chunk.score else ""
+        header = f"# {chunk.file_path}"
+        if hasattr(chunk, "name") and chunk.name:
+            header += f" — {chunk.name}"
+        if hasattr(chunk, "start_line") and chunk.start_line:
+            header += f" (lines {chunk.start_line}-{chunk.end_line})"
+        if score:
+            header += f" [score: {score}]"
+        parts.append(f"{header}\n```\n{chunk.content}\n```")
+
+    return "\n\n".join(parts)
+
+
+@mcp.tool()
+async def forge_memory_recall(
+    query: str,
+    category: str = "",
+    limit: int = 5,
+) -> str:
+    """Recall memories from Forge's cross-session memory system.
+
+    Searches past observations, feedback, and project knowledge using
+    semantic similarity.
+
+    Args:
+        query: What to search for.
+        category: Optional filter — one of: feedback, project, user, reference.
+        limit: Max memories to return.
+    """
+    db = await _get_db()
+    if db is None:
+        return "Error: Database unavailable. Memory requires PostgreSQL."
+
+    project = _project_name()
+
+    try:
+        from forge.agent.memory import recall_from_db
+        rows = await recall_from_db(
+            db, project, query,
+            category=category or None,
+            limit=limit,
+        )
+    except Exception as e:
+        return f"Error: Memory recall failed: {e}"
+
+    if not rows:
+        return f"No memories found for '{query}'."
+
+    parts = []
+    for r in rows:
+        score = f" (similarity: {r.score:.2f})" if r.score else ""
+        parts.append(f"[{r.category}] **{r.subject}**{score}\n{r.content}")
+
+    return "\n\n---\n\n".join(parts)
+
+
+@mcp.tool()
+async def forge_memory_save(
+    category: str,
+    subject: str,
+    content: str,
+) -> str:
+    """Save a memory to Forge's cross-session memory system.
+
+    Memories persist across sessions and are recalled by semantic similarity.
+
+    Args:
+        category: One of: feedback, project, user, reference.
+        subject: Brief title for the memory.
+        content: The memory content.
+    """
+    valid_categories = {"feedback", "project", "user", "reference"}
+    if category not in valid_categories:
+        return f"Error: category must be one of: {', '.join(sorted(valid_categories))}"
+
+    db = await _get_db()
+    if db is None:
+        return "Error: Database unavailable. Memory requires PostgreSQL."
+
+    project = _project_name()
+
+    try:
+        from forge.agent.memory import save_memory_to_db
+        memory_id = await save_memory_to_db(db, project, category, subject, content)
+        return f"Memory saved (id: {memory_id}, category: {category}, subject: {subject})"
+    except Exception as e:
+        return f"Error: Memory save failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Resource
+# ---------------------------------------------------------------------------
+
+
 @mcp.resource("forge://status")
 def forge_status() -> str:
     """Current Forge configuration and working directory."""
@@ -263,6 +473,7 @@ def forge_status() -> str:
         f"Fast model: {settings.ollama.fast_model}\n"
         f"Embed model: {settings.ollama.embed_model}\n"
         f"Ollama URL: {settings.ollama.base_url}\n"
+        f"Mode: {settings.agent.mode}\n"
     )
 
 

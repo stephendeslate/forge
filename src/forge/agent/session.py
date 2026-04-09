@@ -58,17 +58,6 @@ async def setup_model_monitor(deps: AgentDeps, console: Console) -> None:
             else:
                 console.print("[yellow]Model preload timed out — will load on first request.[/yellow]")
 
-    # Check Anthropic proxy health
-    from forge.models.anthropic import _ensure_anthropic_env, anthropic_health_check, is_anthropic_available, mark_rate_limited
-
-    _ensure_anthropic_env()
-    if is_anthropic_available():
-        proxy_ok = await anthropic_health_check()
-        if proxy_ok:
-            console.print("[dim]Anthropic proxy: [green]connected[/green][/dim]")
-        else:
-            console.print("[yellow]Anthropic proxy unreachable — using local models[/yellow]")
-            mark_rate_limited(600.0)  # 10 min cooldown, will auto-retry later
 
 
 def setup_worktree(
@@ -295,6 +284,14 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
             return f"\n\n🔍 AUTO-REVIEW of your recent changes:\n{results}\nAddress these issues."
         return ""
 
+    @agent.system_prompt
+    async def _inject_exemplars(ctx: RunContext[AgentDeps]) -> str:
+        if ctx.deps._exemplar_context:
+            context = ctx.deps._exemplar_context
+            ctx.deps._exemplar_context = None  # One-shot injection
+            return context
+        return ""
+
     _memory_cache: list | None = None
 
     @agent.system_prompt
@@ -336,6 +333,7 @@ def wire_dynamic_prompts(agent: Agent, deps: AgentDeps) -> None:
             except Exception:
                 logger.debug("Memory injection failed", exc_info=True)
         return ""
+
 
 
 def wire_lint_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
@@ -592,19 +590,38 @@ def wire_critique_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
             diff_text = diff_text[:max_chars] + "\n... (diff truncated)"
 
         # Send to fast model for critique
-        critique = await _call_critique_model(diff_text, deps)
+        critique, critique_source = await _call_critique_model(diff_text, deps)
         if critique and "LGTM" not in critique.upper():
             deps.critique_results = critique
-            logger.info("Critique found issues in multi-file changes")
+            logger.info("Critique found issues in multi-file changes (via %s)", critique_source)
+
+            # Capture cloud critique as exemplar — only when Gemini provided it
+            if critique_source == "gemini" and deps.memory_db and deps.memory_project:
+                try:
+                    from forge.agent.exemplars import capture_exemplar
+                    file_list = ", ".join(f.name for f in real_files[:5])
+                    await capture_exemplar(
+                        deps.memory_db,
+                        deps.memory_project,
+                        "critique",
+                        f"Review changes to: {file_list}",
+                        critique,
+                        "gemini-critique",
+                        outcome_score=0.6,
+                    )
+                except Exception:
+                    logger.debug("Critique exemplar capture failed", exc_info=True)
 
     hook_registry.on(TurnEnd, _run_critique, priority=30)
 
 
-async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
+async def _call_critique_model(diff_text: str, deps: AgentDeps) -> tuple[str | None, str]:
     """Send diff to the critique model with CRITIQUE_SYSTEM prompt.
 
     Uses heavy model by default (configurable via ollama.critique_model).
     If gemini.critique_model is set and Gemini is available, routes to Gemini.
+
+    Returns (critique_text, model_source) — model_source is "gemini" or "local".
     """
     import httpx
 
@@ -625,7 +642,7 @@ async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
                 prompt, model_settings={"timeout": settings.gemini.timeout},
             )
             logger.info("Gemini critique completed via %s", settings.gemini.critique_model)
-            return result.output
+            return result.output, "gemini"
         except Exception as exc:
             # Check for rate limiting (429)
             exc_str = str(exc).lower()
@@ -659,11 +676,11 @@ async def _call_critique_model(diff_text: str, deps: AgentDeps) -> str | None:
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get("message", {}).get("content", "")
+                return data.get("message", {}).get("content", ""), "local"
     except Exception:
         logger.debug("Critique model call failed", exc_info=True)
 
-    return None
+    return None, "local"
 
 
 def wire_syntax_hooks(hook_registry: HookRegistry, deps: AgentDeps) -> None:
@@ -772,40 +789,20 @@ def print_welcome(
 
     # Mode badge
     mode = settings.agent.mode
-    mode_styles = {"local": "bold green", "balanced": "bold cyan", "max": "bold magenta"}
-    mode_labels = {"local": "LOCAL", "balanced": "HYBRID", "max": "MAX"}
+    mode_styles = {"local": "bold green", "balanced": "bold cyan"}
+    mode_labels = {"local": "LOCAL", "balanced": "HYBRID"}
     logo.append("  ")
     logo.append(f"[{mode_labels.get(mode, mode.upper())}]", style=mode_styles.get(mode, "bold"))
 
     # ── Model grid ──
-    from forge.models.anthropic import is_anthropic_available
-
     model_grid = Table.grid(padding=(0, 2))
     model_grid.add_column(style="dim", min_width=10)  # label
     model_grid.add_column()  # value
 
-    if mode == "max" and is_anthropic_available():
-        model_grid.add_row(
-            "  heavy",
-            Text.assemble(
-                ("☁ ", "cyan"), (settings.anthropic.model, "bold cyan"),
-                ("  fallback: ", "dim"), (settings.ollama.heavy_model, "green"),
-            ),
-        )
-    elif mode == "max":
-        # Max mode but Anthropic unavailable — show warning
-        model_grid.add_row(
-            "  heavy",
-            Text.assemble(
-                (settings.ollama.heavy_model, "bold green"),
-                ("  ⚠ cloud unavailable", "yellow"),
-            ),
-        )
-    else:
-        model_grid.add_row(
-            "  heavy",
-            Text.assemble((settings.ollama.heavy_model, "bold green")),
-        )
+    model_grid.add_row(
+        "  heavy",
+        Text.assemble((settings.ollama.heavy_model, "bold green")),
+    )
     model_grid.add_row(
         "  fast",
         Text.assemble((settings.ollama.fast_model, "green")),
@@ -941,6 +938,20 @@ async def cleanup(
     # Close Ollama monitor
     if deps.ollama_monitor:
         await deps.ollama_monitor.close()
+
+    # Close NPU backend
+    try:
+        from forge.models.npu import close_npu_backend
+        await close_npu_backend()
+    except Exception:
+        logger.debug("NPU backend cleanup failed", exc_info=True)
+
+    # Close embeddings client
+    try:
+        from forge.models.embeddings import close_embeddings_client
+        await close_embeddings_client()
+    except Exception:
+        logger.debug("Embeddings client cleanup failed", exc_info=True)
 
     # Kill orphan background processes
     await deps.cleanup()

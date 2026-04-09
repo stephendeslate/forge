@@ -58,6 +58,12 @@ class OllamaBackend:
 
     def _get_agent(self, system: str) -> Agent:
         if system not in self._agents:
+            # Cap cache size — evict oldest non-default entry (FIFO via dict ordering)
+            if len(self._agents) >= 32:
+                for key in list(self._agents):
+                    if key != "":  # preserve default agent
+                        del self._agents[key]
+                        break
             self._agents[system] = Agent(model=self._model_id, instructions=system)
         return self._agents[system]
 

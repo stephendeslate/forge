@@ -26,27 +26,21 @@ def main(
     worktree: bool = typer.Option(False, "--worktree", help="Create isolated git worktree"),
     worktree_name: str = typer.Option(None, "--worktree-name", help="Name for the worktree"),
     local: bool = typer.Option(False, "--local", help="Local-only mode (no cloud calls)"),
-    max_mode: bool = typer.Option(False, "--max", help="Max mode (cloud-orchestrated with Opus)"),
-    prompt: str = typer.Argument(None, help="Optional initial prompt (shortcut for 'forge agent \"prompt\"')"),
 ) -> None:
     """Forge — local AI orchestration."""
     if version:
         console.print(f"forge {__version__}")
         raise typer.Exit()
 
-    if local and max_mode:
-        console.print("[red]Cannot use --local and --max together.[/red]")
-        raise typer.Exit(1)
-
-    if local or max_mode:
+    if local:
         from forge.config import apply_mode
-        apply_mode("local" if local else "max")
+        apply_mode("local")
 
     if ctx.invoked_subcommand is None:
         from forge.agent.loop import agent_repl
 
         wt_name = worktree_name if worktree or worktree_name else None
-        asyncio.run(agent_repl(initial_prompt=prompt, system=CHAT_SYSTEM, worktree_name=wt_name))
+        asyncio.run(agent_repl(system=CHAT_SYSTEM, worktree_name=wt_name))
 
 
 @app.command()
@@ -57,19 +51,14 @@ def agent(
     worktree: bool = typer.Option(False, "--worktree", help="Create isolated git worktree"),
     worktree_name: str = typer.Option(None, "--worktree-name", help="Name for the worktree"),
     local: bool = typer.Option(False, "--local", help="Local-only mode (no cloud calls)"),
-    max_mode: bool = typer.Option(False, "--max", help="Max mode (cloud-orchestrated with Opus)"),
 ) -> None:
     """Agentic coding mode — read, edit, search, and run commands."""
     from forge.agent.loop import agent_repl
     from forge.agent.permissions import PermissionPolicy
 
-    if local and max_mode:
-        console.print("[red]Cannot use --local and --max together.[/red]")
-        raise typer.Exit(1)
-
-    if local or max_mode:
+    if local:
         from forge.config import apply_mode
-        apply_mode("local" if local else "max")
+        apply_mode("local")
 
     if yolo:
         policy = PermissionPolicy.YOLO
@@ -149,6 +138,21 @@ def index(
     from ._index import index_command
 
     asyncio.run(index_command(path, project, force))
+
+
+@app.command()
+def new(
+    idea: str = typer.Argument(..., help="What to build"),
+    output: str = typer.Option(None, "--output", "-o", help="Output directory (default: ./<slug>)"),
+    stack: str = typer.Option(None, "--stack", "-s", help="Tech stack preset: nestjs, nextjs, fastapi"),
+    model: str = typer.Option(None, "--model", "-m", help="Model override"),
+    auto: bool = typer.Option(False, "--auto", help="Skip approval prompts"),
+    yolo: bool = typer.Option(False, "--yolo", help="Allow all tool calls without prompting"),
+) -> None:
+    """Create a new project from an idea — plan, build, verify."""
+    from ._new import new_command
+
+    asyncio.run(new_command(idea, output, stack, model, auto, yolo))
 
 
 @app.command()

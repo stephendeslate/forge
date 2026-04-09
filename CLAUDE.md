@@ -5,7 +5,7 @@
 - **Language:** Python 3.12, managed with `uv`
 - **Entry point:** `forge.cli:app` (typer)
 - **Config:** `~/.config/forge/config.toml` + env vars (`FORGE_*`)
-- **Models:** Ollama (GPU, ROCm) — heavy: `qwen3-coder-next:q8_0` (131K ctx), fast: `qwen3.5:4b` (8K ctx via `fast_num_ctx`); NPU (FastFlowLM) — `llama-3.2-3b`
+- **Models:** Ollama (GPU, ROCm) — heavy: `qwen3-coder-next:q8_0` (131K ctx), fast: `qwen3.5:4b` (8K ctx via `fast_num_ctx`); NPU (FastFlowLM) — `llama-3.2-3b`; Gemini (cloud, for planning/critique/recovery)
 
 ## Commands
 
@@ -50,6 +50,7 @@ forge serve --cwd /path         # MCP server rooted at specific directory
 /tasks        — show task list with status and dependencies
 /memory       — show memory stats or search memories
 /forget <id>  — delete a memory by numeric ID
+/exemplars    — list captured cloud model exemplars (delete with /exemplars delete <id>)
 /mcp          — list connected MCP servers
 /checkpoint   — save conversation checkpoint [name]
 /restore <n>  — restore to named checkpoint
@@ -83,8 +84,14 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
                ├── tools: read/write/edit/run/search/web_search/web_fetch
                ├── task tools: task_create/task_update/task_list/task_get
                ├── memory tools: save_memory/recall_memories
+               ├── exemplar learning: cloud successes → few-shot injection
                ├── MCP: external tool servers via .forge/mcp.json
                └── hooks: pre/post tool use events, permission enforcement
+forge serve → MCP server (stdio) — exposes Forge tools to external clients
+               ├── file tools: read/write/edit/search/list/run_command
+               ├── forge_ask: local model inference (heavy/fast/npu)
+               ├── forge_rag_search: semantic code search
+               └── forge_memory_recall/save: cross-session memory
 ```
 
 - **Router** uses keyword heuristics (no LLM call) to classify prompts; auto-routes short simple prompts to NPU when enabled
@@ -100,6 +107,8 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
 - **RAG** tree-sitter AST chunking → nomic-embed-text-v2-moe (768d) → pgvector cosine search
 - **Sandbox** command blocklist hook (`sandbox.py`) blocks dangerous commands (sudo, rm -rf /, curl|sh, etc.) and path boundary enforcement restricts file tools to cwd + /tmp; configurable via `SandboxSettings`
 - **Multimodal** `@path/to/image.png` syntax in REPL input attaches images via `BinaryContent`; auto-routes to `vision_model` if configured; `read_file` detects images and returns metadata
+- **Exemplar learning** cloud model successes (recovery, planning, critique) are stored in `exemplars` table with embeddings; retrieved as few-shot context for local model via system prompt injection; outcome tracking via exponential moving average
+- **MCP server** `forge serve` exposes file tools + `forge_ask` (local inference), `forge_rag_search`, `forge_memory_recall/save`; stdio transport; lazy DB init; designed for use as Claude Code MCP backend
 - **Database** PostgreSQL on Unix socket (port 5433), pgvector 0.6.0 with `vector` type (not halfvec)
 
 ## Key Implementation Notes
@@ -116,6 +125,7 @@ forge agent → pydantic-ai Agent(tools=[...]) → agentic loop
 - MCP config format: `{"mcpServers": {"name": {"command": "...", "args": [...], "env": {...}}}}` — same schema as Claude Desktop; set `"name": false` to disable a built-in server
 - Playwright browser MCP auto-discovered if `npx` is on PATH (headless mode); MCP tools are passed to sub-agents via `toolsets` param
 - Memory stored in `memories` table with 768d embeddings; recalled via cosine similarity; auto-prunes at 50 entries
+- Exemplars stored in `exemplars` table with 768d embeddings; ranked by outcome_score + similarity; auto-prunes at 100 per project
 - Task store is in-memory per session, serialized to DB for resume; injected into system prompt via `to_prompt()`
 - Hook registry: `HookRegistry.on(EventType, handler)` with priority ordering; `@with_hooks` decorator wraps tools
 - Sandbox hooks registered at priority -50 (before permission hook at 0); command blocklist + path boundary enforcement
@@ -154,3 +164,4 @@ uv run forge agent --worktree                  # Agent in isolated worktree
 - [x] Phase 7C: MCP integration — discover and connect external MCP tool servers via pydantic-ai
 - [x] Phase 8: Conversation checkpoints + RAG auto-index — named save/restore within sessions, staleness detection, post-write reindex hooks, /index command
 - [x] Phase 9: Sandboxing, multimodal, web browsing, dependency fixes — command blocklist + path boundaries, @image input with vision routing, Playwright MCP auto-discovery, fastmcp direct dep, MCP in sub-agents
+- [x] Phase 10: Remove max mode, enhanced MCP server, exemplar learning — removed Claude Code CLI wrapper (double-agent problem), added forge_ask/rag/memory MCP tools for Claude Code integration, exemplar learning system captures cloud model successes for local model few-shot injection

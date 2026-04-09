@@ -148,8 +148,9 @@ def _split_command_segments(command: str) -> list[str]:
 def make_command_blocklist_handler():
     """Create a PreToolUse handler that blocks dangerous commands.
 
-    Reads patterns from SandboxSettings at call time so config changes
-    take effect without restarting.
+    Delegates core blocklist/infinite-loop checks to ``check_command_blocklist``
+    (shared with MCP server), then adds hook-only extras: logging, sleep
+    detection, warn patterns.
     """
 
     async def _handler(event: PreToolUse) -> HookResult:
@@ -165,32 +166,22 @@ def make_command_blocklist_handler():
         if not command:
             return HookResult()
 
-        # Check blocked patterns against the whole command first (catches
-        # cross-operator patterns like "curl ... | bash"), then against
-        # each individual segment (catches patterns hidden behind && or ;).
+        # Core blocklist + infinite loop check (shared with MCP server)
+        block_msg = check_command_blocklist(command)
+        if block_msg:
+            logger.warning("Blocked command: %s", command)
+            return HookResult(
+                action=HookAction.BLOCK,
+                message=(
+                    block_msg + "\n"
+                    "This command could cause irreversible damage. "
+                    "If you need to run it, ask the user to do it manually."
+                ),
+            )
+
+        # Hook-only: sleep detection — check each segment for sleep >= 10s
         segments = _split_command_segments(command)
         check_targets = [command] + [s for s in segments if s != command]
-
-        for target in check_targets:
-            for pattern in settings.sandbox.blocked_patterns:
-                try:
-                    if re.search(pattern, target):
-                        logger.warning("Blocked command: %s (pattern: %s)", command, pattern)
-                        detail = f"Matched segment: `{target}`\n" if target != command else ""
-                        return HookResult(
-                            action=HookAction.BLOCK,
-                            message=(
-                                f"Command blocked by safety policy: `{command}`\n"
-                                f"{detail}"
-                                f"Matched pattern: `{pattern}`\n"
-                                "This command could cause irreversible damage. "
-                                "If you need to run it, ask the user to do it manually."
-                            ),
-                        )
-                except re.error:
-                    logger.debug("Invalid sandbox pattern: %s", pattern)
-
-        # Sleep detection — check each segment for sleep >= 10s
         for target in check_targets:
             sleep_match = re.search(r"\bsleep\s+(\d+)", target)
             if sleep_match and int(sleep_match.group(1)) >= 10:
@@ -202,20 +193,7 @@ def make_command_blocklist_handler():
                     ),
                 )
 
-        # Infinite loop detection — check the whole command (shell syntax
-        # like "while true; do" gets split on ";", so segment-only checks miss it)
-        if re.search(r"\bwhile\s+true\s*;?\s*do\b", command) or re.search(
-            r"\bfor\s*\(\s*;\s*;\s*\)", command
-        ):
-            return HookResult(
-                action=HookAction.BLOCK,
-                message=(
-                    f"Blocked: infinite loop detected in `{command[:80]}`.\n"
-                    "Use a bounded loop or a different approach."
-                ),
-            )
-
-        # Check warn patterns (log only, don't block)
+        # Hook-only: warn patterns (log only, don't block)
         for segment in segments:
             for pattern in settings.sandbox.warn_patterns:
                 try:
@@ -262,16 +240,11 @@ def make_write_command_detector(deps):
 def make_path_boundary_handler(cwd: Path):
     """Create a PreToolUse handler that restricts file tool paths.
 
-    Ensures file operations stay within the working directory, /tmp,
-    or explicitly allowed paths.
+    Delegates core boundary check to ``check_path_boundary`` (shared with
+    MCP server), then adds logging and user-facing guidance.
     """
 
     async def _handler(event: PreToolUse) -> HookResult:
-        from forge.config import settings
-
-        if not settings.sandbox.enabled or not settings.sandbox.restrict_paths:
-            return HookResult()
-
         if event.tool_name not in FILE_TOOLS:
             return HookResult()
 
@@ -279,37 +252,14 @@ def make_path_boundary_handler(cwd: Path):
         if not file_path:
             return HookResult()
 
-        # Resolve the path
-        p = Path(file_path)
-        if not p.is_absolute():
-            p = (cwd / p).resolve()
-        else:
-            p = p.resolve()
+        block_msg = check_path_boundary(file_path, cwd)
+        if block_msg:
+            logger.warning("Path outside boundary: %s (cwd: %s)", file_path, cwd)
+            return HookResult(
+                action=HookAction.BLOCK,
+                message=block_msg + "\nUse paths within the project directory or /tmp.",
+            )
 
-        resolved_cwd = cwd.resolve()
-
-        # Build allowed roots
-        allowed_roots = [resolved_cwd, Path("/tmp")]
-        for extra in settings.sandbox.allowed_paths:
-            allowed_roots.append(Path(extra).resolve())
-
-        # Check if path is within any allowed root
-        for root in allowed_roots:
-            try:
-                p.relative_to(root)
-                return HookResult()
-            except ValueError:
-                continue
-
-        logger.warning("Path outside boundary: %s (cwd: %s)", p, resolved_cwd)
-        return HookResult(
-            action=HookAction.BLOCK,
-            message=(
-                f"Path outside allowed directories: `{p}`\n"
-                f"Allowed: {resolved_cwd}, /tmp"
-                + (f", {', '.join(settings.sandbox.allowed_paths)}" if settings.sandbox.allowed_paths else "")
-                + "\nUse paths within the project directory or /tmp."
-            ),
-        )
+        return HookResult()
 
     return _handler

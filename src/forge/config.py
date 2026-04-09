@@ -40,15 +40,6 @@ class GeminiSettings(BaseSettings):
     critique_model: str = Field(default="gemini-2.5-flash", description="Gemini model for critique (empty = don't use Gemini for critique)")
 
 
-class AnthropicSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FORGE_ANTHROPIC_")
-
-    enabled: bool = Field(default=True, description="Use Anthropic as primary heavy model")
-    model: str = Field(default="claude-opus-4-6", description="Anthropic model name")
-    api_key: str = Field(default="", description="API key (or set ANTHROPIC_API_KEY; proxy handles real auth)")
-    timeout: int = Field(default=300, description="Request timeout in seconds")
-    max_tokens: int = Field(default=16384, description="Max output tokens per request")
-
 
 class NPUSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_NPU_")
@@ -88,7 +79,7 @@ class HookSettings(BaseSettings):
 class AgentSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_AGENT_")
 
-    mode: Literal["local", "balanced", "max"] = Field(default="balanced", description="Operating mode: local (all local), balanced (local-first, cloud-augmented), max (cloud-orchestrated)")
+    mode: Literal["local", "balanced"] = Field(default="balanced", description="Operating mode: local (all local), balanced (local-first, cloud-augmented)")
     num_ctx: int = Field(default=131072, description="Ollama num_ctx — context window size in tokens")
     fast_num_ctx: int = Field(default=8192, description="Context window for fast model (smaller = less VRAM, enables coexistence)")
     token_budget: int = Field(default=120000, description="Max tokens before auto-compaction triggers")
@@ -134,6 +125,12 @@ class AgentSettings(BaseSettings):
 
     # Post-session memory summary
     session_memory_threshold: int = Field(default=10, description="Min messages before showing session memory summary")
+
+    # Exemplar learning
+    exemplar_enabled: bool = Field(default=True, description="Enable exemplar learning from cloud models")
+    exemplar_max_inject: int = Field(default=2, description="Max exemplars injected as few-shot context")
+    exemplar_max_per_project: int = Field(default=100, description="Max exemplars stored per project")
+    exemplar_min_score: float = Field(default=0.3, description="Min similarity score to retrieve an exemplar")
 
 
 DEFAULT_BLOCKED_PATTERNS = [
@@ -192,7 +189,6 @@ class Settings(BaseSettings):
 
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
-    anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     npu: NPUSettings = Field(default_factory=NPUSettings)
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
@@ -212,7 +208,7 @@ class Settings(BaseSettings):
         return _CONFIG_DIR
 
 
-_VALID_MODES = {"local", "balanced", "max"}
+_VALID_MODES = {"local", "balanced"}
 
 
 def apply_mode(mode: str) -> None:
@@ -220,20 +216,14 @@ def apply_mode(mode: str) -> None:
 
     - local: disable all cloud services
     - balanced: re-enable cloud services (defaults)
-    - max: ensure Anthropic is enabled, set mode for create_agent to force cloud primary
     """
     if mode not in _VALID_MODES:
         raise ValueError(f"Invalid mode '{mode}'. Must be one of: {', '.join(sorted(_VALID_MODES))}")
     settings.agent.mode = mode  # type: ignore[assignment]
     if mode == "local":
-        settings.anthropic.enabled = False
         settings.gemini.enabled = False
     elif mode == "balanced":
         # Explicit reset — ensures switching from local→balanced re-enables cloud
-        settings.anthropic.enabled = True
-        settings.gemini.enabled = True
-    elif mode == "max":
-        settings.anthropic.enabled = True
         settings.gemini.enabled = True
 
 

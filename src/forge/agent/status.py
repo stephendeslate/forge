@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import sys
 import time
@@ -14,6 +15,24 @@ try:
     _HAS_TERMIOS = True
 except ImportError:
     _HAS_TERMIOS = False
+
+# Backup terminal restore — survives SIGTERM (not SIGKILL)
+_saved_termios: tuple[int, list] | None = None
+
+
+def _atexit_restore_terminal() -> None:
+    global _saved_termios
+    if _saved_termios is not None:
+        fd, settings = _saved_termios
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+        except (termios.error, OSError):
+            pass
+        _saved_termios = None
+
+
+if _HAS_TERMIOS:
+    atexit.register(_atexit_restore_terminal)
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -243,8 +262,8 @@ class StatusTracker:
         # Mode badge
         mode_str = ""
         if self.mode:
-            mode_labels = {"local": "LOCAL", "balanced": "HYBRID", "max": "MAX"}
-            mode_colors = {"local": "\033[32m", "balanced": "\033[36m", "max": "\033[35m"}
+            mode_labels = {"local": "LOCAL", "balanced": "HYBRID"}
+            mode_colors = {"local": "\033[32m", "balanced": "\033[36m"}
             label = mode_labels.get(self.mode, self.mode.upper())
             mcolor = mode_colors.get(self.mode, dim)
             mode_str = f" {mcolor}[{label}]{reset}"
@@ -272,12 +291,14 @@ class StatusTracker:
 
     async def _key_loop(self) -> None:
         """Monitor stdin for Ctrl-O (0x0f) to toggle visibility."""
+        global _saved_termios
         if not _HAS_TERMIOS or not sys.stdin.isatty():
             return
         fd = sys.stdin.fileno()
         old_settings = None
         try:
             old_settings = termios.tcgetattr(fd)
+            _saved_termios = (fd, old_settings)
             tty.setcbreak(fd)
         except (termios.error, OSError):
             return
@@ -302,4 +323,8 @@ class StatusTracker:
             pass
         finally:
             if old_settings is not None:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except (termios.error, OSError):
+                    pass
+                _saved_termios = None

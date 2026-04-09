@@ -19,6 +19,22 @@ class MemoryRow:
     created_at: Any = None
     accessed_at: Any = None
     score: float = 0.0
+    access_count: int = 0
+
+    @classmethod
+    def from_row(cls, r: asyncpg.Record) -> MemoryRow:
+        keys = r.keys()
+        return cls(
+            id=r["id"],
+            project=r["project"],
+            category=r["category"],
+            subject=r["subject"],
+            content=r["content"],
+            created_at=r["created_at"],
+            accessed_at=r["accessed_at"],
+            score=r["score"] if "score" in keys else 0.0,
+            access_count=r["access_count"] if "access_count" in keys else 0,
+        )
 
 
 @dataclass
@@ -35,9 +51,57 @@ class ChunkRow:
     file_hash: str
     score: float = 0.0  # cosine similarity score from search
 
+    @classmethod
+    def from_row(cls, r: asyncpg.Record) -> ChunkRow:
+        return cls(
+            id=r["id"],
+            project=r["project"],
+            file_path=r["file_path"],
+            chunk_type=r["chunk_type"],
+            name=r["name"],
+            content=r["content"],
+            start_line=r["start_line"],
+            end_line=r["end_line"],
+            token_count=r["token_count"],
+            file_hash=r["file_hash"],
+            score=r["score"] if "score" in r.keys() else 0.0,
+        )
+
+
+@dataclass
+class ExemplarRow:
+    id: int
+    project: str
+    task_type: str
+    task_description: str
+    solution_approach: str
+    outcome_score: float
+    model_source: str
+    created_at: Any = None
+    used_count: int = 0
+    last_used_at: Any = None
+    score: float = 0.0  # cosine similarity from search
+
+    @classmethod
+    def from_row(cls, r: asyncpg.Record) -> ExemplarRow:
+        keys = r.keys()
+        return cls(
+            id=r["id"],
+            project=r["project"],
+            task_type=r["task_type"],
+            task_description=r["task_description"],
+            solution_approach=r["solution_approach"],
+            outcome_score=r["outcome_score"],
+            model_source=r["model_source"],
+            created_at=r["created_at"],
+            used_count=r["used_count"],
+            last_used_at=r["last_used_at"],
+            score=r["score"] if "score" in keys else 0.0,
+        )
+
 
 class Database:
-    """Manages the asyncpg connection pool and chunk operations."""
+    """Facade over focused store classes. Maintains backward compatibility."""
 
     def __init__(self, dsn: str | None = None) -> None:
         from forge.config import settings
@@ -50,6 +114,14 @@ class Database:
         self._retry_attempts = cfg.retry_attempts
         self._retry_delay = cfg.retry_delay
         self._pool: asyncpg.Pool | None = None
+
+        # Stores — lazily initialized from pool
+        self._chunks_store: ChunkStore | None = None
+        self._sessions_store: SessionStore | None = None
+        self._memories_store: MemoryStore | None = None
+        self._exemplars_store: ExemplarStore | None = None
+        self._checkpoints_store: CheckpointStore | None = None
+        self._tasks_store: TaskStoreDB | None = None
 
     async def connect(self) -> None:
         for attempt in range(self._retry_attempts):
@@ -80,8 +152,9 @@ class Database:
                         "Migration check failed — continuing without migrations",
                         exc_info=True,
                     )
+
                 return
-            except (OSError, asyncpg.PostgresError) as exc:
+            except (OSError, asyncpg.PostgresError):
                 if attempt == self._retry_attempts - 1:
                     raise
                 await asyncio.sleep(self._retry_delay * (attempt + 1))
@@ -97,535 +170,205 @@ class Database:
             raise RuntimeError("Database not connected. Call connect() first.")
         return self._pool
 
+    def _get_store(self, attr: str, cls: type):
+        """Lazily initialize a store from the pool."""
+        store = getattr(self, attr, None)
+        if store is None:
+            store = cls(self.pool)
+            setattr(self, attr, store)
+        return store
+
+    @property
+    def _chunks(self) -> ChunkStore:
+        return self._get_store("_chunks_store", ChunkStore)
+
+    @property
+    def _sessions(self) -> SessionStore:
+        return self._get_store("_sessions_store", SessionStore)
+
+    @property
+    def _memories(self) -> MemoryStore:
+        return self._get_store("_memories_store", MemoryStore)
+
+    @property
+    def _exemplars(self) -> ExemplarStore:
+        return self._get_store("_exemplars_store", ExemplarStore)
+
+    @property
+    def _checkpoints(self) -> CheckpointStore:
+        return self._get_store("_checkpoints_store", CheckpointStore)
+
+    @property
+    def _tasks(self) -> TaskStoreDB:
+        return self._get_store("_tasks_store", TaskStoreDB)
+
+    # --- Chunk / RAG ---
+
     async def get_file_hash(self, project: str, file_path: str) -> str | None:
-        """Get the stored file hash for incremental indexing. Returns None if not indexed."""
-        row = await self.pool.fetchrow(
-            "SELECT DISTINCT file_hash FROM chunks WHERE project = $1 AND file_path = $2",
-            project,
-            file_path,
-        )
-        return row["file_hash"] if row else None
+        return await self._chunks.get_file_hash(project, file_path)
 
     async def delete_file_chunks(self, project: str, file_path: str) -> int:
-        """Delete all chunks for a file (before re-indexing)."""
-        result = await self.pool.execute(
-            "DELETE FROM chunks WHERE project = $1 AND file_path = $2",
-            project,
-            file_path,
-        )
-        try:
-            return int(result.split()[-1])  # "DELETE N"
-        except (ValueError, IndexError):
-            return 0
+        return await self._chunks.delete_file_chunks(project, file_path)
 
     async def insert_chunks(self, chunks: list[dict[str, Any]]) -> int:
-        """Bulk insert chunks with embeddings."""
-        if not chunks:
-            return 0
-
-        records = [
-            (
-                c["project"],
-                c["file_path"],
-                c["chunk_type"],
-                c.get("name"),
-                c["content"],
-                c["start_line"],
-                c["end_line"],
-                c["token_count"],
-                c["embedding"],
-                c["file_hash"],
-            )
-            for c in chunks
-        ]
-
-        await self.pool.executemany(
-            """
-            INSERT INTO chunks (project, file_path, chunk_type, name, content,
-                                start_line, end_line, token_count, embedding, file_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10)
-            """,
-            records,
-        )
-        return len(records)
+        return await self._chunks.insert_chunks(chunks)
 
     async def search(
-        self,
-        embedding: str,
-        project: str,
-        *,
-        limit: int = 10,
-        min_score: float = 0.3,
+        self, embedding: str, project: str, *, limit: int = 10, min_score: float = 0.3,
     ) -> list[ChunkRow]:
-        """Search for similar chunks using cosine distance on vector."""
-        rows = await self.pool.fetch(
-            """
-            SELECT id, project, file_path, chunk_type, name, content,
-                   start_line, end_line, token_count, file_hash,
-                   1 - (embedding <=> $1::vector) AS score
-            FROM chunks
-            WHERE project = $2
-              AND 1 - (embedding <=> $1::vector) >= $4
-            ORDER BY embedding <=> $1::vector
-            LIMIT $3
-            """,
-            embedding,
-            project,
-            limit,
-            min_score,
-        )
-        return [
-            ChunkRow(
-                id=r["id"],
-                project=r["project"],
-                file_path=r["file_path"],
-                chunk_type=r["chunk_type"],
-                name=r["name"],
-                content=r["content"],
-                start_line=r["start_line"],
-                end_line=r["end_line"],
-                token_count=r["token_count"],
-                file_hash=r["file_hash"],
-                score=r["score"],
-            )
-            for r in rows
-        ]
+        return await self._chunks.search(embedding, project, limit=limit, min_score=min_score)
 
-    async def text_search(
-        self,
-        query: str,
-        project: str,
-        *,
-        limit: int = 20,
-    ) -> list[ChunkRow]:
-        """Full-text search using PostgreSQL tsvector/tsquery."""
-        rows = await self.pool.fetch(
-            """
-            SELECT id, project, file_path, chunk_type, name, content,
-                   start_line, end_line, token_count, file_hash,
-                   ts_rank(tsv, websearch_to_tsquery('english', $1)) AS score
-            FROM chunks
-            WHERE project = $2
-              AND tsv @@ websearch_to_tsquery('english', $1)
-            ORDER BY score DESC
-            LIMIT $3
-            """,
-            query,
-            project,
-            limit,
-        )
-        return [
-            ChunkRow(
-                id=r["id"],
-                project=r["project"],
-                file_path=r["file_path"],
-                chunk_type=r["chunk_type"],
-                name=r["name"],
-                content=r["content"],
-                start_line=r["start_line"],
-                end_line=r["end_line"],
-                token_count=r["token_count"],
-                file_hash=r["file_hash"],
-                score=r["score"],
-            )
-            for r in rows
-        ]
-
-    # --- Session / conversation persistence ---
-
-    async def create_session(self, session_id: str, mode: str = "chat", project: str | None = None) -> None:
-        await self.pool.execute(
-            "INSERT INTO sessions (id, mode, project) VALUES ($1, $2, $3)",
-            session_id, mode, project,
-        )
-
-    async def update_session_title(self, session_id: str, title: str) -> None:
-        await self.pool.execute(
-            "UPDATE sessions SET title = $1, updated_at = NOW() WHERE id = $2",
-            title, session_id,
-        )
-
-    async def save_message(self, session_id: str, role: str, content: str, model: str = "") -> None:
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO conversations (session_id, role, content, model) VALUES ($1, $2, $3, $4)",
-                    session_id, role, content, model or None,
-                )
-                await conn.execute(
-                    "UPDATE sessions SET updated_at = NOW() WHERE id = $1",
-                    session_id,
-                )
-
-    async def load_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        rows = await self.pool.fetch(
-            "SELECT role, content, model, created_at FROM conversations "
-            "WHERE session_id = $1 ORDER BY created_at LIMIT $2",
-            session_id, limit,
-        )
-        return [dict(r) for r in rows]
-
-    async def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
-        rows = await self.pool.fetch(
-            """
-            SELECT s.id, s.title, s.mode, s.project, s.created_at, s.updated_at,
-                   count(c.id) AS message_count
-            FROM sessions s
-            LEFT JOIN conversations c ON c.session_id = s.id
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            LIMIT $1
-            """,
-            limit,
-        )
-        return [dict(r) for r in rows]
-
-    async def delete_session(self, session_id: str) -> None:
-        await self.pool.execute("DELETE FROM conversations WHERE session_id = $1", session_id)
-        await self.pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
-
-    async def get_session(self, session_id: str) -> dict[str, Any] | None:
-        row = await self.pool.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
-        return dict(row) if row else None
-
-    async def get_latest_session_id(self) -> str | None:
-        row = await self.pool.fetchrow("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1")
-        return row["id"] if row else None
-
-    async def get_session_count(self) -> int:
-        row = await self.pool.fetchrow("SELECT count(*) FROM sessions")
-        return row["count"]
-
-    async def delete_agent_history(self, session_id: str) -> None:
-        """Delete the agent_history row for a session (before re-saving)."""
-        await self.pool.execute(
-            "DELETE FROM conversations WHERE session_id = $1 AND role = 'agent_history'",
-            session_id,
-        )
-
-    async def load_agent_history(self, session_id: str) -> str | None:
-        """Load the agent_history JSON blob for a session. Returns None if not found."""
-        row = await self.pool.fetchrow(
-            "SELECT content FROM conversations WHERE session_id = $1 AND role = 'agent_history' "
-            "ORDER BY created_at DESC LIMIT 1",
-            session_id,
-        )
-        return row["content"] if row else None
+    async def text_search(self, query: str, project: str, *, limit: int = 20) -> list[ChunkRow]:
+        return await self._chunks.text_search(query, project, limit=limit)
 
     async def get_project_stats(self, project: str) -> dict[str, Any]:
-        """Get indexing stats for a project."""
-        row = await self.pool.fetchrow(
-            """
-            SELECT count(*) AS chunk_count,
-                   count(DISTINCT file_path) AS file_count,
-                   max(indexed_at) AS last_indexed
-            FROM chunks WHERE project = $1
-            """,
-            project,
-        )
-        return dict(row) if row else {"chunk_count": 0, "file_count": 0, "last_indexed": None}
+        return await self._chunks.get_project_stats(project)
 
-    # --- Memory persistence ---
+    # --- Session / Conversation ---
 
-    async def save_memory(
-        self,
-        project: str,
-        category: str,
-        subject: str,
-        content: str,
-        embedding: str,
-    ) -> int:
-        """Insert a memory and return its ID."""
-        row = await self.pool.fetchrow(
-            """
-            INSERT INTO memories (project, category, subject, content, embedding)
-            VALUES ($1, $2, $3, $4, $5::vector)
-            RETURNING id
-            """,
-            project, category, subject, content, embedding,
-        )
-        return row["id"]
+    async def create_session(self, session_id: str, mode: str = "chat", project: str | None = None) -> None:
+        await self._sessions.create_session(session_id, mode, project)
+
+    async def update_session_title(self, session_id: str, title: str) -> None:
+        await self._sessions.update_session_title(session_id, title)
+
+    async def save_message(self, session_id: str, role: str, content: str, model: str = "") -> None:
+        await self._sessions.save_message(session_id, role, content, model)
+
+    async def load_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        return await self._sessions.load_messages(session_id, limit)
+
+    async def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        return await self._sessions.list_sessions(limit)
+
+    async def delete_session(self, session_id: str) -> None:
+        await self._sessions.delete_session(session_id)
+
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return await self._sessions.get_session(session_id)
+
+    async def get_latest_session_id(self) -> str | None:
+        return await self._sessions.get_latest_session_id()
+
+    async def get_session_count(self) -> int:
+        return await self._sessions.get_session_count()
+
+    async def delete_agent_history(self, session_id: str) -> None:
+        await self._sessions.delete_agent_history(session_id)
+
+    async def load_agent_history(self, session_id: str) -> str | None:
+        return await self._sessions.load_agent_history(session_id)
+
+    # --- Memory ---
+
+    async def save_memory(self, project: str, category: str, subject: str, content: str, embedding: str) -> int:
+        return await self._memories.save_memory(project, category, subject, content, embedding)
 
     async def search_memories(
-        self,
-        embedding: str,
-        project: str,
-        *,
-        category: str | None = None,
-        limit: int = 10,
-        min_score: float = 0.3,
+        self, embedding: str, project: str, *, category: str | None = None,
+        limit: int = 10, min_score: float = 0.3,
     ) -> list[MemoryRow]:
-        """Search memories by vector similarity."""
-        if category:
-            rows = await self.pool.fetch(
-                """
-                SELECT id, project, category, subject, content, created_at, accessed_at,
-                       1 - (embedding <=> $1::vector) AS score
-                FROM memories
-                WHERE project = $2 AND category = $3
-                  AND 1 - (embedding <=> $1::vector) >= $5
-                ORDER BY embedding <=> $1::vector
-                LIMIT $4
-                """,
-                embedding, project, category, limit, min_score,
-            )
-        else:
-            rows = await self.pool.fetch(
-                """
-                SELECT id, project, category, subject, content, created_at, accessed_at,
-                       1 - (embedding <=> $1::vector) AS score
-                FROM memories
-                WHERE project = $2
-                  AND 1 - (embedding <=> $1::vector) >= $4
-                ORDER BY embedding <=> $1::vector
-                LIMIT $3
-                """,
-                embedding, project, limit, min_score,
-            )
+        return await self._memories.search_memories(
+            embedding, project, category=category, limit=limit, min_score=min_score,
+        )
 
-        # Touch accessed_at and increment access_count for returned memories
-        if rows:
-            ids = [r["id"] for r in rows]
-            await self.pool.execute(
-                "UPDATE memories SET accessed_at = NOW(), "
-                "access_count = COALESCE(access_count, 0) + 1 "
-                "WHERE id = ANY($1::bigint[])",
-                ids,
-            )
-
-        return [
-            MemoryRow(
-                id=r["id"],
-                project=r["project"],
-                category=r["category"],
-                subject=r["subject"],
-                content=r["content"],
-                created_at=r["created_at"],
-                accessed_at=r["accessed_at"],
-                score=r["score"],
-            )
-            for r in rows
-        ]
-
-    async def list_memories(
-        self,
-        project: str,
-        *,
-        category: str | None = None,
-        limit: int = 50,
-    ) -> list[MemoryRow]:
-        """List memories for a project, newest first."""
-        if category:
-            rows = await self.pool.fetch(
-                "SELECT id, project, category, subject, content, created_at, accessed_at "
-                "FROM memories WHERE project = $1 AND category = $2 "
-                "ORDER BY created_at DESC LIMIT $3",
-                project, category, limit,
-            )
-        else:
-            rows = await self.pool.fetch(
-                "SELECT id, project, category, subject, content, created_at, accessed_at "
-                "FROM memories WHERE project = $1 "
-                "ORDER BY created_at DESC LIMIT $2",
-                project, limit,
-            )
-        return [
-            MemoryRow(
-                id=r["id"], project=r["project"], category=r["category"],
-                subject=r["subject"], content=r["content"],
-                created_at=r["created_at"], accessed_at=r["accessed_at"],
-            )
-            for r in rows
-        ]
+    async def list_memories(self, project: str, *, category: str | None = None, limit: int = 50) -> list[MemoryRow]:
+        return await self._memories.list_memories(project, category=category, limit=limit)
 
     async def delete_memory(self, memory_id: int) -> bool:
-        """Delete a memory by ID. Returns True if deleted."""
-        result = await self.pool.execute(
-            "DELETE FROM memories WHERE id = $1", memory_id,
-        )
-        return result == "DELETE 1"
+        return await self._memories.delete_memory(memory_id)
 
     async def count_memories(self, project: str) -> int:
-        """Count memories for a project."""
-        row = await self.pool.fetchrow(
-            "SELECT count(*) FROM memories WHERE project = $1", project,
-        )
-        return row["count"]
+        return await self._memories.count_memories(project)
 
     async def prune_memories(self, project: str, *, keep: int = 50) -> int:
-        """Delete oldest memories beyond the keep limit. Returns count deleted."""
-        result = await self.pool.execute(
-            """
-            DELETE FROM memories WHERE id IN (
-                SELECT id FROM memories
-                WHERE project = $1
-                ORDER BY accessed_at DESC
-                OFFSET $2
-            )
-            """,
-            project, keep,
-        )
-        try:
-            return int(result.split()[-1])
-        except (ValueError, IndexError):
-            return 0
+        return await self._memories.prune_memories(project, keep=keep)
 
-    async def find_similar_pairs(
-        self, project: str, threshold: float = 0.92,
-    ) -> list[tuple[int, int, float]]:
-        """Find memory pairs with cosine similarity >= threshold."""
-        rows = await self.pool.fetch(
-            """
-            SELECT a.id AS id_a, b.id AS id_b,
-                   1 - (a.embedding <=> b.embedding) AS similarity
-            FROM memories a, memories b
-            WHERE a.project = $1 AND b.project = $1
-              AND a.id < b.id
-              AND 1 - (a.embedding <=> b.embedding) >= $2
-            ORDER BY similarity DESC
-            """,
-            project, threshold,
-        )
-        return [(r["id_a"], r["id_b"], r["similarity"]) for r in rows]
+    async def find_similar_pairs(self, project: str, threshold: float = 0.92) -> list[tuple[int, int, float]]:
+        return await self._memories.find_similar_pairs(project, threshold)
 
     async def get_memories_by_ids(self, ids: list[int]) -> list[MemoryRow]:
-        """Fetch specific memories by ID."""
-        rows = await self.pool.fetch(
-            "SELECT id, project, category, subject, content, created_at, accessed_at, "
-            "COALESCE(access_count, 0) AS access_count "
-            "FROM memories WHERE id = ANY($1::bigint[]) ORDER BY id",
-            ids,
-        )
-        result = []
-        for r in rows:
-            mr = MemoryRow(
-                id=r["id"], project=r["project"], category=r["category"],
-                subject=r["subject"], content=r["content"],
-                created_at=r["created_at"], accessed_at=r["accessed_at"],
-            )
-            mr.access_count = r["access_count"]  # type: ignore[attr-defined]
-            result.append(mr)
-        return result
+        return await self._memories.get_memories_by_ids(ids)
 
     async def get_all_memories_with_embeddings(self, project: str) -> list[MemoryRow]:
-        """Fetch all memories for a project with access_count."""
-        rows = await self.pool.fetch(
-            "SELECT id, project, category, subject, content, created_at, accessed_at, "
-            "COALESCE(access_count, 0) AS access_count "
-            "FROM memories WHERE project = $1 ORDER BY id",
-            project,
-        )
-        result = []
-        for r in rows:
-            mr = MemoryRow(
-                id=r["id"], project=r["project"], category=r["category"],
-                subject=r["subject"], content=r["content"],
-                created_at=r["created_at"], accessed_at=r["accessed_at"],
-            )
-            mr.access_count = r["access_count"]  # type: ignore[attr-defined]
-            result.append(mr)
-        return result
+        return await self._memories.get_all_memories_with_embeddings(project)
 
-    async def merge_memory(
-        self, keep_id: int, discard_id: int, new_content: str, new_embedding: str,
-    ) -> None:
-        """Merge two memories: update keeper content/embedding, delete discarded."""
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                # Sum access counts
-                await conn.execute(
-                    """
-                    UPDATE memories SET
-                        content = $2,
-                        embedding = $3::vector,
-                        access_count = COALESCE(access_count, 0) + (
-                            SELECT COALESCE(access_count, 0) FROM memories WHERE id = $4
-                        )
-                    WHERE id = $1
-                    """,
-                    keep_id, new_content, new_embedding, discard_id,
-                )
-                await conn.execute("DELETE FROM memories WHERE id = $1", discard_id)
+    async def merge_memory(self, keep_id: int, discard_id: int, new_content: str, new_embedding: str) -> None:
+        await self._memories.merge_memory(keep_id, discard_id, new_content, new_embedding)
 
     async def prune_by_ids(self, ids: list[int]) -> int:
-        """Delete memories by ID list. Returns count deleted."""
-        if not ids:
-            return 0
-        result = await self.pool.execute(
-            "DELETE FROM memories WHERE id = ANY($1::bigint[])", ids,
-        )
-        try:
-            return int(result.split()[-1])
-        except (ValueError, IndexError):
-            return 0
+        return await self._memories.prune_by_ids(ids)
 
-    # --- Task store persistence ---
+    # --- Exemplar ---
+
+    async def save_exemplar(
+        self, project: str, task_type: str, task_description: str,
+        solution_approach: str, outcome_score: float, model_source: str, embedding: str,
+    ) -> int:
+        return await self._exemplars.save_exemplar(
+            project, task_type, task_description, solution_approach,
+            outcome_score, model_source, embedding,
+        )
+
+    async def search_exemplars(
+        self, embedding: str, project: str, *, task_type: str | None = None,
+        limit: int = 3, min_score: float = 0.3,
+    ) -> list[ExemplarRow]:
+        return await self._exemplars.search_exemplars(
+            embedding, project, task_type=task_type, limit=limit, min_score=min_score,
+        )
+
+    async def update_exemplar_outcome(self, exemplar_id: int, success: bool) -> None:
+        await self._exemplars.update_exemplar_outcome(exemplar_id, success)
+
+    async def increment_exemplar_usage(self, exemplar_id: int) -> None:
+        await self._exemplars.increment_exemplar_usage(exemplar_id)
+
+    async def count_exemplars(self, project: str) -> int:
+        return await self._exemplars.count_exemplars(project)
+
+    async def list_exemplars(self, project: str, *, limit: int = 20) -> list[ExemplarRow]:
+        return await self._exemplars.list_exemplars(project, limit=limit)
+
+    async def get_exemplar(self, exemplar_id: int) -> ExemplarRow | None:
+        return await self._exemplars.get_exemplar(exemplar_id)
+
+    async def delete_exemplar(self, exemplar_id: int) -> bool:
+        return await self._exemplars.delete_exemplar(exemplar_id)
+
+    async def prune_exemplars(self, project: str, *, keep: int = 100) -> int:
+        return await self._exemplars.prune_exemplars(project, keep=keep)
+
+    # --- Task store ---
 
     async def save_task_store(self, session_id: str, task_json: str) -> None:
-        """Persist task store JSON to conversations table."""
-        await self.pool.execute(
-            "DELETE FROM conversations WHERE session_id = $1 AND role = 'task_store'",
-            session_id,
-        )
-        await self.save_message(session_id, "task_store", task_json, model="")
+        await self._tasks.save_task_store(session_id, task_json)
 
     async def load_task_store(self, session_id: str) -> str | None:
-        """Load task store JSON. Returns None if not found."""
-        row = await self.pool.fetchrow(
-            "SELECT content FROM conversations WHERE session_id = $1 AND role = 'task_store' "
-            "ORDER BY created_at DESC LIMIT 1",
-            session_id,
-        )
-        return row["content"] if row else None
+        return await self._tasks.load_task_store(session_id)
 
-    # --- Checkpoint persistence ---
+    # --- Checkpoints ---
 
     async def save_checkpoint(
-        self,
-        session_id: str,
-        name: str,
-        agent_history: str,
-        task_store: str | None,
-        message_count: int,
+        self, session_id: str, name: str, agent_history: str,
+        task_store: str | None, message_count: int,
     ) -> None:
-        """UPSERT a named checkpoint for a session."""
-        await self.pool.execute(
-            """
-            INSERT INTO checkpoints (session_id, name, agent_history, task_store, message_count)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (session_id, name) DO UPDATE
-            SET agent_history = EXCLUDED.agent_history,
-                task_store = EXCLUDED.task_store,
-                message_count = EXCLUDED.message_count,
-                created_at = NOW()
-            """,
-            session_id, name, agent_history, task_store, message_count,
-        )
+        await self._checkpoints.save_checkpoint(session_id, name, agent_history, task_store, message_count)
 
     async def load_checkpoint(self, session_id: str, name: str) -> dict[str, Any] | None:
-        """Load a named checkpoint. Returns dict with agent_history, task_store, message_count."""
-        row = await self.pool.fetchrow(
-            "SELECT agent_history, task_store, message_count, created_at "
-            "FROM checkpoints WHERE session_id = $1 AND name = $2",
-            session_id, name,
-        )
-        return dict(row) if row else None
+        return await self._checkpoints.load_checkpoint(session_id, name)
 
     async def list_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
-        """List checkpoints for a session, newest first."""
-        rows = await self.pool.fetch(
-            "SELECT name, message_count, created_at "
-            "FROM checkpoints WHERE session_id = $1 ORDER BY created_at DESC",
-            session_id,
-        )
-        return [dict(r) for r in rows]
+        return await self._checkpoints.list_checkpoints(session_id)
 
     async def delete_checkpoint(self, session_id: str, name: str) -> bool:
-        """Delete a checkpoint by name. Returns True if deleted."""
-        result = await self.pool.execute(
-            "DELETE FROM checkpoints WHERE session_id = $1 AND name = $2",
-            session_id, name,
-        )
-        return result == "DELETE 1"
+        return await self._checkpoints.delete_checkpoint(session_id, name)
 
 
+# Import stores at bottom to avoid circular imports
+from forge.storage.checkpoint_store import CheckpointStore  # noqa: E402
+from forge.storage.chunk_store import ChunkStore  # noqa: E402
+from forge.storage.exemplar_store import ExemplarStore  # noqa: E402
+from forge.storage.memory_store import MemoryStore  # noqa: E402
+from forge.storage.session_store import SessionStore  # noqa: E402
+from forge.storage.task_store_db import TaskStoreDB  # noqa: E402
