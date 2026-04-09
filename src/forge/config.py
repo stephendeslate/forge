@@ -32,8 +32,8 @@ class OllamaSettings(BaseSettings):
 class GeminiSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FORGE_GEMINI_")
 
-    enabled: bool = Field(default=True, description="Enable cloud reasoning via Gemini 2.5 Pro (uses internet)")
-    model: str = Field(default="gemini-2.5-pro", description="Gemini model name")
+    enabled: bool = Field(default=True, description="Enable cloud reasoning via Gemini (uses internet)")
+    model: str = Field(default="gemini-2.5-flash", description="Gemini model for planning/recovery")
     fallback_model: str = Field(default="gemini-2.0-flash", description="Fallback model if primary fails")
     api_key: str = Field(default="", description="Google AI Studio API key (or set GOOGLE_API_KEY env var)")
     timeout: int = Field(default=120, description="Request timeout in seconds")

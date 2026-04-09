@@ -16,7 +16,7 @@ class TestGeminiSettingsDefaults:
     def test_defaults(self):
         s = GeminiSettings()
         assert s.enabled is True
-        assert s.model == "gemini-2.5-pro"
+        assert s.model == "gemini-2.5-flash"
         assert s.fallback_model == "gemini-2.0-flash"
         assert s.api_key == ""
         assert s.timeout == 120
