@@ -16,8 +16,20 @@ STACK_PRESETS: dict[str, str] = {
 - Vitest for testing
 - docker-compose.yml for PostgreSQL + Redis
 - NestJS modules: one per domain (apps/api/src/modules/{domain}/)
-- Shared Zod schemas in packages/shared/
+- Shared Zod schemas in packages/shared/ — imported and used by API for validation
 - TypeScript 5.7+ strict mode
+
+### NestJS Conventions (MUST follow)
+- Every module that injects PrismaService MUST import PrismaModule in its imports array.
+- Every protected controller MUST use @UseGuards(JwtAuthGuard).
+- main.ts MUST have: app.enableCors(), app.useGlobalPipes(new ValidationPipe()), app.enableShutdownHooks().
+- main.ts MUST have a global AllExceptionsFilter that catches Prisma errors and returns clean JSON (not stack traces).
+- API MUST listen on port 3001 (not 3000 — that's Next.js).
+- .env MUST be in .gitignore. Use .env.example for documenting required variables.
+- Every mutating endpoint MUST have @HttpCode with the correct status (201 for create, 200 for update, 204 for delete).
+- Auth endpoints MUST NOT return passwordHash in responses. Use Prisma select to exclude it.
+- List endpoints MUST support pagination (take/skip query params with sensible defaults).
+- Use Prisma's create/update directly with try/catch for constraint errors (P2002 → 409 Conflict) instead of find-then-create patterns.
 """,
     "nextjs": """\
 ## Tech Stack: Next.js Full-Stack
@@ -71,6 +83,17 @@ You MUST follow this exact workflow:
    - Project overview and tech stack
    - Architecture (data model with key entities and relationships, key flows, module structure)
    - Key commands section: list EVERY script that will exist in package.json files (install, build, dev, test, etc.)
+   - **Infrastructure requirements** (REQUIRED section):
+     - Guards: list every guard the app needs (e.g., JwtAuthGuard, RolesGuard)
+     - Middleware: request logging, security headers
+     - Pipes: ValidationPipe configuration, custom pipes
+     - Filters: Global AllExceptionsFilter that catches Prisma/HTTP errors and returns clean JSON
+     - Validation strategy: specify exactly how input validation works (e.g., "Zod schemas from packages/shared piped through a ZodValidationPipe" or "class-validator DTOs")
+     - Error handling: how constraint violations (duplicate email), not-found, and unauthorized errors are handled
+     - Config: list all environment variables and their purpose
+   - **Shared package contract** (REQUIRED section):
+     - List every type, schema, and utility that lives in packages/shared
+     - Specify which apps import what from shared (e.g., "API imports Zod schemas for validation, Web imports types for API responses")
    - Phased build order (3-5 phases, each with 2-5 related features)
    - Dependencies between features
    - Test strategy and integration checkpoints
@@ -119,6 +142,10 @@ You MUST follow this exact workflow:
 - NEVER use scaffolding CLIs like create-turbo, create-next-app, etc. Write all files directly with write_file.
 - NEVER start long-running servers (nest start, pnpm start, node dist/main.js) in run_command — they will hang. Instead, use `timeout 5 node dist/main.js` to verify the server boots, or use `curl` against a server you've already verified starts.
 - To verify the server works: use `timeout 5 node dist/main.js 2>&1 || true` — if it prints "Nest application successfully started", the server works. Do NOT try to keep it running.
+- NEVER use find-then-create patterns (race condition). Use direct create with try/catch on unique constraint errors.
+- The shared package (packages/shared) MUST be imported and used by the API — not dead code. If you define Zod schemas in shared, the API must import and use them.
+- Frontend and API response shapes MUST match. If the frontend reads `stats.total`, the API must return `{{ total: number }}`, not `{{ totalTasks: number }}`.
+- Frontend auth MUST use ONE strategy consistently (either cookies OR localStorage, not both).
 
 ## Task management
 Create a task for each build phase. Mark in_progress when starting, completed when done.
