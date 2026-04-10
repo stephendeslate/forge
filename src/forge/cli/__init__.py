@@ -147,12 +147,13 @@ def new(
     stack: str = typer.Option(None, "--stack", "-s", help="Tech stack preset: nestjs, nextjs, fastapi"),
     model: str = typer.Option(None, "--model", "-m", help="Model override"),
     auto: bool = typer.Option(False, "--auto", help="Skip approval prompts"),
+    clean: bool = typer.Option(False, "--clean", help="Wipe output directory and start fresh"),
     yolo: bool = typer.Option(False, "--yolo", help="Allow all tool calls without prompting"),
 ) -> None:
     """Create a new project from an idea — plan, build, verify."""
     from ._new import new_command
 
-    asyncio.run(new_command(idea, output, stack, model, auto, yolo))
+    asyncio.run(new_command(idea, output, stack, model, auto, yolo, clean))
 
 
 @app.command()

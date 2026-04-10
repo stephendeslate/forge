@@ -332,8 +332,17 @@ async def agent_repl(
     resume_session_id: str | None = None,
     system: str = AGENT_SYSTEM,
     worktree_name: str | None = None,
+    headless: bool = False,
+    headless_max_turns: int = 50,
+    headless_request_limit: int = 200,
 ) -> None:
-    """Run the agentic REPL with tool use."""
+    """Run the agentic REPL with tool use.
+
+    When headless=True, auto-feeds "Continue building." prompts instead of
+    reading from stdin. Exits after headless_max_turns or when the agent
+    reports completion. Uses a higher request_limit to avoid hitting the
+    per-turn cap during large builds.
+    """
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
@@ -479,6 +488,15 @@ async def agent_repl(
         deps.escalator = escalator
         wire_escalation(escalator, deps, turn_counter_ref)
 
+    # --- Headless: raise per-turn request limit and enable auto-background ---
+    _original_request_limit = settings.agent.request_limit
+    _original_bg_threshold = settings.agent.run_command_background_threshold
+    if headless:
+        settings.agent.request_limit = headless_request_limit  # type: ignore[assignment]
+        # Auto-background commands after 15s to prevent server-start hangs
+        if settings.agent.run_command_background_threshold <= 0:
+            settings.agent.run_command_background_threshold = 15.0  # type: ignore[assignment]
+
     # --- Initial prompt ---
     turn_counter = 0
     if initial_prompt:
@@ -496,17 +514,98 @@ async def agent_repl(
 
     # --- REPL loop ---
     title_set = initial_prompt is not None
+    headless_turns_used = 0
+    headless_verify_count = 0
+    headless_build_turns = 0  # Tracks how many build-phase turns we've sent
     try:
         while True:
-            try:
-                user_input = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: pt_session.prompt("\n❯ ")
-                )
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[dim]Goodbye.[/dim]")
-                break
+            if headless:
+                # Headless mode: auto-feed prompts that drive toward completion
+                headless_turns_used += 1
+                if headless_turns_used > headless_max_turns:
+                    console.print("\n[dim]Headless: max turns reached.[/dim]")
+                    break
 
-            user_input = user_input.strip()
+                # Decide: build prompt or verification prompt?
+                # Check if the model's last response mentions all phases complete
+                # or if we've sent enough build turns.
+                should_verify = False
+
+                if headless_build_turns >= 2:
+                    # After 2+ build turns, check if model thinks it's done
+                    if message_history:
+                        from pydantic_ai.messages import ModelResponse, TextPart
+                        for msg in reversed(message_history[-3:]):
+                            if isinstance(msg, ModelResponse):
+                                text = " ".join(
+                                    p.content for p in msg.parts
+                                    if isinstance(p, TextPart)
+                                )
+                                # Model signals it's done building
+                                if any(phrase in text.lower() for phrase in [
+                                    "all phases", "phase 5", "phase 4",
+                                    "complete", "finished", "done",
+                                    "verification_complete",
+                                ]):
+                                    should_verify = True
+                                break
+
+                if should_verify or headless_turns_used > 5:
+                    # Verification loop: the key insight from telehealth-booking
+                    headless_verify_count += 1
+                    console.print(f"\n[cyan]Headless: verification pass {headless_verify_count}[/cyan]")
+                    user_input = (
+                        "Verify the completion of the project against BUILD_PLAN.md. "
+                        "Read BUILD_PLAN.md, then check what actually exists on disk:\n"
+                        "1. Run `pnpm build` — does it pass with 0 errors?\n"
+                        "2. Run `pnpm test` — do tests exist AND pass? If no test files exist, write them.\n"
+                        "3. Check each phase in BUILD_PLAN.md — is every item actually implemented "
+                        "with real code (not stubs)?\n"
+                        "4. Check for common issues: port conflicts between API and web, "
+                        "missing CORS configuration, missing error handling for duplicate entries, "
+                        "empty packages with no real code, missing database migrations, "
+                        ".bak files or compiled .js/.d.ts artifacts in source directories.\n"
+                        "5. Verify the API server starts: `timeout 5 node apps/api/dist/main.js 2>&1 || true`\n\n"
+                        "If ANYTHING is incomplete or broken, fix it now — write the missing code, "
+                        "add the missing tests, fix the config issues. Do NOT skip items.\n"
+                        "Only when the build passes, tests pass, and every BUILD_PLAN item is "
+                        "implemented, say the exact phrase VERIFICATION_COMPLETE in your response text."
+                    )
+
+                    # Check if model said VERIFICATION_COMPLETE in its actual response
+                    # (not in command output — only in ModelResponse TextParts)
+                    if message_history and headless_verify_count >= 3:
+                        from pydantic_ai.messages import ModelResponse, TextPart
+                        verified = False
+                        for msg in reversed(message_history[-3:]):
+                            if isinstance(msg, ModelResponse):
+                                for part in msg.parts:
+                                    if isinstance(part, TextPart) and "VERIFICATION_COMPLETE" in part.content:
+                                        verified = True
+                                        break
+                            if verified:
+                                break
+                        if verified:
+                            console.print("\n[dim]Headless: verification complete.[/dim]")
+                            break
+                else:
+                    # Build phase: keep building
+                    headless_build_turns += 1
+                    user_input = (
+                        "Continue building. Work through the BUILD_PLAN phases. "
+                        "Write all files for the current phase, run build + tests, "
+                        "fix any errors, commit, then move to the next phase."
+                    )
+            else:
+                try:
+                    user_input = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: pt_session.prompt("\n❯ ")
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Goodbye.[/dim]")
+                    break
+
+                user_input = user_input.strip()
             if not user_input:
                 continue
 
@@ -622,6 +721,9 @@ async def agent_repl(
                             message_history.extend(recovery_result)
 
     finally:
+        if headless:
+            settings.agent.request_limit = _original_request_limit  # type: ignore[assignment]
+            settings.agent.run_command_background_threshold = _original_bg_threshold  # type: ignore[assignment]
         await cleanup(
             deps, hook_registry, mcp_stack, db, session_id, message_history, console,
         )
